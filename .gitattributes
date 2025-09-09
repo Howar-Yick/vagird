@@ -1,0 +1,8 @@
+# 自动规范文本文件
+* text=auto
+
+# 脚本用 LF，避免跨平台“伪变化”
+*.py text eol=lf
+*.bat text eol=crlf
+*.md  text eol=lf
+*.json text eol=lf

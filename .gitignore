@@ -1,0 +1,26 @@
+# —— Python 缓存与虚拟环境 ——
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+
+# —— PTRADE 运行产物（不进仓库） ——
+logs/
+state/
+reports/
+
+# —— VSCode 本地缓存（仅保留三个工程文件） ——
+.vscode/*
+!.vscode/settings.json
+!.vscode/launch.json
+!.vscode/tasks.json
+
+# —— 临时与杂项 ——
+*.log
+*.tmp
+~$*
+
+# —— OneDrive 临时占位文件 ——
+*.lnk

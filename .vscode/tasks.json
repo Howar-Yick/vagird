@@ -1,0 +1,7 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    { "label": "format", "type": "shell", "command": ".\\scripts\\format.bat", "group": "none" },
+    { "label": "lint",   "type": "shell", "command": ".\\scripts\\lint.bat",   "group": "none" }
+  ]
+}

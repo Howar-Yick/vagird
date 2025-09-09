@@ -1,0 +1,14 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "pytest: smoke",
+      "type": "python",
+      "request": "launch",
+      "module": "pytest",
+      "args": ["-q", "tests/test_smoke.py"],
+      "console": "integratedTerminal",
+      "justMyCode": true
+    }
+  ]
+}
