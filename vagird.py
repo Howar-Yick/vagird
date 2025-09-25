@@ -1,9 +1,9 @@
 # event_driven_grid_strategy.py
-# 版本号：GEMINI-0926-VERBOSE-LOG
-# 0926-LOG: 全面增强日志输出，清晰展示ATR计算、网格决策、委托下单、成交回报等关键信息。
-# 0926-R3: 恢复强大的撤单函数，解决策略重启后不撤单的问题。
-# 0926: 增加T+1判断和交易冷静期，解决可用不足和同价位重复下单问题。
-# 0925: 实现持仓与ATR混合驱动的动态网格。
+# 版本号：GEMINI-0926-FINAL-R3
+# 0926-R3: 严格基于您的原始文件进行修改，确保所有平台API和辅助函数可用，解决 'attribute_history' NameError。
+# 0926-LOG: 全面增强日志输出。
+# 0926: 增加T+1判断和交易冷静期。
+# 0925: 实现配置文件与动态网格。
 
 import json
 import logging
@@ -15,22 +15,26 @@ from types import SimpleNamespace
 # 全局文件句柄 & 常量
 LOG_FH = None
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'GEMINI-0926-VERBOSE-LOG'
+__version__ = 'GEMINI-0926-FINAL-R3'
 
-# --- 路径与日志工具 ---
+# --- 路径工具 ---
 def research_path(*parts) -> Path:
+    """研究目录根 + 子路径，确保文件夹存在"""
     p = Path(get_research_path()).joinpath(*parts)
     p.parent.mkdir(parents=True, exist_ok=True)
     return p
 
-def info(msg, *args):
-    text = msg.format(*args)
-    log.info(text)
-    if LOG_FH:
-        LOG_FH.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} INFO {text}\n")
-        LOG_FH.flush()
+# --- 环境判断 ---
+def check_environment():
+    try:
+        u = str(get_user_name())
+        if u == '55418810': return '回测'
+        if u == '8887591588': return '实盘'
+        return '模拟'
+    except:
+        return '未知'
 
-# --- 平台参数读写辅助函数 ---
+# --- 【恢复】您原有的辅助函数 ---
 def get_saved_param(key, default=None):
     try:
         return get_parameter(key)
@@ -43,17 +47,23 @@ def set_saved_param(key, value):
     except:
         pass
 
-# --- 环境与代码转换 ---
-def check_environment():
+def info(msg, *args):
+    """统一日志：平台 + 文件"""
+    text = msg.format(*args)
+    log.info(text)
+    if LOG_FH:
+        LOG_FH.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} INFO {text}\n")
+        LOG_FH.flush()
+
+def safe_save_state(symbol, state):
+    """捕获异常的保存"""
     try:
-        u = str(get_user_name())
-        if u == '55418810': return '回测'
-        if u == '8887591588': return '实盘'
-        return '模拟'
-    except:
-        return '未知'
+        save_state(symbol, state)
+    except Exception as e:
+        info('[{}] ⚠️ 状态保存失败: {}', symbol, e)
 
 def convert_symbol_to_standard(full_symbol):
+    """API 合约符号转 .SZ/.SS 形式"""
     if not isinstance(full_symbol, str): return full_symbol
     if full_symbol.endswith('.XSHE'): return full_symbol.replace('.XSHE','.SZ')
     if full_symbol.endswith('.XSHG'): return full_symbol.replace('.XSHG','.SS')
@@ -70,17 +80,19 @@ def initialize(context):
     info("当前环境：{}", context.env)
     context.run_cycle = get_saved_param('run_cycle_seconds', 60)
 
+    # --- 【升级】从外部JSON文件加载标的配置 ---
     try:
         config_file = research_path('config', 'symbols.json')
-        context.symbol_config = json.loads(config_file.read_text(encoding='utf-8')) if config_file.exists() else {}
-        if not context.symbol_config:
-            log.error(f"❌ 配置文件 {config_file} 不存在或为空，请创建！")
-        else:
+        if config_file.exists():
+            context.symbol_config = json.loads(config_file.read_text(encoding='utf-8'))
             info('✅ 从 {} 加载 {} 个标的配置', config_file, len(context.symbol_config))
+        else:
+            log.error(f"❌ 配置文件 {config_file} 不存在，请创建！")
+            context.symbol_config = {}
     except Exception as e:
         log.error(f"❌ 加载配置文件失败：{e}")
         context.symbol_config = {}
-    
+
     context.symbol_list = list(context.symbol_config.keys())
     context.state = {}
     context.latest_data = {}
@@ -142,9 +154,8 @@ def after_initialize_cleanup(context):
         cancel_all_orders_by_symbol(context, sym)
     info('✅ 按品种清理完成')
 
-# --- 【关键恢复】使用您最初版本中强大的撤单函数 ---
 def get_order_status(entrust_no):
-    """获取订单实时状态"""
+    """获取订单实时状态 (来自您的原始版本)"""
     try:
         order_detail = get_order(entrust_no)
         if order_detail:
@@ -154,34 +165,27 @@ def get_order_status(entrust_no):
     return ''
 
 def cancel_all_orders_by_symbol(context, symbol):
-    """撤销某标的所有可撤销挂单，逻辑来自您的初始版本，最为健壮"""
+    """撤销某标的所有可撤销挂单 (来自您的原始版本)"""
     all_orders = get_all_orders() or []
     total = 0
-
     if not hasattr(context, 'canceled_cache'):
         context.canceled_cache = {'date': None, 'orders': set()}
     today = context.current_dt.date()
     if context.canceled_cache.get('date') != today:
         context.canceled_cache = {'date': today, 'orders': set()}
     cache = context.canceled_cache['orders']
-
     for o in all_orders:
         api_sym = o.get('symbol') or o.get('stock_code')
         sym2 = convert_symbol_to_standard(api_sym)
         if sym2 != symbol:
             continue
-
         status = str(o.get('status', ''))
         entrust_no = o.get('entrust_no')
-
         if not entrust_no or status != '2' or entrust_no in context.state[symbol]['filled_order_ids'] or entrust_no in cache:
             continue
-            
         final_status = get_order_status(entrust_no)
         if final_status in ('4', '5', '6', '8'):
-            info('[{}] ⏭️ 跳过无法撤单的状态 entrust_no:{} status={}', symbol, entrust_no, final_status)
             continue
-        
         cache.add(entrust_no)
         total += 1
         info('[{}] 👉 发现并尝试撤销遗留挂单 entrust_no={}', symbol, entrust_no)
@@ -189,11 +193,8 @@ def cancel_all_orders_by_symbol(context, symbol):
             cancel_order_ex({'entrust_no': entrust_no, 'symbol': api_sym})
         except Exception as e:
             info('[{}] ⚠️ 撤单异常 entrust_no={}: {}', symbol, entrust_no, e)
-
     if total > 0:
         info('[{}] 共{}笔遗留挂单尝试撤销完毕', symbol, total)
-
-# --- 交易与订单逻辑 ---
 
 def place_auction_orders(context):
     if '回测' in context.env or not (is_auction_time() or is_main_trading_time()):
@@ -212,35 +213,26 @@ def place_auction_orders(context):
 
 def place_limit_orders(context, symbol, state):
     now_dt = context.current_dt
-    
     if state.get('_last_trade_ts') and (now_dt - state['_last_trade_ts']).total_seconds() < 60:
         return
-            
     if not (is_auction_time() or (is_main_trading_time() and now_dt.time() < time(14, 50))):
         return
-        
     price = context.latest_data.get(symbol)
     if not (price and price > 0):
         return
-        
     base = state['base_price']
     if abs(price / base - 1) > 0.10:
         return
-        
     unit, buy_sp, sell_sp = state['grid_unit'], state['buy_grid_spacing'], state['sell_grid_spacing']
     buy_p, sell_p = round(base * (1 - buy_sp), 3), round(base * (1 + sell_sp), 3)
-    
     position = get_position(symbol)
     pos = position.amount + state.pop('_pos_change', 0)
-    
     trigger_sell = (pos - unit <= state['base_position']) and price >= sell_p
     trigger_buy = (pos + unit >= state['max_position']) and price <= buy_p
-    
     if not (trigger_sell or trigger_buy):
         if state.get('_last_order_ts') and (now_dt - state.get('_last_order_ts')).seconds < 30: return
         if state.get('_last_order_bp') and abs(base / state.get('_last_order_bp') - 1) < buy_sp / 2: return
         state['_last_order_ts'], state['_last_order_bp'] = now_dt, base
-
     if trigger_sell:
         state['base_price'] = sell_p
         info('[{}] 触及卖格价，基准价上移至 {:.3f}', symbol, sell_p)
@@ -251,18 +243,15 @@ def place_limit_orders(context, symbol, state):
         info('[{}] 触及买格价，基准价下移至 {:.3f}', symbol, buy_p)
         cancel_all_orders_by_symbol(context, symbol)
         buy_p, sell_p = round(buy_p * (1 - buy_sp), 3), round(buy_p * (1 + sell_sp), 3)
-
     try:
         open_orders = [o for o in get_open_orders(symbol) or [] if o.status == '2']
         enable_amount = position.enable_amount
-        
         if not any(o.amount > 0 and abs(o.price - buy_p) < 1e-3 for o in open_orders) and pos + unit <= state['max_position']:
             info('[{}] --> 发起买入委托: {}股 @ {:.3f}', symbol, unit, buy_p)
             order(symbol, unit, limit_price=buy_p)
         if not any(o.amount < 0 and abs(o.price - sell_p) < 1e-3 for o in open_orders) and enable_amount >= unit and pos - unit >= state['base_position']:
             info('[{}] --> 发起卖出委托: {}股 @ {:.3f}', symbol, unit, sell_p)
             order(symbol, -unit, limit_price=sell_p)
-            
     except Exception as e:
         info('[{}] ⚠️ 限价挂单异常：{}', symbol, e)
     finally:
@@ -274,23 +263,16 @@ def on_trade_response(context, trade_list):
         sym, entrust_no = convert_symbol_to_standard(tr['stock_code']), tr['entrust_no']
         if sym not in context.state or entrust_no in context.state[sym]['filled_order_ids']:
             continue
-            
         context.state[sym]['filled_order_ids'].add(entrust_no)
         state = context.state[sym]
-        
         state['_last_trade_ts'] = context.current_dt
         state['base_price'] = tr['business_price']
-        
         trade_direction = "买入" if tr['entrust_bs'] == '1' else "卖出"
         info('✅ [{}] 成交回报! 方向: {}, 数量: {}, 价格: {:.3f}', sym, trade_direction, tr['business_amount'], tr['business_price'])
-        
         state['_pos_change'] = tr['business_amount'] if tr['entrust_bs'] == '1' else -tr['business_amount']
-        
         cancel_all_orders_by_symbol(context, sym)
-        
         if context.current_dt.time() < time(14, 50):
             place_limit_orders(context, sym, state)
-            
         safe_save_state(sym, state)
 
 def handle_data(context, data):
@@ -329,17 +311,13 @@ def update_grid_spacing_hybrid(context, symbol, state, curr_pos):
     base_buy_spacing, base_sell_spacing = 0.005, 0.005
     if curr_pos <= base_pos + unit * 5:   base_buy_spacing, base_sell_spacing = 0.005, 0.01
     elif curr_pos > base_pos + unit * 15: base_buy_spacing, base_sell_spacing = 0.01, 0.005
-    
     atr_pct = calculate_atr(context, symbol)
-    
     volatility_modifier = 1.0
     if atr_pct is not None:
         normal_atr_pct = 0.015 
         volatility_modifier = max(0.5, min(atr_pct / normal_atr_pct, 2.0))
-        
     new_buy = round(max(0.0025, min(base_buy_spacing * volatility_modifier, 0.03)), 4)
     new_sell = round(max(0.0025, min(base_sell_spacing * volatility_modifier, 0.03)), 4)
-    
     if new_buy != state.get('buy_grid_spacing') or new_sell != state.get('sell_grid_spacing'):
         state['buy_grid_spacing'], state['sell_grid_spacing'] = new_buy, new_sell
         info('[{}] 🌀 网格动态调整. 仓位档:[买{:.2%},卖{:.2%}], ATR({:.2%})系数:{:.2f} -> 最终:[买{:.2%},卖{:.2%}]',
