@@ -1,9 +1,6 @@
 # event_driven_grid_strategy.py
-# 版本号：GEMINI-0926-FINAL-R4
-# 0926-R4: 严格基于您的原始文件(VCHATGPT-0708)进行修改，确保所有函数完整，并正确集成所有新功能。
-# 0926-LOGIC-FIX: 修正动态网格中高低仓位区的判断逻辑。
-# 0926: 增加T+1判断、交易冷静期、详细日志。
-# 0925: 实现配置文件与动态ATR网格。
+# 版本号：GEMINI-0927-FINAL
+# 0927: 严格基于您的原始文件(VCHATGPT-0708)进行修改，确保所有函数完整，并正确集成所有新功能。
 
 import json
 import logging
@@ -15,11 +12,11 @@ from types import SimpleNamespace
 # 全局文件句柄 & 常量
 LOG_FH = None
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'GEMINI-0926-FINAL-R4'
+__version__ = 'GEMINI-0927-FINAL'
 
 # --- 【新增】交易成本常量 ---
 # 单边交易成本，万分之0.6，即 0.00006
-TRANSACTION_COST = 0.00006
+TRANSACTION_COST = 0.00006 
 
 # --- 路径工具 (来自您的原始版本) ---
 def research_path(*parts) -> Path:
@@ -37,7 +34,7 @@ def check_environment():
         return '模拟'
     except:
         return '未知'
-        
+
 # --- 辅助函数 (来自您的原始版本) ---
 def get_saved_param(key, default=None):
     try:
@@ -82,8 +79,8 @@ def safe_save_state(symbol, state):
     """捕获异常的保存 (来自您的原始版本)"""
     try:
         save_state(symbol, state)
-    except Exception:
-        info('[{}] ⚠️ 状态保存失败', symbol)
+    except Exception as e:
+        info('[{}] ⚠️ 状态保存失败: {}', symbol, e)
 
 def convert_symbol_to_standard(full_symbol):
     """API 合约符号转 .SZ/.SS 形式 (来自您的原始版本)"""
@@ -106,8 +103,11 @@ def initialize(context):
     # --- 【升级】从外部JSON文件加载标的配置 ---
     try:
         config_file = research_path('config', 'symbols.json')
+        # 【新增】为热重载功能保存路径和初始时间
+        context.config_file_path = config_file
         if config_file.exists():
             context.symbol_config = json.loads(config_file.read_text(encoding='utf-8'))
+            context.last_config_mod_time = config_file.stat().st_mtime
             info('✅ 从 {} 加载 {} 个标的配置', config_file, len(context.symbol_config))
         else:
             log.error(f"❌ 配置文件 {config_file} 不存在，请创建！")
@@ -309,6 +309,9 @@ def on_order_filled(context, symbol, order):
 def handle_data(context, data):
     now_dt = context.current_dt
     now = now_dt.time()
+    # 【新增】每5分钟检查一次配置文件是否变更
+    if now_dt.minute % 5 == 0 and now_dt.second < 5:
+        reload_config_if_changed(context)
     for sym in context.symbol_list:
         if sym in data and data[sym] and data[sym].price > 0:
             context.latest_data[sym] = data[sym].price
@@ -340,28 +343,21 @@ def log_status(context, symbol, state, price):
 def update_grid_spacing_hybrid(context, symbol, state, curr_pos):
     """【逻辑修正】混合模型：根据持仓决定基础档位，再根据ATR进行缩放"""
     unit, base_pos = state['grid_unit'], state['base_position']
-    
-    # 【逻辑修正】恢复至您最初的正确逻辑
     if curr_pos <= base_pos + unit * 5:
-        base_buy_spacing, base_sell_spacing = 0.005, 0.01  # 低(网格)仓位区：窄买宽卖，鼓励买入
+        base_buy_spacing, base_sell_spacing = 0.005, 0.01
     elif curr_pos > base_pos + unit * 15:
-        base_buy_spacing, base_sell_spacing = 0.01, 0.005  # 高(网格)仓位区：宽买窄卖，鼓励卖出
+        base_buy_spacing, base_sell_spacing = 0.01, 0.005
     else:
-        base_buy_spacing, base_sell_spacing = 0.005, 0.005 # 中间区
-        
+        base_buy_spacing, base_sell_spacing = 0.005, 0.005
     atr_pct = calculate_atr(context, symbol)
     volatility_modifier = 1.0
     if atr_pct is not None:
         normal_atr_pct = 0.015 
         volatility_modifier = max(0.5, min(atr_pct / normal_atr_pct, 2.0))
-        
-    # 最小间距需覆盖交易成本 (5倍)
     min_spacing = TRANSACTION_COST * 5 
     max_spacing = 0.03
-    
     new_buy = round(max(min_spacing, min(base_buy_spacing * volatility_modifier, max_spacing)), 4)
     new_sell = round(max(min_spacing, min(base_sell_spacing * volatility_modifier, max_spacing)), 4)
-    
     if new_buy != state.get('buy_grid_spacing') or new_sell != state.get('sell_grid_spacing'):
         state['buy_grid_spacing'], state['sell_grid_spacing'] = new_buy, new_sell
         info('[{}] 🌀 网格动态调整. 仓位档:[买{:.2%},卖{:.2%}], ATR({:.2%})系数:{:.2f} -> 最终:[买{:.2%},卖{:.2%}]',
@@ -478,3 +474,63 @@ def update_daily_reports(context, data):
                 f.write(",".join(headers) + "\n")
             f.write(",".join(map(str, row)) + "\n")
         info(f'✅ [{symbol}] 已更新每日报表：{report_file}')
+        
+# --- 【新增】配置文件热重载功能 ---
+def reload_config_if_changed(context):
+    """检查配置文件是否有变动，如果有，则动态重新加载。"""
+    try:
+        current_mod_time = context.config_file_path.stat().st_mtime
+        if current_mod_time == context.last_config_mod_time:
+            return
+
+        info('🔄 检测到配置文件发生变更，开始热重载...')
+        context.last_config_mod_time = current_mod_time
+        new_config = json.loads(context.config_file_path.read_text(encoding='utf-8'))
+        
+        old_symbols = set(context.symbol_list)
+        new_symbols = set(new_config.keys())
+        
+        # 处理被删除的标的
+        for sym in old_symbols - new_symbols:
+            info(f'[{sym}] 标的已从配置中移除，将清理其状态和挂单...')
+            cancel_all_orders_by_symbol(context, sym)
+            context.symbol_list.remove(sym)
+            if sym in context.state: del context.state[sym]
+            if sym in context.latest_data: del context.latest_data[sym]
+            
+        # 处理新增的标的
+        for sym in new_symbols - old_symbols:
+            info(f'[{sym}] 新增标的，正在初始化状态...')
+            cfg = new_config[sym]
+            st = {**cfg}
+            st.update({
+                'base_price': cfg['base_price'], 'grid_unit': cfg['grid_unit'],
+                'filled_order_ids': set(), 'trade_week_set': set(),
+                'base_position': cfg['initial_base_position'],
+                'last_week_position': cfg['initial_base_position'],
+                'initial_position_value': cfg['initial_base_position'] * cfg['base_price'],
+                'buy_grid_spacing': 0.005, 'sell_grid_spacing': 0.005,
+                'max_position': cfg['initial_base_position'] + cfg['grid_unit'] * 20
+            })
+            context.state[sym] = st
+            context.latest_data[sym] = st['base_price']
+            context.symbol_list.append(sym)
+        
+        # 处理参数发生变更的标的
+        for sym in old_symbols.intersection(new_symbols):
+            if context.symbol_config[sym] != new_config[sym]:
+                info(f'[{sym}] 参数发生变更，正在更新...')
+                # 只更新运行时可安全修改的参数
+                state = context.state[sym]
+                new_params = new_config[sym]
+                state['grid_unit'] = new_params['grid_unit']
+                state['dingtou_base'] = new_params['dingtou_base']
+                state['dingtou_rate'] = new_params['dingtou_rate']
+                # 重新计算max_position以防grid_unit变化
+                state['max_position'] = state['base_position'] + new_params['grid_unit'] * 20
+
+        context.symbol_config = new_config
+        info('✅ 配置文件热重载完成！当前监控标的: {}', context.symbol_list)
+
+    except Exception as e:
+        info(f'❌ 配置文件热重载失败: {e}')
