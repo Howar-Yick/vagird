@@ -1,11 +1,17 @@
-
 {
-  "files.eol": "\n",
-  "python.analysis.typeCheckingMode": "basic",
+  // 仅对 Python 文件保存时自动格式化
+  "[python]": {
+    "editor.formatOnSave": true
+  },
+  // 使用 black 作为 Python 格式化工具
   "python.formatting.provider": "black",
-  "editor.formatOnSave": true,
-  "editor.rulers": [100],
+  // Python 类型检查模式
+  "python.analysis.typeCheckingMode": "basic",
+  // VSCode 编辑器视觉提示
+  "editor.rulers": [
+    100
+  ],
   "editor.codeActionsOnSave": {
-    "source.organizeImports": true
+    "source.organizeImports": "explicit"
   }
 }
