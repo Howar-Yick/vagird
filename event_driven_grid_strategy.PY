@@ -1,7 +1,6 @@
 # event_driven_grid_strategy.py
-# 版本号：GEMINI-1001-MERGED-FINAL
-# 1001-MERGED-FINAL: 【功能合并与最终版】这是一个完整的、未经省略的版本。
-# 它以最新的暗黑主题版为基础，并从VCHATGPT-0708版中完整恢复了每日CSV报表生成功能。
+# 版本号：GEMINI-1.0-0926-VERSION-RULE-ADOPTED
+# 1.0-0926-VERSION-RULE-ADOPTED: 【版本号规则更新】采纳用户定义的全新版本号命名规范。
 
 import json
 import logging
@@ -13,7 +12,7 @@ from types import SimpleNamespace
 # 全局文件句柄 & 常量
 LOG_FH = None
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'GEMINI-1001-MERGED-FINAL'
+__version__ = 'GEMINI-1.0-0926-VERSION-RULE-ADOPTED'
 TRANSACTION_COST = 0.00006 
 
 # --- 路径与辅助函数 ---
