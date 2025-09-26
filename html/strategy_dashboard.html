@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>PTRADE策略实时看板</title>
+    <style>
+        body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;background-color:#f5f5f5;color:#333;margin:20px}
+        h1,h2{color:#1a1a1a;border-bottom:2px solid #e0e0e0;padding-bottom:10px}
+        table{width:100%;border-collapse:collapse;margin-top:20px;box-shadow:0 2px 5px rgba(0,0,0,0.1)}
+        th,td{padding:12px 15px;text-align:left;border-bottom:1px solid #ddd}
+        th{background-color:#e9eff2;font-weight:bold}
+        tr:nth-child(even){background-color:#fafafa}
+        tr:hover{background-color:#f1f1f1}
+        .positive{color:#d9534f}
+        .negative{color:#5cb85c}
+        .summary-card{background-color:white;padding:20px;border-radius:8px;box-shadow:0 2px 5px rgba(0,0,0,0.1);margin-bottom:20px}
+        .summary-item{display:inline-block;width:48%;text-align:center}
+        .summary-item h3{margin:0;color:#555}
+        .summary-item p{margin:5px 0 0 0;font-size:24px;font-weight:bold}
+        .footer{text-align:center;margin-top:20px;color:#888;font-size:12px}
+    </style>
+</head>
+<body>
+    <h1>PTRADE策略实时看板</h1>
+    <p class="footer">最后更新时间: <span id="update-time"></span></p>
+
+    <div class="summary-card">
+        <div class="summary-item">
+            <h3>总市值 (CNY)</h3>
+            <p id="total-market-value"></p>
+        </div>
+        <div class="summary-item">
+            <h3>总浮动盈亏 (CNY)</h3>
+            <p id="total-pnl"></p>
+        </div>
+    </div>
+
+    <h2>各标的详细状态</h2>
+    <table>
+        <thead>
+            <tr>
+                <th>标的代码</th>
+                <th>持仓 (可卖)</th>
+                <th>成本价</th>
+                <th>市价</th>
+                <th>市值</th>
+                <th>浮动盈亏</th>
+                <th>盈亏比例</th>
+                <th>目标底仓</th>
+                <th>网格数量</th>
+                <th>网格间距(买/卖)</th>
+                <th>ATR(14d)</th>
+            </tr>
+        </thead>
+        <tbody id="metrics-table-body">
+            </tbody>
+    </table>
+    <p class="footer">本页面每60秒自动刷新一次。</p>
+
+    <script>
+        function formatNumber(num) {
+            return num.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        }
+
+        async function fetchDataAndUpdate() {
+            try {
+                // 添加一个随机查询参数来防止浏览器缓存
+                const response = await fetch('dashboard_data.json?t=' + new Date().getTime());
+                if (!response.ok) {
+                    throw new Error('网络响应错误');
+                }
+                const data = await response.json();
+
+                // 更新头部信息
+                document.getElementById('update-time').textContent = data.update_time;
+                document.getElementById('total-market-value').textContent = formatNumber(data.total_market_value);
+                
+                const totalPnlElement = document.getElementById('total-pnl');
+                totalPnlElement.textContent = formatNumber(data.total_unrealized_pnl);
+                totalPnlElement.className = data.total_unrealized_pnl >= 0 ? 'positive' : 'negative';
+
+                // 更新表格内容
+                const tableBody = document.getElementById('metrics-table-body');
+                let tableRows = '';
+                for (const m of data.metrics) {
+                    const pnlClass = parseFloat(m.unrealized_pnl.replace(/,/g, '')) >= 0 ? 'positive' : 'negative';
+                    tableRows += `
+                        <tr>
+                            <td>${m.symbol}</td>
+                            <td>${m.position}</td>
+                            <td>${m.cost_basis}</td>
+                            <td>${m.price}</td>
+                            <td>${m.market_value}</td>
+                            <td class="${pnlClass}">${m.unrealized_pnl}</td>
+                            <td class="${pnlClass}">${m.pnl_ratio}</td>
+                            <td>${m.base_position}</td>
+                            <td>${m.grid_unit}</td>
+                            <td>${m.grid_spacing}</td>
+                            <td>${m.atr}</td>
+                        </tr>
+                    `;
+                }
+                tableBody.innerHTML = tableRows;
+
+            } catch (error) {
+                console.error('无法加载策略数据:', error);
+                const tableBody = document.getElementById('metrics-table-body');
+                tableBody.innerHTML = `<tr><td colspan="11" style="text-align:center;">加载数据失败，请检查策略是否正在运行并生成 dashboard_data.json 文件。</td></tr>`;
+            }
+        }
+
+        // 页面加载时立即执行一次，之后每60秒执行一次
+        document.addEventListener('DOMContentLoaded', () => {
+            fetchDataAndUpdate();
+            setInterval(fetchDataAndUpdate, 60000);
+        });
+    </script>
+</body>
+</html>
