@@ -1,7 +1,7 @@
 # event_driven_grid_strategy.py
-# 版本号：GEMINI-1.9-1009-LOG-ENHANCE
-# 1.9-1009-LOG-ENHANCE: 【日志增强】在价值平均调整底仓的日志中，增加“目标市值”、“当前市值”和“市值缺口”的打印，
-# 使策略的决策过程完全透明化。
+# 版本号：GEMINI-2.0-1010-PERF-LOGGING
+# 2.0-1010-PERF-LOGGING: 【功能新增】为实现未来的业绩归因分析，增加详细交易日志功能。
+# 每笔成交都会被记录到 a_trade_details.csv 文件中，包含当时的底仓目标，为后续分析奠定数据基础。
 
 import json
 import logging
@@ -13,7 +13,7 @@ from types import SimpleNamespace
 # 全局文件句柄 & 常量
 LOG_FH = None
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'GEMINI-1.9-1009-LOG-ENHANCE'
+__version__ = 'GEMINI-2.0-1010-PERF-LOGGING'
 TRANSACTION_COST = 0.00005 
 
 # --- 路径与辅助函数 ---
@@ -245,6 +245,10 @@ def on_trade_response(context, trade_list):
         if str(tr.get('status')) != '8': continue
         sym = convert_symbol_to_standard(tr['stock_code'])
         entrust_no = tr['entrust_no']
+
+        # 【功能新增】调用交易日志记录函数
+        log_trade_details(context, sym, tr)
+
         if sym not in context.state or entrust_no in context.state[sym]['filled_order_ids']: continue
         context.state[sym]['filled_order_ids'].add(entrust_no)
         safe_save_state(sym, context.state[sym])
@@ -284,33 +288,40 @@ def on_order_filled(context, symbol, order):
 def handle_data(context, data):
     now_dt = context.current_dt
     now = now_dt.time()
-    if now_dt.minute % 5 == 0 and now_dt.second < 5:
+
+    is_5_min_tick = (now_dt.minute % 5 == 0 and now_dt.second < 5)
+    if is_5_min_tick:
         reload_config_if_changed(context)
-        generate_html_report(context) 
+        generate_html_report(context)
+    
+    is_30_min_tick = (now_dt.minute % 30 == 0 and now_dt.second < 5)
+    if is_30_min_tick:
+        info('📌 每30分钟状态巡检...')
+
     for sym in context.symbol_list:
-        if sym in data and data[sym] and data[sym].price > 0:
-            context.latest_data[sym] = data[sym].price
-    for sym in context.symbol_list:
-        if sym not in context.state: continue
+        if sym not in context.state or sym not in data or not data[sym] or data[sym].price <= 0:
+            continue
+        
+        context.latest_data[sym] = data[sym].price
         st = context.state[sym]
-        price = context.latest_data.get(sym)
-        if not price: continue
+        price = context.latest_data[sym]
+
         get_target_base_position(context, sym, st, price, now_dt)
         adjust_grid_unit(st)
-        if now_dt.minute % 30 == 0 and now_dt.second < 5:
-            update_grid_spacing_final(context, sym, st, get_position(sym).amount)
+        update_grid_spacing_final(context, sym, st, get_position(sym).amount)
+
+        if is_30_min_tick:
+            log_status(context, sym, st, price)
+
     if is_auction_time() or (is_main_trading_time() and now < time(14, 50)):
         for sym in context.symbol_list:
-            if sym in context.state: place_limit_orders(context, sym, context.state[sym])
+            if sym in context.state:
+                place_limit_orders(context, sym, context.state[sym])
+    
     if time(14, 55) <= now < time(14, 57):
         for sym in context.symbol_list:
             if sym in context.state:
                 place_market_orders_if_triggered(context, sym, context.state[sym])
-    if now_dt.minute % 30 == 0 and now_dt.second < 5:
-        info('📌 每30分钟状态巡检...')
-        for sym in context.symbol_list:
-            if sym in context.state:
-                log_status(context, sym, context.state[sym], context.latest_data.get(sym))
 
 def place_market_orders_if_triggered(context, symbol, state):
     if not is_main_trading_time(): return
@@ -396,27 +407,18 @@ def end_of_day(context):
 def get_target_base_position(context, symbol, state, price, dt):
     """计算定投目标仓位并更新底仓/max仓位 (采用正确的VA算法)"""
     weeks = get_trade_weeks(context, symbol, state, dt)
-    
     target_val = state['initial_position_value'] + sum(state['dingtou_base'] * (1 + state['dingtou_rate'])**w for w in range(1, weeks + 1))
-    
     if price <= 0: return state['base_position'] 
     new_pos = target_val / price
-    
     min_base = round(state['initial_position_value'] / state['base_price'] / 100) * 100 if state['base_price'] > 0 else 0
-    
     final_pos = round(max(min_base, new_pos) / 100) * 100
-
     if final_pos != state['base_position']:
-        # 【日志增强】
         current_val = state['base_position'] * price
         delta_val = target_val - current_val
-        
         info('[{}] 价值平均: 目标底仓从 {} 调整至 {}. (目标市值: {:.2f}, 当前市值: {:.2f}, 市值缺口: {:.2f})', 
              symbol, state['base_position'], final_pos, target_val, current_val, delta_val)
-        
         state['base_position'] = final_pos
         state['max_position'] = final_pos + state['grid_unit'] * 20
-        
     return final_pos
 
 def get_trade_weeks(context, symbol, state, dt):
@@ -550,6 +552,39 @@ def update_daily_reports(context, data):
             f.write(",".join(map(str, row)) + "\n")
         info(f'✅ [{symbol}] 已更新每日CSV报表：{report_file}')
 
+# =====================================================================================
+# 【功能新增】交易日志记录函数
+# =====================================================================================
+def log_trade_details(context, symbol, trade):
+    """记录每一笔成交的详细信息到 a_trade_details.csv 文件中"""
+    try:
+        trade_log_path = research_path('reports', 'a_trade_details.csv')
+        is_new = not trade_log_path.exists()
+
+        with open(trade_log_path, 'a', encoding='utf-8', newline='') as f:
+            if is_new:
+                headers = ["time", "symbol", "direction", "quantity", "price", "base_position_at_trade"]
+                f.write(",".join(headers) + "\n")
+            
+            direction = "BUY" if trade['entrust_bs'] == '1' else "SELL"
+            base_position = context.state[symbol].get('base_position', 0)
+            
+            row = [
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                symbol,
+                direction,
+                str(trade['business_amount']),
+                f"{trade['business_price']:.3f}",
+                str(base_position)
+            ]
+            f.write(",".join(row) + "\n")
+
+    except Exception as e:
+        info(f'❌ 记录交易日志失败: {e}')
+
+# =====================================================================================
+# HTML实时看板生成函数 (已为业绩归因预留位置)
+# =====================================================================================
 def generate_html_report(context):
     """生成一个HTML格式的策略状态看板，并写入文件。"""
     all_metrics = []
@@ -593,7 +628,8 @@ def generate_html_report(context):
                 padding: 20px;
             }}
             .container {{ max-width: 1400px; margin: auto; }}
-            h1 {{ text-align: center; color: #ffffff; border-bottom: 2px solid #333; padding-bottom: 10px; margin-top: 0; }}
+            h1, h2 {{ text-align: center; color: #ffffff; border-bottom: 2px solid #333; padding-bottom: 10px; margin-top: 20px; }}
+            h1 {{ margin-top: 0; }}
             .update-time {{ text-align: center; color: #888; margin-top: -10px; margin-bottom: 20px; }}
             .summary-cards {{ display: flex; gap: 20px; justify-content: center; margin-bottom: 30px; }}
             .card {{ background-color: #1e1e1e; padding: 20px; border-radius: 8px; text-align: center; border: 1px solid #333; min-width: 250px; }}
@@ -608,6 +644,7 @@ def generate_html_report(context):
             .positive {{ color: #4caf50; }}
             .negative {{ color: #f44336; }}
             .footer {{ text-align: center; margin-top: 20px; color: #888; font-size: 12px; }}
+            .placeholder {{ text-align: center; padding: 40px; color: #666; font-style: italic; }}
         </style>
     </head>
     <body>
@@ -644,6 +681,12 @@ def generate_html_report(context):
                     {table_rows}
                 </tbody>
             </table>
+
+            <h2>业绩归因分析</h2>
+            <div class="placeholder">
+                数据采集中... 未来版本将在此处展示详细的盈亏归因分析。
+            </div>
+
             <p class="footer">看板由策略每5分钟更新一次。请在PTRADE中手动刷新查看。</p>
         </div>
     </body>
