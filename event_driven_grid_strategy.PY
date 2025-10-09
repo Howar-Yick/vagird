@@ -1,7 +1,7 @@
 # event_driven_grid_strategy.py
-# 版本号：GEMINI-1.8-1009-VA-REWRITE
-# 1.8-1009-VA-REWRITE: 【核心算法重写】重写get_target_base_position函数，采用
-# 正确的价值平均算法(目标市值/当前价)，彻底解决因算法错误导致的底仓调整与预期不符的问题。
+# 版本号：GEMINI-1.9-1009-LOG-ENHANCE
+# 1.9-1009-LOG-ENHANCE: 【日志增强】在价值平均调整底仓的日志中，增加“目标市值”、“当前市值”和“市值缺口”的打印，
+# 使策略的决策过程完全透明化。
 
 import json
 import logging
@@ -13,7 +13,7 @@ from types import SimpleNamespace
 # 全局文件句柄 & 常量
 LOG_FH = None
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'GEMINI-1.8-1009-VA-REWRITE'
+__version__ = 'GEMINI-1.9-1009-LOG-ENHANCE'
 TRANSACTION_COST = 0.00005 
 
 # --- 路径与辅助函数 ---
@@ -302,9 +302,10 @@ def handle_data(context, data):
     if is_auction_time() or (is_main_trading_time() and now < time(14, 50)):
         for sym in context.symbol_list:
             if sym in context.state: place_limit_orders(context, sym, context.state[sym])
-    if now >= time(14, 55):
+    if time(14, 55) <= now < time(14, 57):
         for sym in context.symbol_list:
-            if sym in context.state: place_market_orders_if_triggered(context, sym, context.state[sym])
+            if sym in context.state:
+                place_market_orders_if_triggered(context, sym, context.state[sym])
     if now_dt.minute % 30 == 0 and now_dt.second < 5:
         info('📌 每30分钟状态巡检...')
         for sym in context.symbol_list:
@@ -392,30 +393,30 @@ def end_of_day(context):
             context.should_place_order_map[sym] = True
     info('✅ 日终保存状态完成')
 
-# =====================================================================================
-# 【核心算法重写】价值平均函数 (get_target_base_position)
-# =====================================================================================
 def get_target_base_position(context, symbol, state, price, dt):
     """计算定投目标仓位并更新底仓/max仓位 (采用正确的VA算法)"""
     weeks = get_trade_weeks(context, symbol, state, dt)
     
-    # 1. 计算本周的目标总价值
     target_val = state['initial_position_value'] + sum(state['dingtou_base'] * (1 + state['dingtou_rate'])**w for w in range(1, weeks + 1))
     
-    # 2. 根据当前价格，直接计算出理论上的目标持仓股数
-    if price <= 0: return state['base_position'] # 价格异常时，维持不变
+    if price <= 0: return state['base_position'] 
     new_pos = target_val / price
     
-    # 3. 确保底仓不会低于初始底仓（如果有的话）
     min_base = round(state['initial_position_value'] / state['base_price'] / 100) * 100 if state['base_price'] > 0 else 0
     
-    # 4. 对最终结果进行取整，并确保不低于最小底仓
     final_pos = round(max(min_base, new_pos) / 100) * 100
 
     if final_pos != state['base_position']:
-        info('[{}] 价值平均: 目标底仓从 {} 调整至 {}', symbol, state['base_position'], final_pos)
+        # 【日志增强】
+        current_val = state['base_position'] * price
+        delta_val = target_val - current_val
+        
+        info('[{}] 价值平均: 目标底仓从 {} 调整至 {}. (目标市值: {:.2f}, 当前市值: {:.2f}, 市值缺口: {:.2f})', 
+             symbol, state['base_position'], final_pos, target_val, current_val, delta_val)
+        
         state['base_position'] = final_pos
         state['max_position'] = final_pos + state['grid_unit'] * 20
+        
     return final_pos
 
 def get_trade_weeks(context, symbol, state, dt):
