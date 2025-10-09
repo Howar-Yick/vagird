@@ -1,7 +1,7 @@
 # event_driven_grid_strategy.py
-# 版本号：GEMINI-2.2-1010-LOG-FIX
-# 2.2-1010-LOG-FIX: 【代码回退与修复】严格遵从用户要求，将 handle_data 函数回退至 2.0 版本的稳定状态，
-# 并仅在 calculate_atr 函数中增加日志记录，未改动任何其他功能。
+# 版本号：GEMINI-2.1-1010-RATCHET-FIX
+# 2.1-1010-RATCHET-FIX: 【核心逻辑修复】重构place_limit_orders函数，分离“棘轮”和“常规挂单”逻辑，
+# 解决了在低仓位（只买不卖）和高仓位（只卖不买）状态下，基准价未能随价格双向移动的严重Bug。
 
 import json
 import logging
@@ -13,7 +13,7 @@ from types import SimpleNamespace
 # 全局文件句柄 & 常量
 LOG_FH = None
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'GEMINI-2.2-1010-LOG-FIX'
+__version__ = 'GEMINI-2.1-1010-RATCHET-FIX'
 TRANSACTION_COST = 0.00005 
 
 # --- 路径与辅助函数 ---
@@ -210,22 +210,31 @@ def place_limit_orders(context, symbol, state):
     buy_p, sell_p = round(base * (1 - buy_sp), 3), round(base * (1 + sell_sp), 3)
     position = get_position(symbol)
     pos = position.amount + state.pop('_pos_change', 0)
-    trigger_sell = (pos - unit <= state['base_position']) and price >= sell_p
-    trigger_buy = (pos + unit >= state['max_position']) and price <= buy_p
-    if not (trigger_sell or trigger_buy):
-        if state.get('_last_order_ts') and (now_dt - state.get('_last_order_ts')).seconds < 30: return
-        if state.get('_last_order_bp') and abs(base / state.get('_last_order_bp') - 1) < buy_sp / 2: return
-        state['_last_order_ts'], state['_last_order_bp'] = now_dt, base
-    if trigger_sell:
+    
+    # 1. 判断是否需要移动基准价 (棘轮效应)
+    is_in_buy_only_range = (pos - unit <= state['base_position'])
+    is_in_sell_only_range = (pos + unit >= state['max_position'])
+    
+    ratchet_up = is_in_buy_only_range and price >= sell_p
+    ratchet_down = is_in_sell_only_range and price <= buy_p
+
+    if ratchet_up:
         state['base_price'] = sell_p
-        info('[{}] 触及卖格价，基准价上移至 {:.3f}', symbol, sell_p)
+        info('[{}] 价格上涨，基准价上移至 {:.3f}', symbol, sell_p)
         cancel_all_orders_by_symbol(context, symbol)
-        buy_p, sell_p = round(sell_p * (1 - buy_sp), 3), round(sell_p * (1 + sell_sp), 3)
-    elif trigger_buy:
+        buy_p, sell_p = round(sell_p * (1 - state['buy_grid_spacing']), 3), round(sell_p * (1 + state['sell_grid_spacing']), 3)
+    elif ratchet_down:
         state['base_price'] = buy_p
-        info('[{}] 触及买格价，基准价下移至 {:.3f}', symbol, buy_p)
+        info('[{}] 价格下跌，基准价下移至 {:.3f}', symbol, buy_p)
         cancel_all_orders_by_symbol(context, symbol)
-        buy_p, sell_p = round(buy_p * (1 - buy_sp), 3), round(buy_p * (1 + sell_sp), 3)
+        buy_p, sell_p = round(buy_p * (1 - state['buy_grid_spacing']), 3), round(buy_p * (1 + state['sell_grid_spacing']), 3)
+    else:
+        # 2. 如果不需要移动基准价，则应用常规的下单节流/防抖逻辑
+        if state.get('_last_order_ts') and (now_dt - state.get('_last_order_ts')).seconds < 30: return
+        if state.get('_last_order_bp') and abs(base / state.get('_last_order_bp') - 1) < state['buy_grid_spacing'] / 2: return
+        state['_last_order_ts'], state['_last_order_bp'] = now_dt, base
+        
+    # 3. 执行挂单
     try:
         open_orders = [o for o in get_open_orders(symbol) or [] if o.status == '2']
         enable_amount = position.enable_amount
