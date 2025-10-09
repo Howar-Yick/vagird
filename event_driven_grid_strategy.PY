@@ -1,7 +1,7 @@
 # event_driven_grid_strategy.py
-# 版本号：GEMINI-2.0-1010-PERF-LOGGING
-# 2.0-1010-PERF-LOGGING: 【功能新增】为实现未来的业绩归因分析，增加详细交易日志功能。
-# 每笔成交都会被记录到 a_trade_details.csv 文件中，包含当时的底仓目标，为后续分析奠定数据基础。
+# 版本号：GEMINI-2.0-1009-MERGE-FIX
+# 2.0-1009-MERGE-FIX: 【最终合并修复版】以最新版为基础，从VCHATGPT-0708版中恢复了
+# ATR动态网格每分钟调整的核心逻辑，并修复了所有已知Bug。
 
 import json
 import logging
@@ -13,7 +13,7 @@ from types import SimpleNamespace
 # 全局文件句柄 & 常量
 LOG_FH = None
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'GEMINI-2.0-1010-PERF-LOGGING'
+__version__ = 'GEMINI-2.0-1009-MERGE-FIX'
 TRANSACTION_COST = 0.00005 
 
 # --- 路径与辅助函数 ---
@@ -245,10 +245,6 @@ def on_trade_response(context, trade_list):
         if str(tr.get('status')) != '8': continue
         sym = convert_symbol_to_standard(tr['stock_code'])
         entrust_no = tr['entrust_no']
-
-        # 【功能新增】调用交易日志记录函数
-        log_trade_details(context, sym, tr)
-
         if sym not in context.state or entrust_no in context.state[sym]['filled_order_ids']: continue
         context.state[sym]['filled_order_ids'].add(entrust_no)
         safe_save_state(sym, context.state[sym])
@@ -288,40 +284,33 @@ def on_order_filled(context, symbol, order):
 def handle_data(context, data):
     now_dt = context.current_dt
     now = now_dt.time()
-
-    is_5_min_tick = (now_dt.minute % 5 == 0 and now_dt.second < 5)
-    if is_5_min_tick:
+    if now_dt.minute % 5 == 0 and now_dt.second < 5:
         reload_config_if_changed(context)
-        generate_html_report(context)
-    
-    is_30_min_tick = (now_dt.minute % 30 == 0 and now_dt.second < 5)
-    if is_30_min_tick:
-        info('📌 每30分钟状态巡检...')
-
+        generate_html_report(context) 
     for sym in context.symbol_list:
-        if sym not in context.state or sym not in data or not data[sym] or data[sym].price <= 0:
-            continue
-        
-        context.latest_data[sym] = data[sym].price
+        if sym in data and data[sym] and data[sym].price > 0:
+            context.latest_data[sym] = data[sym].price
+    for sym in context.symbol_list:
+        if sym not in context.state: continue
         st = context.state[sym]
-        price = context.latest_data[sym]
-
+        price = context.latest_data.get(sym)
+        if not price: continue
         get_target_base_position(context, sym, st, price, now_dt)
         adjust_grid_unit(st)
-        update_grid_spacing_final(context, sym, st, get_position(sym).amount)
-
-        if is_30_min_tick:
-            log_status(context, sym, st, price)
-
+        if now_dt.minute % 30 == 0 and now_dt.second < 5:
+            update_grid_spacing_final(context, sym, st, get_position(sym).amount)
     if is_auction_time() or (is_main_trading_time() and now < time(14, 50)):
         for sym in context.symbol_list:
-            if sym in context.state:
-                place_limit_orders(context, sym, context.state[sym])
-    
+            if sym in context.state: place_limit_orders(context, sym, context.state[sym])
     if time(14, 55) <= now < time(14, 57):
         for sym in context.symbol_list:
             if sym in context.state:
                 place_market_orders_if_triggered(context, sym, context.state[sym])
+    if now_dt.minute % 30 == 0 and now_dt.second < 5:
+        info('📌 每30分钟状态巡检...')
+        for sym in context.symbol_list:
+            if sym in context.state:
+                log_status(context, sym, context.state[sym], context.latest_data.get(sym))
 
 def place_market_orders_if_triggered(context, symbol, state):
     if not is_main_trading_time(): return
