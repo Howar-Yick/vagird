@@ -1,6 +1,6 @@
 # event_driven_grid_strategy.py
-# 版本号：GEMINI-1.6-1009-COST-UPDATE
-# 1.6-1009-COST-UPDATE: 【参数优化】根据用户实际费率，将TRANSACTION_COST从万分之0.6精确调整为万分之0.5。
+# 版本号：GEMINI-1.0-0926-VERSION-RULE-ADOPTED
+# 1.0-0926-VERSION-RULE-ADOPTED: 【版本号规则更新】采纳用户定义的全新版本号命名规范。
 
 import json
 import logging
@@ -12,9 +12,8 @@ from types import SimpleNamespace
 # 全局文件句柄 & 常量
 LOG_FH = None
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'GEMINI-1.6-1009-COST-UPDATE'
-# 【参数优化】根据用户实际费率，将交易成本调整为万分之0.5
-TRANSACTION_COST = 0.00005 
+__version__ = 'GEMINI-1.0-0926-VERSION-RULE-ADOPTED'
+TRANSACTION_COST = 0.00006 
 
 # --- 路径与辅助函数 ---
 def research_path(*parts) -> Path:
@@ -92,8 +91,6 @@ def initialize(context):
     context.symbol_list = list(context.symbol_config.keys())
     context.state = {}
     context.latest_data = {}
-    context.should_place_order_map = {}
-
     for sym, cfg in context.symbol_config.items():
         state_file = research_path('state', f'{sym}.json')
         saved = json.loads(state_file.read_text(encoding='utf-8')) if state_file.exists() else get_saved_param(f'state_{sym}', {}) or {}
@@ -111,8 +108,6 @@ def initialize(context):
         })
         context.state[sym] = st
         context.latest_data[sym] = st['base_price']
-        context.should_place_order_map[sym] = True
-
     context.initial_cleanup_done = False
     if '回测' not in context.env:
         run_daily(context, place_auction_orders, time='9:15')
@@ -278,7 +273,6 @@ def on_order_filled(context, symbol, order):
         info('[{}] 处于9:25-9:30挂单冻结期，成交后仅更新状态，推迟挂单至9:30后。', symbol)
     elif context.current_dt.time() < time(14, 50):
         place_limit_orders(context, symbol, state)
-    context.should_place_order_map[symbol] = True
     safe_save_state(symbol, state)
 
 def handle_data(context, data):
@@ -389,7 +383,6 @@ def end_of_day(context):
     for sym in context.symbol_list:
         if sym in context.state:
             safe_save_state(sym, context.state[sym])
-            context.should_place_order_map[sym] = True
     info('✅ 日终保存状态完成')
 
 def get_target_base_position(context, symbol, state, price, dt):
@@ -479,32 +472,41 @@ def reload_config_if_changed(context):
     except Exception as e:
         info(f'❌ 配置文件热重载失败: {e}')
 
+# =====================================================================================
+# 【恢复功能】每日CSV报表生成函数 (来自 VCHATGPT-0708)
+# =====================================================================================
 def update_daily_reports(context, data):
     """为每个标的维护一个 CSV 文件，每日收盘后追加一行"""
     reports_dir = research_path('reports')
     reports_dir.mkdir(parents=True, exist_ok=True)
     current_date = context.current_dt.strftime("%Y-%m-%d")
+
     for symbol in context.symbol_list:
         report_file = reports_dir / f"{symbol}.csv"
         state       = context.state[symbol]
         pos_obj     = get_position(symbol)
         amount      = getattr(pos_obj, 'amount', 0)
         cost_basis  = getattr(pos_obj, 'cost_basis', state['base_price'])
+        
         close_price = context.latest_data.get(symbol, state['base_price'])
         try:
             close_price = getattr(close_price, 'price', close_price)
         except:
             close_price = state['base_price']
+
         weeks       = len(state.get('trade_week_set', []))
         count       = weeks
         d_base      = state['dingtou_base']
         d_rate      = state['dingtou_rate']
+        
         invest_should = d_base
         invest_actual = d_base * (1 + d_rate) ** weeks
         cumulative_invest = sum(d_base * (1 + d_rate) ** w for w in range(1, weeks+1))
         expected_value = state['initial_position_value'] + d_base * weeks
+
         last_week_val = state.get('last_week_position', 0) * close_price
         current_val   = amount * close_price
+
         weekly_return = (current_val - last_week_val) / last_week_val if last_week_val>0 else 0.0
         total_return  = (current_val - cumulative_invest) / cumulative_invest if cumulative_invest>0 else 0.0
         weekly_bottom_profit = (state['base_position'] - state.get('last_week_position', 0)) * close_price
@@ -515,6 +517,7 @@ def update_daily_reports(context, data):
         compare_cost    = added_base * close_price
         profit_all      = (close_price - cost_basis) * amount if cost_basis > 0 else 0
         t_quantity = max(0, amount - state['base_position'])
+
         row = [
             current_date, f"{close_price:.3f}", str(weeks), str(count),
             f"{weekly_return:.2%}", f"{total_return:.2%}", f"{expected_value:.2f}",
@@ -526,6 +529,7 @@ def update_daily_reports(context, data):
             str(intermediate_qty), str(state['max_position']), f"{cost_basis:.3f}",
             f"{compare_cost:.3f}", f"{profit_all:.0f}"
         ]
+        
         is_new = not report_file.exists()
         with open(report_file, 'a', encoding='utf-8', newline='') as f:
             if is_new:
@@ -538,23 +542,34 @@ def update_daily_reports(context, data):
                 ]
                 f.write(",".join(headers) + "\n")
             f.write(",".join(map(str, row)) + "\n")
+
         info(f'✅ [{symbol}] 已更新每日CSV报表：{report_file}')
 
+# =====================================================================================
+# HTML实时看板生成函数 (暗黑主题，无刷新脚本)
+# =====================================================================================
 def generate_html_report(context):
     """生成一个HTML格式的策略状态看板，并写入文件。"""
+    
+    # --- 数据准备 ---
     all_metrics = []
     total_market_value = 0
     total_unrealized_pnl = 0
+
     for symbol in context.symbol_list:
         if symbol not in context.state: continue
         state = context.state[symbol]
         pos = get_position(symbol)
         price = context.latest_data.get(symbol, 0)
+        
         market_value = pos.amount * price
         unrealized_pnl = (price - pos.cost_basis) * pos.amount if pos.cost_basis > 0 else 0
+        
         total_market_value += market_value
         total_unrealized_pnl += unrealized_pnl
+        
         atr_pct = calculate_atr(context, symbol)
+
         all_metrics.append({
             "symbol": symbol,
             "position": f"{pos.amount} ({pos.enable_amount})",
@@ -568,6 +583,8 @@ def generate_html_report(context):
             "grid_spacing": f"{state['buy_grid_spacing']:.2%} / {state['sell_grid_spacing']:.2%}",
             "atr_str": f"{atr_pct:.2%}" if atr_pct is not None else "N/A"
         })
+
+    # --- HTML模板 ---
     html_template = """
     <!DOCTYPE html>
     <html lang="zh-CN">
@@ -582,19 +599,74 @@ def generate_html_report(context):
                 margin: 0;
                 padding: 20px;
             }}
-            .container {{ max-width: 1400px; margin: auto; }}
-            h1 {{ text-align: center; color: #ffffff; border-bottom: 2px solid #333; padding-bottom: 10px; margin-top: 0; }}
-            .update-time {{ text-align: center; color: #888; margin-top: -10px; margin-bottom: 20px; }}
-            .summary-cards {{ display: flex; gap: 20px; justify-content: center; margin-bottom: 30px; }}
-            .card {{ background-color: #1e1e1e; padding: 20px; border-radius: 8px; text-align: center; border: 1px solid #333; min-width: 250px; }}
-            .card h3 {{ margin: 0 0 10px 0; color: #aaa; font-weight: normal; text-transform: uppercase; font-size: 1em; }}
-            .card .value {{ font-size: 2em; font-weight: bold; }}
-            .data-table {{ width: 100%; border-collapse: collapse; background-color: #1e1e1e; box-shadow: 0 2px 5px rgba(0,0,0,0.3); }}
-            .data-table th, .data-table td {{ border: 1px solid #333; padding: 12px 15px; text-align: right; }}
-            .data-table th {{ background-color: #2a2a2a; color: #ffffff; font-weight: bold; }}
-            .data-table tbody tr:nth-child(even) {{ background-color: #242424; }}
-            .data-table tbody tr:hover {{ background-color: #383838; }}
-            .data-table td:first-child {{ text-align: left; font-weight: bold; }}
+            .container {{
+                max-width: 1400px;
+                margin: auto;
+            }}
+            h1 {{
+                text-align: center;
+                color: #ffffff;
+                border-bottom: 2px solid #333;
+                padding-bottom: 10px;
+                margin-top: 0;
+            }}
+            .update-time {{
+                text-align: center;
+                color: #888;
+                margin-top: -10px;
+                margin-bottom: 20px;
+            }}
+            .summary-cards {{
+                display: flex;
+                gap: 20px;
+                justify-content: center;
+                margin-bottom: 30px;
+            }}
+            .card {{
+                background-color: #1e1e1e;
+                padding: 20px;
+                border-radius: 8px;
+                text-align: center;
+                border: 1px solid #333;
+                min-width: 250px;
+            }}
+            .card h3 {{
+                margin: 0 0 10px 0;
+                color: #aaa;
+                font-weight: normal;
+                text-transform: uppercase;
+                font-size: 1em;
+            }}
+            .card .value {{
+                font-size: 2em;
+                font-weight: bold;
+            }}
+            .data-table {{
+                width: 100%;
+                border-collapse: collapse;
+                background-color: #1e1e1e;
+                box-shadow: 0 2px 5px rgba(0,0,0,0.3);
+            }}
+            .data-table th, .data-table td {{
+                border: 1px solid #333;
+                padding: 12px 15px;
+                text-align: right;
+            }}
+            .data-table th {{
+                background-color: #2a2a2a;
+                color: #ffffff;
+                font-weight: bold;
+            }}
+            .data-table tbody tr:nth-child(even) {{
+                background-color: #242424;
+            }}
+            .data-table tbody tr:hover {{
+                background-color: #383838;
+            }}
+            .data-table td:first-child {{
+                text-align: left;
+                font-weight: bold;
+            }}
             .positive {{ color: #4caf50; }}
             .negative {{ color: #f44336; }}
             .footer {{ text-align: center; margin-top: 20px; color: #888; font-size: 12px; }}
@@ -604,6 +676,7 @@ def generate_html_report(context):
         <div class="container">
             <h1>策略运行看板</h1>
             <p class="update-time">最后更新时间: {update_time}</p>
+            
             <div class="summary-cards">
                 <div class="card">
                     <h3>总市值</h3>
@@ -614,6 +687,7 @@ def generate_html_report(context):
                     <p class="value {pnl_class}">{total_unrealized_pnl}</p>
                 </div>
             </div>
+
             <table class="data-table">
                 <thead>
                     <tr>
@@ -639,6 +713,7 @@ def generate_html_report(context):
     </body>
     </html>
     """
+
     table_rows = ""
     for m in all_metrics:
         pnl_class = "positive" if float(m["unrealized_pnl"].replace(",", "")) >= 0 else "negative"
@@ -657,6 +732,8 @@ def generate_html_report(context):
             <td>{m['atr_str']}</td>
         </tr>
         """
+
+    # --- 渲染并写入文件 ---
     final_html = html_template.format(
         update_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         total_market_value=f"{total_market_value:,.2f}",
@@ -664,6 +741,7 @@ def generate_html_report(context):
         pnl_class="positive" if total_unrealized_pnl >= 0 else "negative",
         table_rows=table_rows
     )
+
     try:
         report_path = research_path('reports', 'strategy_dashboard.html')
         report_path.write_text(final_html, encoding='utf-8')
