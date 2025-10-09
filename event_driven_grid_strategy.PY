@@ -1,6 +1,7 @@
 # event_driven_grid_strategy.py
-# 版本号：GEMINI-1.6-1009-COST-UPDATE
-# 1.6-1009-COST-UPDATE: 【参数优化】根据用户实际费率，将TRANSACTION_COST从万分之0.6精确调整为万分之0.5。
+# 版本号：GEMINI-1.7-1009-VA-SELL-FIX
+# 1.7-1009-VA-SELL-FIX: 【核心逻辑修复】修正了价值平均(VA)的实现，
+# 恢复了当市值超过价值轨道时，应减少底仓（卖出）的核心功能。
 
 import json
 import logging
@@ -12,8 +13,7 @@ from types import SimpleNamespace
 # 全局文件句柄 & 常量
 LOG_FH = None
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'GEMINI-1.6-1009-COST-UPDATE'
-# 【参数优化】根据用户实际费率，将交易成本调整为万分之0.5
+__version__ = 'GEMINI-1.7-1009-VA-SELL-FIX'
 TRANSACTION_COST = 0.00005 
 
 # --- 路径与辅助函数 ---
@@ -392,19 +392,38 @@ def end_of_day(context):
             context.should_place_order_map[sym] = True
     info('✅ 日终保存状态完成')
 
+# =====================================================================================
+# 【核心逻辑修复】价值平均函数 (get_target_base_position)
+# =====================================================================================
 def get_target_base_position(context, symbol, state, price, dt):
+    """计算定投目标仓位并更新底仓/max仓位 (已修复卖出逻辑)"""
     weeks = get_trade_weeks(context, symbol, state, dt)
+    
+    # 目标价值轨道计算保持不变
     target_val = state['initial_position_value'] + sum(state['dingtou_base'] * (1 + state['dingtou_rate'])**w for w in range(1, weeks + 1))
-    delta_val = target_val - (state['last_week_position'] * price)
+    
+    # 当前市值评估，使用上周底仓作为基准，确保每周只做一次大的方向性调整
+    current_val = state['last_week_position'] * price
+    
+    # 计算市值“缺口”
+    delta_val = target_val - current_val
+
+    # 计算需要调整的股数
     if delta_val > 0:
+        # 缺口为正，需要买入，向上取整以补足
         delta_pos = math.ceil(delta_val / price / 100) * 100
-        new_pos = state['last_week_position'] + delta_pos
     else:
-        new_pos = state['last_week_position']
-    min_base = round(state['initial_position_value'] / state['base_price'] / 100) * 100
+        # 缺口为负，需要卖出，向下取整以卖出足够份额
+        delta_pos = math.floor(delta_val / price / 100) * 100
+        
+    new_pos = state['last_week_position'] + delta_pos
+
+    # 确保底仓不会低于初始底仓（如果有的话）
+    min_base = round(state['initial_position_value'] / state['base_price'] / 100) * 100 if state['base_price'] > 0 else 0
     final_pos = round(max(min_base, new_pos) / 100) * 100
+
     if final_pos != state['base_position']:
-        info('[{}] 价值平均: 目标底仓从 {} 调整至 {}', symbol, state['base_position'], final_pos)
+        info('[{}] 价值平均: 目标底仓从 {} 调整至 {} (市值缺口: {:.2f})', symbol, state['base_position'], final_pos, delta_val)
         state['base_position'] = final_pos
         state['max_position'] = final_pos + state['grid_unit'] * 20
     return final_pos
