@@ -1,7 +1,7 @@
 # event_driven_grid_strategy.py
-# 版本号：GEMINI-2.2-1010-DIAGLOG-ADD
-# 2.2-1010-DIAGLOG-ADD: 【诊断增强】在place_limit_orders函数中增加关键决策日志，
-# 用于追踪策略运行时所获取的实时价格、基准价、挂单价及持仓，以排查棘轮逻辑的触发问题。
+# 版本号：GEMINI-2.7-1011-FINAL-REFRESH-FIX
+# 2.7-1011-FINAL-REFRESH-FIX: 【最终修正】遵照用户指示，在 handle_data 中恢复了
+# VCHATGPT-0708 版本的核心价格更新逻辑，彻底解决因价格缓存不刷新导致P==Base、棘轮失效的根本问题。
 
 import json
 import logging
@@ -13,7 +13,7 @@ from types import SimpleNamespace
 # 全局文件句柄 & 常量
 LOG_FH = None
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'GEMINI-2.2-1010-DIAGLOG-ADD'
+__version__ = 'GEMINI-2.7-1011-FINAL-REFRESH-FIX'
 TRANSACTION_COST = 0.00005 
 
 # --- 路径与辅助函数 ---
@@ -208,33 +208,38 @@ def place_limit_orders(context, symbol, state):
     """
     now_dt = context.current_dt
 
-    # --- 前置检查 ---
-    if state.get('_last_trade_ts') and (now_dt - state['_last_trade_ts']).total_seconds() < 60: return
-    if is_order_blocking_period(): return
-    if not (is_auction_time() or (is_main_trading_time() and now_dt.time() < time(14, 50))): return
-    
+    # --- 前置检查 (来自你的新版本) ---
+    # 1. 成交后60秒冷静期
+    if state.get('_last_trade_ts') and (now_dt - state['_last_trade_ts']).total_seconds() < 60:
+        return
+    # 2. 集合竞价后期(9:25-9:30)不下单
+    if is_order_blocking_period():
+        return
+    # 3. 非挂单时段检查
+    if not (is_auction_time() or (is_main_trading_time() and now_dt.time() < time(14, 50))):
+        return
+    # 4. 价格有效性检查
     price = context.latest_data.get(symbol)
-    if not (price and price > 0): return
+    if not (price and price > 0):
+        return
     base = state['base_price']
-    if abs(price / base - 1) > 0.10: return
+    if abs(price / base - 1) > 0.10:
+        return
 
-    # --- 核心决策变量 ---
+    # --- 核心逻辑 (恢复自 BASE.PY) ---
     unit, buy_sp, sell_sp = state['grid_unit'], state['buy_grid_spacing'], state['sell_grid_spacing']
     buy_p, sell_p = round(base * (1 - buy_sp), 3), round(base * (1 + sell_sp), 3)
 
     position = get_position(symbol)
-    # 使用 .get('_pos_change', 0) 是更安全的方式，确保即使成交回报尚未更新持仓，我们也能使用最新的持仓量进行决策
     pos = position.amount + state.get('_pos_change', 0)
 
-    # --- 【新增】诊断日志 ---
-    # 在做出任何决策前，打印出所有关键变量的快照
+    # --- 诊断日志 ---
     info('[{}] 决策检查: P={:.3f}, Base={:.3f}, BuyP={:.3f}, SellP={:.3f}, Pos={}',
          symbol, price, base, buy_p, sell_p, pos)
 
     # 1. 定义“棘轮”触发条件
     is_in_low_pos_range = (pos - unit <= state['base_position'])
     ratchet_up = is_in_low_pos_range and price >= sell_p
-
     is_in_high_pos_range = (pos + unit >= state['max_position'])
     ratchet_down = is_in_high_pos_range and price <= buy_p
 
@@ -264,8 +269,6 @@ def place_limit_orders(context, symbol, state):
     try:
         open_orders = [o for o in get_open_orders(symbol) or [] if o.status == '2']
         enable_amount = position.enable_amount
-        
-        # 在消费完 _pos_change 后，将其从 state 中移除，避免重复计算
         state.pop('_pos_change', None)
 
         can_buy = not any(o.amount > 0 and abs(o.price - buy_p) < 1e-3 for o in open_orders)
@@ -328,12 +331,17 @@ def on_order_filled(context, symbol, order):
 def handle_data(context, data):
     now_dt = context.current_dt
     now = now_dt.time()
-    if now_dt.minute % 5 == 0 and now_dt.second < 5:
-        reload_config_if_changed(context)
-        generate_html_report(context) 
+
+    # --- 【最终修正】 ---
+    # 恢复 VCHATGPT-0708 版本的核心价格更新逻辑
     for sym in context.symbol_list:
         if sym in data and data[sym] and data[sym].price > 0:
             context.latest_data[sym] = data[sym].price
+
+    if now_dt.minute % 5 == 0 and now_dt.second < 5:
+        reload_config_if_changed(context)
+        generate_html_report(context) 
+        
     for sym in context.symbol_list:
         if sym not in context.state: continue
         st = context.state[sym]
@@ -343,13 +351,16 @@ def handle_data(context, data):
         adjust_grid_unit(st)
         if now_dt.minute % 30 == 0 and now_dt.second < 5:
             update_grid_spacing_final(context, sym, st, get_position(sym).amount)
+            
     if is_auction_time() or (is_main_trading_time() and now < time(14, 50)):
         for sym in context.symbol_list:
             if sym in context.state: place_limit_orders(context, sym, context.state[sym])
+            
     if time(14, 55) <= now < time(14, 57):
         for sym in context.symbol_list:
             if sym in context.state:
                 place_market_orders_if_triggered(context, sym, context.state[sym])
+                
     if now_dt.minute % 30 == 0 and now_dt.second < 5:
         info('📌 每30分钟状态巡检...')
         for sym in context.symbol_list:
@@ -533,6 +544,7 @@ def update_daily_reports(context, data):
     reports_dir.mkdir(parents=True, exist_ok=True)
     current_date = context.current_dt.strftime("%Y-%m-%d")
     for symbol in context.symbol_list:
+        if symbol not in context.state: continue
         report_file = reports_dir / f"{symbol}.csv"
         state       = context.state[symbol]
         pos_obj     = get_position(symbol)
