@@ -1,7 +1,6 @@
 # event_driven_grid_strategy.py
-# 版本号：GEMINI-2.8-1011-DICT-COMP-RESTORE
-# 2.8-1011-DICT-COMP-RESTORE: 【最终修正】遵照用户指示，在 handle_data 中彻底恢复
-# VCHATGPT-0708 版本的字典推导式行情更新方法，以解决P==Base的根本问题。
+# 版本号：GEMINI-3.0-1010-FIX-ORDER
+# 3.0-1010-FIX-ORDER: 修复只买不卖和只卖不买更新基准价的问题。
 
 import json
 import logging
@@ -13,7 +12,7 @@ from types import SimpleNamespace
 # 全局文件句柄 & 常量
 LOG_FH = None
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'GEMINI-2.8-1011-DICT-COMP-RESTORE'
+__version__ = 'GEMINI-3.0-1010-FIX-ORDER'
 TRANSACTION_COST = 0.00005 
 
 # --- 路径与辅助函数 ---
@@ -198,8 +197,17 @@ def place_auction_orders(context):
         safe_save_state(sym, state)
 
 def place_limit_orders(context, symbol, state):
+    """
+    限价挂单主函数。
+    【核心逻辑修复】采用 VCHATGPT-0708 版本的逻辑结构，确保“棘轮”功能正常。
+    1. 优先判断是否触发“棘轮”条件（只买不卖触及卖价，或只卖不买触及买价）。
+    2. 如果触发，则无视节流防抖，立即更新基准价并重新计算网格。
+    3. 如果未触发，则执行常规的节流防抖逻辑。
+    4. 最后根据计算出的价格挂单。
+    """
     now_dt = context.current_dt
 
+    # --- 前置检查 ---
     if state.get('_last_trade_ts') and (now_dt - state['_last_trade_ts']).total_seconds() < 60: return
     if is_order_blocking_period(): return
     if not (is_auction_time() or (is_main_trading_time() and now_dt.time() < time(14, 50))): return
@@ -209,26 +217,37 @@ def place_limit_orders(context, symbol, state):
     base = state['base_price']
     if abs(price / base - 1) > 0.10: return
 
+    # --- 核心决策变量 ---
     unit, buy_sp, sell_sp = state['grid_unit'], state['buy_grid_spacing'], state['sell_grid_spacing']
     buy_p, sell_p = round(base * (1 - buy_sp), 3), round(base * (1 + sell_sp), 3)
+
     position = get_position(symbol)
+    # 使用 .get('_pos_change', 0) 是更安全的方式，确保即使成交回报尚未更新持仓，我们也能使用最新的持仓量进行决策
     pos = position.amount + state.get('_pos_change', 0)
 
+    # --- 【新增】诊断日志 ---
+    # 在做出任何决策前，打印出所有关键变量的快照
     info('[{}] 决策检查: P={:.3f}, Base={:.3f}, BuyP={:.3f}, SellP={:.3f}, Pos={}',
          symbol, price, base, buy_p, sell_p, pos)
 
+    # 1. 定义“棘轮”触发条件
     is_in_low_pos_range = (pos - unit <= state['base_position'])
     ratchet_up = is_in_low_pos_range and price >= sell_p
+
     is_in_high_pos_range = (pos + unit >= state['max_position'])
     ratchet_down = is_in_high_pos_range and price <= buy_p
 
+    # 2. 如果不是棘轮行情，则应用常规节流/防抖
     if not (ratchet_up or ratchet_down):
         last_ts = state.get('_last_order_ts')
-        if last_ts and (now_dt - last_ts).seconds < 30: return
+        if last_ts and (now_dt - last_ts).seconds < 30:
+            return
         last_bp = state.get('_last_order_bp')
-        if last_bp and abs(base / last_bp - 1) < buy_sp / 2: return
+        if last_bp and abs(base / last_bp - 1) < buy_sp / 2:
+            return
         state['_last_order_ts'], state['_last_order_bp'] = now_dt, base
 
+    # 3. 处理棘轮（如果触发）
     if ratchet_up:
         state['base_price'] = sell_p
         info('[{}] 棘轮上移: 价格上涨触及卖价，基准价上移至 {:.3f}', symbol, sell_p)
@@ -240,18 +259,24 @@ def place_limit_orders(context, symbol, state):
         cancel_all_orders_by_symbol(context, symbol)
         buy_p, sell_p = round(buy_p * (1 - state['buy_grid_spacing']), 3), round(buy_p * (1 + state['sell_grid_spacing']), 3)
 
+    # 4. 执行挂单
     try:
         open_orders = [o for o in get_open_orders(symbol) or [] if o.status == '2']
         enable_amount = position.enable_amount
+        
+        # 在消费完 _pos_change 后，将其从 state 中移除，避免重复计算
         state.pop('_pos_change', None)
+
         can_buy = not any(o.amount > 0 and abs(o.price - buy_p) < 1e-3 for o in open_orders)
         if can_buy and pos + unit <= state['max_position']:
             info('[{}] --> 发起买入委托: {}股 @ {:.3f}', symbol, unit, buy_p)
             order(symbol, unit, limit_price=buy_p)
+
         can_sell = not any(o.amount < 0 and abs(o.price - sell_p) < 1e-3 for o in open_orders)
         if can_sell and enable_amount >= unit and pos - unit >= state['base_position']:
             info('[{}] --> 发起卖出委托: {}股 @ {:.3f}', symbol, unit, sell_p)
             order(symbol, -unit, limit_price=sell_p)
+
     except Exception as e:
         info('[{}] ⚠️ 限价挂单异常：{}', symbol, e)
     finally:
@@ -302,21 +327,17 @@ def on_order_filled(context, symbol, order):
 def handle_data(context, data):
     now_dt = context.current_dt
     now = now_dt.time()
-
-    # --- 【最终修正】 ---
-    # 恢复 VCHATGPT-0708 版本的核心价格更新逻辑
-    try:
-        context.latest_data = {
-            sym: data[sym].price
-            for sym in context.symbol_list if sym in data and data[sym] and data[sym].price > 0
-        }
-    except Exception as e:
-        info("⚠️ 更新 context.latest_data 失败: {}", e)
-
     if now_dt.minute % 5 == 0 and now_dt.second < 5:
         reload_config_if_changed(context)
         generate_html_report(context) 
-        
+#    for sym in context.symbol_list:
+#        if sym in data and data[sym] and data[sym].price > 0:
+#            context.latest_data[sym] = data[sym].price
+    # 1) 更新最新行情缓存
+    context.latest_data = {
+        sym: data[sym].price
+        for sym in context.symbol_list
+    }
     for sym in context.symbol_list:
         if sym not in context.state: continue
         st = context.state[sym]
@@ -326,16 +347,13 @@ def handle_data(context, data):
         adjust_grid_unit(st)
         if now_dt.minute % 30 == 0 and now_dt.second < 5:
             update_grid_spacing_final(context, sym, st, get_position(sym).amount)
-            
     if is_auction_time() or (is_main_trading_time() and now < time(14, 50)):
         for sym in context.symbol_list:
             if sym in context.state: place_limit_orders(context, sym, context.state[sym])
-            
     if time(14, 55) <= now < time(14, 57):
         for sym in context.symbol_list:
             if sym in context.state:
                 place_market_orders_if_triggered(context, sym, context.state[sym])
-                
     if now_dt.minute % 30 == 0 and now_dt.second < 5:
         info('📌 每30分钟状态巡检...')
         for sym in context.symbol_list:
@@ -519,7 +537,6 @@ def update_daily_reports(context, data):
     reports_dir.mkdir(parents=True, exist_ok=True)
     current_date = context.current_dt.strftime("%Y-%m-%d")
     for symbol in context.symbol_list:
-        if symbol not in context.state: continue
         report_file = reports_dir / f"{symbol}.csv"
         state       = context.state[symbol]
         pos_obj     = get_position(symbol)
