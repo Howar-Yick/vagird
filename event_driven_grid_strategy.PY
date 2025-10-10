@@ -1,7 +1,7 @@
 # event_driven_grid_strategy.py
-# 版本号：GEMINI-2.1-1010-RATCHET-FIX
-# 2.1-1010-RATCHET-FIX: 【核心逻辑修复】重构place_limit_orders函数，分离“棘轮”和“常规挂单”逻辑，
-# 解决了在低仓位（只买不卖）和高仓位（只卖不买）状态下，基准价未能随价格双向移动的严重Bug。
+# 版本号：GEMINI-2.2-1010-DIAGLOG-ADD
+# 2.2-1010-DIAGLOG-ADD: 【诊断增强】在place_limit_orders函数中增加关键决策日志，
+# 用于追踪策略运行时所获取的实时价格、基准价、挂单价及持仓，以排查棘轮逻辑的触发问题。
 
 import json
 import logging
@@ -13,7 +13,7 @@ from types import SimpleNamespace
 # 全局文件句柄 & 常量
 LOG_FH = None
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'GEMINI-2.1-1010-RATCHET-FIX'
+__version__ = 'GEMINI-2.2-1010-DIAGLOG-ADD'
 TRANSACTION_COST = 0.00005 
 
 # --- 路径与辅助函数 ---
@@ -198,52 +198,86 @@ def place_auction_orders(context):
         safe_save_state(sym, state)
 
 def place_limit_orders(context, symbol, state):
+    """
+    限价挂单主函数。
+    【核心逻辑修复】采用 VCHATGPT-0708 版本的逻辑结构，确保“棘轮”功能正常。
+    1. 优先判断是否触发“棘轮”条件（只买不卖触及卖价，或只卖不买触及买价）。
+    2. 如果触发，则无视节流防抖，立即更新基准价并重新计算网格。
+    3. 如果未触发，则执行常规的节流防抖逻辑。
+    4. 最后根据计算出的价格挂单。
+    """
     now_dt = context.current_dt
+
+    # --- 前置检查 ---
     if state.get('_last_trade_ts') and (now_dt - state['_last_trade_ts']).total_seconds() < 60: return
     if is_order_blocking_period(): return
     if not (is_auction_time() or (is_main_trading_time() and now_dt.time() < time(14, 50))): return
+    
     price = context.latest_data.get(symbol)
     if not (price and price > 0): return
     base = state['base_price']
     if abs(price / base - 1) > 0.10: return
+
+    # --- 核心决策变量 ---
     unit, buy_sp, sell_sp = state['grid_unit'], state['buy_grid_spacing'], state['sell_grid_spacing']
     buy_p, sell_p = round(base * (1 - buy_sp), 3), round(base * (1 + sell_sp), 3)
-    position = get_position(symbol)
-    pos = position.amount + state.pop('_pos_change', 0)
-    
-    # 1. 判断是否需要移动基准价 (棘轮效应)
-    is_in_buy_only_range = (pos - unit <= state['base_position'])
-    is_in_sell_only_range = (pos + unit >= state['max_position'])
-    
-    ratchet_up = is_in_buy_only_range and price >= sell_p
-    ratchet_down = is_in_sell_only_range and price <= buy_p
 
+    position = get_position(symbol)
+    # 使用 .get('_pos_change', 0) 是更安全的方式，确保即使成交回报尚未更新持仓，我们也能使用最新的持仓量进行决策
+    pos = position.amount + state.get('_pos_change', 0)
+
+    # --- 【新增】诊断日志 ---
+    # 在做出任何决策前，打印出所有关键变量的快照
+    info('[{}] 决策检查: P={:.3f}, Base={:.3f}, BuyP={:.3f}, SellP={:.3f}, Pos={}',
+         symbol, price, base, buy_p, sell_p, pos)
+
+    # 1. 定义“棘轮”触发条件
+    is_in_low_pos_range = (pos - unit <= state['base_position'])
+    ratchet_up = is_in_low_pos_range and price >= sell_p
+
+    is_in_high_pos_range = (pos + unit >= state['max_position'])
+    ratchet_down = is_in_high_pos_range and price <= buy_p
+
+    # 2. 如果不是棘轮行情，则应用常规节流/防抖
+    if not (ratchet_up or ratchet_down):
+        last_ts = state.get('_last_order_ts')
+        if last_ts and (now_dt - last_ts).seconds < 30:
+            return
+        last_bp = state.get('_last_order_bp')
+        if last_bp and abs(base / last_bp - 1) < buy_sp / 2:
+            return
+        state['_last_order_ts'], state['_last_order_bp'] = now_dt, base
+
+    # 3. 处理棘轮（如果触发）
     if ratchet_up:
         state['base_price'] = sell_p
-        info('[{}] 价格上涨，基准价上移至 {:.3f}', symbol, sell_p)
+        info('[{}] 棘轮上移: 价格上涨触及卖价，基准价上移至 {:.3f}', symbol, sell_p)
         cancel_all_orders_by_symbol(context, symbol)
         buy_p, sell_p = round(sell_p * (1 - state['buy_grid_spacing']), 3), round(sell_p * (1 + state['sell_grid_spacing']), 3)
     elif ratchet_down:
         state['base_price'] = buy_p
-        info('[{}] 价格下跌，基准价下移至 {:.3f}', symbol, buy_p)
+        info('[{}] 棘轮下移: 价格下跌触及买价，基准价下移至 {:.3f}', symbol, buy_p)
         cancel_all_orders_by_symbol(context, symbol)
         buy_p, sell_p = round(buy_p * (1 - state['buy_grid_spacing']), 3), round(buy_p * (1 + state['sell_grid_spacing']), 3)
-    else:
-        # 2. 如果不需要移动基准价，则应用常规的下单节流/防抖逻辑
-        if state.get('_last_order_ts') and (now_dt - state.get('_last_order_ts')).seconds < 30: return
-        if state.get('_last_order_bp') and abs(base / state.get('_last_order_bp') - 1) < state['buy_grid_spacing'] / 2: return
-        state['_last_order_ts'], state['_last_order_bp'] = now_dt, base
-        
-    # 3. 执行挂单
+
+    # 4. 执行挂单
     try:
         open_orders = [o for o in get_open_orders(symbol) or [] if o.status == '2']
         enable_amount = position.enable_amount
-        if not any(o.amount > 0 and abs(o.price - buy_p) < 1e-3 for o in open_orders) and pos + unit <= state['max_position']:
+        
+        # 在消费完 _pos_change 后，将其从 state 中移除，避免重复计算
+        state.pop('_pos_change', None)
+
+        can_buy = not any(o.amount > 0 and abs(o.price - buy_p) < 1e-3 for o in open_orders)
+        if can_buy and pos + unit <= state['max_position']:
             info('[{}] --> 发起买入委托: {}股 @ {:.3f}', symbol, unit, buy_p)
             order(symbol, unit, limit_price=buy_p)
-        if not any(o.amount < 0 and abs(o.price - sell_p) < 1e-3 for o in open_orders) and enable_amount >= unit and pos - unit >= state['base_position']:
+
+        can_sell = not any(o.amount < 0 and abs(o.price - sell_p) < 1e-3 for o in open_orders)
+        if can_sell and enable_amount >= unit and pos - unit >= state['base_position']:
             info('[{}] --> 发起卖出委托: {}股 @ {:.3f}', symbol, unit, sell_p)
             order(symbol, -unit, limit_price=sell_p)
+
     except Exception as e:
         info('[{}] ⚠️ 限价挂单异常：{}', symbol, e)
     finally:
