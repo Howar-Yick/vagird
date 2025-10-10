@@ -227,8 +227,8 @@ def place_limit_orders(context, symbol, state):
 
     # --- 【新增】诊断日志 ---
     # 在做出任何决策前，打印出所有关键变量的快照
-    info('[{}] 决策检查: P={:.3f}, Base={:.3f}, BuyP={:.3f}, SellP={:.3f}, Pos={}',
-         symbol, price, base, buy_p, sell_p, pos)
+    #info('[{}] 决策检查: P={:.3f}, Base={:.3f}, BuyP={:.3f}, SellP={:.3f}, Pos={}',
+    #     symbol, price, base, buy_p, sell_p, pos)
 
     # 1. 定义“棘轮”触发条件
     is_in_low_pos_range = (pos - unit <= state['base_position'])
