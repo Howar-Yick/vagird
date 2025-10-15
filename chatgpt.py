@@ -1,15 +1,23 @@
 # event_driven_grid_strategy.py
-# 版本号：CHATGPT-3.2.1-20251014-HALT-GUARD-MKT-OFF1456-fix2+rtlog
+# 版本号：CHATGPT-3.2.1-20251014-HALT-GUARD-MKT-OFF1456-fix3b+rtlog-snapshot
 # 变更点（在 HALT-GUARD 基础上的最小改动）：
-# 1) ❌ 删除 14:55 市价下单触发（不再下任何市价单）；
-# 2) ⏰ 限价挂单窗口延长至 14:56 截止；
-# 3) 🧹 日终统一撤单从 14:55 改为 14:56；
-# 4) 📴 14:56 后不再发起新的挂单（仅靠时间判断，无冻结标记）；
-# 5) 🪫 挂单“不依赖当日是否收到新价”：重启后与集合竞价阶段，统一按各标的保存的 base_price 补挂网格；
-# 6) 🕒 启动宽限期 boot_grace（默认180秒，可配置）：宽限内不做停牌判定；180秒后才开始“阶段+断流”判停；
-# 7) 🛡️ 停牌只影响看板/报表等计算展示，不再拦截挂单（移除 place_limit_orders 中对 mark_halted 的早退）。
-# 8) 🔧 若无当日新价：连续竞价阶段也允许按 base_price 继续挂单；仅在有实时价时启用棘轮移动。
-# 9) 🧪【新增】实时价心跳调试日志（每分钟1行，默认关），开关由 config/debug.json 控制，支持热更新。
+# 1) ❌ 不改市价单（仍然完全移除14:55市价触发）；
+# 2) ⏰ 限价挂单窗口至14:56（保持既有逻辑）；
+# 3) 🧹 日终统一撤单14:56（保持既有逻辑）；
+# 4) 📴 14:56后不再发起新挂单（保持既有逻辑）；
+# 5) 🪫 重启/竞价按 base_price 补挂网格；无实时价不阻断挂单（保持既有逻辑）；
+# 6) 🕒 启动宽限期 boot_grace（默认180秒，可配置参数保留）；
+# 7) 🛡️ 停牌仅影响展示，不拦截挂单（保持既有逻辑）；
+# 8) 🔧 ✅ 实时价获取：用 get_snapshot(...) 的 last_px 更新 latest_data/last_valid_*；
+# 9) 🧪 ✅ 实时价心跳：每“窗口秒”输出 got/miss；调试开关从【研究目录/config/debug.json】热加载：
+#       原始结构：
+#       {
+#         "enable_debug_log": true,
+#         "rt_heartbeat_window_sec": 65,
+#         "rt_heartbeat_preview": 8
+#       }
+#       *保持向后兼容*: 若出现旧版临时键（"debug_rt_log","rt_log_interval_seconds"），也会被识别，但优先使用上述“原始结构”。
+# 10) ⚙️ 棘轮：仅在连续竞价且拿到有效实时价时启用；无价时仍按 base_price 挂单但不移动基准。
 
 import json
 import logging
@@ -21,8 +29,13 @@ from types import SimpleNamespace
 # ---------------- 全局句柄与常量 ----------------
 LOG_FH = None
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'CHATGPT-3.2.1-20251014-HALT-GUARD-MKT-OFF1456-fix2+rtlog'
+__version__ = 'CHATGPT-3.2.1-20251014-HALT-GUARD-MKT-OFF1456-fix3b+rtlog-snapshot'
 TRANSACTION_COST = 0.00005
+
+# ---- 调试默认（可被 config/debug.json 覆盖）----
+DBG_ENABLE_DEFAULT = True
+DBG_RT_WINDOW_SEC_DEFAULT = 60
+DBG_RT_PREVIEW_DEFAULT = 8
 
 # ---------------- 通用路径与工具函数 ----------------
 
@@ -79,45 +92,6 @@ def is_valid_price(x):
     except:
         return False
 
-# ================== 🧪 调试心跳：开关与工具 ==================
-
-def _debug_conf_path():
-    return research_path('config', 'debug.json')
-
-def _load_debug_config(context):
-    """
-    从 config/debug.json 读取调试配置；不存在则认为关闭。
-    支持在线热更：用文件 mtime 判断是否需要重载。
-    """
-    try:
-        p = _debug_conf_path()
-        if p.exists():
-            mtime = p.stat().st_mtime
-            if not hasattr(context, '_debug_conf_mtime') or context._debug_conf_mtime != mtime:
-                cfg_text = p.read_text(encoding='utf-8') or "{}"
-                cfg = json.loads(cfg_text)
-                context.enable_debug_log = bool(cfg.get('enable_debug_log', False))
-                context.rt_hb_window_sec = int(cfg.get('rt_heartbeat_window_sec', 65))
-                context.rt_hb_preview = int(cfg.get('rt_heartbeat_preview', 8))
-                context._debug_conf_mtime = mtime
-        else:
-            context.enable_debug_log = False
-            context.rt_hb_window_sec = 65
-            context.rt_hb_preview = 8
-            context._debug_conf_mtime = None
-    except Exception as e:
-        info('⚠️ 调试配置读取失败，将关闭调试日志: {}', e)
-        context.enable_debug_log = False
-        context.rt_hb_window_sec = 65
-        context.rt_hb_preview = 8
-
-def dlog(context, msg, *args):
-    """仅当调试开关开启时输出（沿用 info 的输出与落盘渠道）。"""
-    if getattr(context, 'enable_debug_log', False):
-        info(msg, *args)
-
-# ============================================================
-
 # ---------------- 状态保存 ----------------
 
 def save_state(symbol, state):
@@ -135,6 +109,71 @@ def safe_save_state(symbol, state):
         save_state(symbol, state)
     except Exception as e:
         info('[{}] ⚠️ 状态保存失败: {}', symbol, e)
+
+# ---------------- 调试配置：从研究目录 config/debug.json 读取 + 热加载 ----------------
+
+def _load_debug_config(context, force=False):
+    """
+    读取/热加载 config/debug.json：
+    原始结构（优先）：
+      enable_debug_log: bool
+      rt_heartbeat_window_sec: int
+      rt_heartbeat_preview: int
+    兼容字段（次优先）：
+      debug_rt_log: bool
+      rt_log_interval_seconds: int   （兼容为窗口秒）
+      rt_log_preview: int            （若有人写错键名时也兜底）
+    """
+    cfg_file = research_path('config', 'debug.json')
+    try:
+        mtime = cfg_file.stat().st_mtime if cfg_file.exists() else None
+    except:
+        mtime = None
+
+    if not force and hasattr(context, 'debug_cfg_mtime') and context.debug_cfg_mtime == mtime:
+        return  # 无变化不重读
+
+    # 默认值
+    enable = DBG_ENABLE_DEFAULT
+    winsec = DBG_RT_WINDOW_SEC_DEFAULT
+    preview = DBG_RT_PREVIEW_DEFAULT
+
+    try:
+        if cfg_file.exists():
+            j = json.loads(cfg_file.read_text(encoding='utf-8'))
+            if isinstance(j, dict):
+                # 优先原始结构
+                if 'enable_debug_log' in j: enable = bool(j['enable_debug_log'])
+                if 'rt_heartbeat_window_sec' in j:
+                    try: winsec = max(5, int(j['rt_heartbeat_window_sec']))
+                    except: pass
+                if 'rt_heartbeat_preview' in j:
+                    try: preview = max(1, int(j['rt_heartbeat_preview']))
+                    except: pass
+
+                # 兼容老临时键（仅在原始结构缺失时生效）
+                if 'enable_debug_log' not in j and 'debug_rt_log' in j:
+                    enable = bool(j['debug_rt_log'])
+                if 'rt_heartbeat_window_sec' not in j and 'rt_log_interval_seconds' in j:
+                    try: winsec = max(5, int(j['rt_log_interval_seconds']))
+                    except: pass
+                if 'rt_heartbeat_preview' not in j and 'rt_log_preview' in j:
+                    try: preview = max(1, int(j['rt_log_preview']))
+                    except: pass
+    except Exception as e:
+        info('⚠️ 读取调试文件 config/debug.json 失败: {}（采用默认 enable={}, win={}s, preview={}）',
+             e, enable, winsec, preview)
+
+    context.enable_debug_log = enable
+    context.rt_heartbeat_window_sec = winsec
+    context.rt_heartbeat_preview = preview
+    context.debug_cfg_mtime = mtime
+    # 首次加载或配置变化时，允许立即打一条心跳
+    context.last_rt_log_ts = None
+    if enable:
+        info('🧪 调试配置生效: enable={} window={}s preview={}', enable, winsec, preview)
+    else:
+        info('🧪 调试配置生效: enable=False（关闭心跳日志）')
 
 # ---------------- 初始化与时间窗口判断 ----------------
 
@@ -166,7 +205,7 @@ def initialize(context):
     context.symbol_list = list(context.symbol_config.keys())
     context.state = {}
     context.latest_data = {}
-    context.should_place_order_map = {}   # 仍保留占位（不再用于市价触发）
+    context.should_place_order_map = {}   # 占位（不用于市价触发）
     context.mark_halted = {}
     context.last_valid_price = {}
     context.last_valid_ts = {sym: None for sym in context.symbol_list}
@@ -194,15 +233,14 @@ def initialize(context):
         context.mark_halted[sym] = False
         context.last_valid_price[sym] = st['base_price']
 
-    # 启动宽限期（重启后 N 秒内不做停牌判定，也不因无价阻断挂单）
+    # 启动宽限期
     context.boot_dt = getattr(context, 'current_dt', None) or datetime.now()
     context.boot_grace_seconds = int(get_saved_param('boot_grace_seconds', 180))
 
-    # 🧪 初始化调试配置 & 心跳分钟标记
-    _load_debug_config(context)
-    context._last_debug_min_mark = None
+    # 调试配置（首次加载）
+    _load_debug_config(context, force=True)
 
-    # 绑定定时任务（把日终撤单从 14:55 改到 14:56）
+    # 绑定定时任务
     context.initial_cleanup_done = False
     if '回测' not in context.env:
         run_daily(context, place_auction_orders, time='9:15')
@@ -235,7 +273,7 @@ def before_trading_start(context, data):
         place_auction_orders(context)
     else:
         info('⏸️ 重启时间{}不在集合竞价时段，跳过补挂网格', current_time.strftime('%H:%M:%S'))
-        # 即便不是竞价，也会靠 handle_data + 时间窗在连续竞价内补挂
+        # 连续竞价内由 handle_data 自动补挂
     context.initial_cleanup_done = True
 
 def after_initialize_cleanup(context):
@@ -302,20 +340,78 @@ def place_auction_orders(context):
         state = context.state[sym]
         adjust_grid_unit(state)
         cancel_all_orders_by_symbol(context, sym)
-        # 不看最新价，直接按 base_price 计算价位
-        context.latest_data[sym] = state['base_price']
+        context.latest_data[sym] = state['base_price']   # 不依赖新价
         place_limit_orders(context, sym, state)
         safe_save_state(sym, state)
+
+# ---------------- 实时价：快照获取 + 心跳日志（支持热加载配置） ----------------
+
+def _fetch_quotes_via_snapshot(context):
+    """
+    用 PTRADE get_snapshot 拉取快照（字段 last_px ）更新价格缓存。
+    并按 config/debug.json 中的开关/窗口打印心跳 got/miss。
+    同时在调用前做 debug 配置热加载（mtime 变更即生效）。
+    """
+    # 热加载调试配置（文件变化立刻生效）
+    _load_debug_config(context, force=False)
+
+    symbols = list(getattr(context, 'symbol_list', []) or [])
+    if not symbols:
+        return
+
+    snaps = {}
+    try:
+        snaps = get_snapshot(symbols) or {}
+    except Exception as e:
+        if getattr(context, 'enable_debug_log', False):
+            info('🧪 RT心跳 获取快照异常: {}', e)
+        snaps = {}
+
+    # 兼容返回类型（dict: symbol->snapshot 或 list of dict）
+    if isinstance(snaps, list):
+        snaps = { (s.get('symbol') or s.get('stock_code') or s.get('security') or ''): s for s in snaps if isinstance(s, dict) }
+
+    now_dt = context.current_dt
+    got, miss_list = 0, []
+    for sym in symbols:
+        snap = snaps.get(sym)
+        px = None
+        if isinstance(snap, dict):
+            px = snap.get('last_px')
+            if not is_valid_price(px):
+                px = snap.get('last') or snap.get('price')
+        if is_valid_price(px):
+            px = float(px)
+            context.latest_data[sym] = px
+            context.last_valid_price[sym] = px
+            context.last_valid_ts[sym] = now_dt
+            context.mark_halted[sym] = False
+            got += 1
+        else:
+            miss_list.append(sym)
+
+    # 心跳日志（按窗口节流）
+    if getattr(context, 'enable_debug_log', False):
+        need_log = False
+        if not hasattr(context, 'last_rt_log_ts') or context.last_rt_log_ts is None:
+            need_log = True
+        else:
+            winsec = int(getattr(context, 'rt_heartbeat_window_sec', DBG_RT_WINDOW_SEC_DEFAULT))
+            need_log = (now_dt - context.last_rt_log_ts).total_seconds() >= winsec
+        if need_log:
+            context.last_rt_log_ts = now_dt
+            preview_n = int(getattr(context, 'rt_heartbeat_preview', DBG_RT_PREVIEW_DEFAULT))
+            miss_preview = ','.join(miss_list[:preview_n]) + ('...' if len(miss_list) > preview_n else '')
+            info('🧪 RT心跳 {} got:{}/{} miss:[{}]',
+                 now_dt.strftime('%H:%M'), got, len(symbols), miss_preview)
 
 # ---------------- 网格限价挂单主逻辑 ----------------
 
 def place_limit_orders(context, symbol, state):
     """
     限价挂单主函数（含“棘轮”与节流）。
-    关键策略：
-    - 挂单不因是否收到当日新价而阻断；
-    - 集合竞价 或 启动宽限期 内：统一按 base_price 计算网格，不做棘轮；
-    - 连续竞价有实时价时才启用棘轮；无价也允许按 base_price 挂单。
+    - 集合竞价/启动宽限期：允许“无价”按 base_price 挂单，不启用棘轮；
+    - 连续竞价阶段：仅当拿到有效实时价才启用棘轮；无价也允许按 base_price 挂单。
     """
     now_dt = context.current_dt
 
@@ -339,7 +435,7 @@ def place_limit_orders(context, symbol, state):
     position = get_position(symbol)
     pos = position.amount + state.get('_pos_change', 0)
 
-    # 棘轮：仅当处于连续竞价且有有效“最新价”时启用
+    # 棘轮启用条件：连续竞价且拿到有效价
     price = context.latest_data.get(symbol)
     ratchet_enabled = (not allow_tickless) and is_valid_price(price)
 
@@ -444,7 +540,7 @@ def on_order_filled(context, symbol, order):
     elif context.current_dt.time() < time(14, 56):
         place_limit_orders(context, symbol, state)
 
-    context.should_place_order_map[sym] = True
+    context.should_place_order_map[symbol] = True
     safe_save_state(symbol, state)
 
 # ---------------- 行情主循环 ----------------
@@ -453,40 +549,13 @@ def handle_data(context, data):
     now_dt = context.current_dt
     now = now_dt.time()
 
+    # ✅ 主动拉取快照，更新 latest_data/last_valid_* 与心跳日志（含调试配置热加载）
+    _fetch_quotes_via_snapshot(context)
+
     # 每5分钟：热重载 + 看板
     if now_dt.minute % 5 == 0 and now_dt.second < 5:
         reload_config_if_changed(context)
         generate_html_report(context)
-
-    # ---------- 更新最新价/最后有效价 ----------
-    for sym in context.symbol_list:
-        if sym in data and data[sym] and is_valid_price(getattr(data[sym], 'price', None)):
-            px = float(data[sym].price)
-            context.latest_data[sym] = px
-            context.last_valid_price[sym] = px
-            context.last_valid_ts[sym] = now_dt
-            context.mark_halted[sym] = False
-
-    # ---------- 🧪 实时价心跳调试（每分钟 1 行；受 debug.json 开关控制） ----------
-    _load_debug_config(context)  # 支持热更
-    if getattr(context, 'enable_debug_log', False):
-        curr_min = now_dt.strftime('%Y-%m-%d %H:%M')
-        # 避免同一分钟多次打印：second<3 做轻量防抖
-        if context._last_debug_min_mark != curr_min and now_dt.second < 3:
-            total = len(context.symbol_list)
-            got_syms, miss_syms = [], []
-            window = max(1, int(getattr(context, 'rt_hb_window_sec', 65)))
-            for sym in context.symbol_list:
-                ts = context.last_valid_ts.get(sym)
-                if ts and (now_dt - ts).total_seconds() <= window:
-                    got_syms.append(sym)
-                else:
-                    miss_syms.append(sym)
-            preview_n = max(0, int(getattr(context, 'rt_hb_preview', 8)))
-            miss_preview = ",".join(miss_syms[:preview_n]) + ("..." if len(miss_syms) > preview_n else "")
-            dlog(context, '🧪 RT心跳 {} got:{}/{} miss:[{}]',
-                 now_dt.strftime('%H:%M'), len(got_syms), total, miss_preview)
-            context._last_debug_min_mark = curr_min
 
     # ---------- 启动宽限期后才做“阶段+断流”停牌识别（仅影响展示，不拦单） ----------
     boot_grace = (now_dt - getattr(context, 'boot_dt', now_dt)).total_seconds() < getattr(context, 'boot_grace_seconds', 180)
@@ -511,7 +580,7 @@ def handle_data(context, data):
                 else:
                     context.mark_halted[sym] = ((now_dt - last_ts).total_seconds() > grace_seconds)
 
-    # ---------- 动态底仓与间距（价无效时跳过VA/ATR，不影响挂单） ----------
+    # ---------- 动态底仓与间距（价有效时才做，保持既有逻辑） ----------
     for sym in context.symbol_list:
         if sym not in context.state:
             continue
@@ -528,8 +597,6 @@ def handle_data(context, data):
         for sym in context.symbol_list:
             if sym in context.state:
                 place_limit_orders(context, sym, context.state[sym])
-
-    # —— 市价触发路径已删除 —— 
 
     # 巡检
     if now_dt.minute % 30 == 0 and now_dt.second < 5:
@@ -778,7 +845,6 @@ def update_daily_reports(context, data):
                 f.write(",".join(headers) + "\n")
             f.write(",".join(map(str, row)) + "\n")
         info(f'✅ [{symbol}] 已更新每日CSV报表：{report_file}')
-
 
 # ---------------- 成交明细日志 ----------------
 
