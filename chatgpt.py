@@ -1,5 +1,5 @@
 # event_driven_grid_strategy.py
-# 版本号：CHATGPT-3.2.1-20251014-HALT-GUARD-MKT-OFF1456-fix3b+rtlog-snapshot
+# 版本号：CHATGPT-3.2.1-20251014-HALT-GUARD-MKT-OFF1456-fix3c+cnames
 # 变更点（在 HALT-GUARD 基础上的最小改动）：
 # 1) ❌ 不改市价单（仍然完全移除14:55市价触发）；
 # 2) ⏰ 限价挂单窗口至14:56（保持既有逻辑）；
@@ -18,6 +18,7 @@
 #       }
 #       *保持向后兼容*: 若出现旧版临时键（"debug_rt_log","rt_log_interval_seconds"），也会被识别，但优先使用上述“原始结构”。
 # 10) ⚙️ 棘轮：仅在连续竞价且拿到有效实时价时启用；无价时仍按 base_price 挂单但不移动基准。
+# 11) 🈶️【新增，最小改动】日志与看板显示中文名称（来自 config/names.json 与 symbols.json 的 name 字段；仅影响展示，不改业务）
 
 import json
 import logging
@@ -29,7 +30,7 @@ from types import SimpleNamespace
 # ---------------- 全局句柄与常量 ----------------
 LOG_FH = None
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'CHATGPT-3.2.1-20251014-HALT-GUARD-MKT-OFF1456-fix3b+rtlog-snapshot'
+__version__ = 'CHATGPT-3.2.1-20251014-HALT-GUARD-MKT-OFF1456-fix3c+cnames'
 TRANSACTION_COST = 0.00005
 
 # ---- 调试默认（可被 config/debug.json 覆盖）----
@@ -80,6 +81,45 @@ def convert_symbol_to_standard(full_symbol):
     if full_symbol.endswith('.XSHG'):
         return full_symbol.replace('.XSHG','.SS')
     return full_symbol
+
+# ---------------- 标的中文名：可选读取 + 显示辅助（新增，最小改动） ----------------
+
+def _load_symbol_names(context):
+    """
+    从两个地方读取中文名（有则用，无则忽略，不影响其它功能）：
+    1) 研究目录 config/names.json   -> 形如 {"513230.SS":"标普500", ...}
+    2) symbols.json 中每个标的可选字段 name -> 覆盖 names.json 的同名项
+    """
+    name_map = {}
+    try:
+        names_file = research_path('config', 'names.json')
+        if names_file.exists():
+            j = json.loads(names_file.read_text(encoding='utf-8'))
+            if isinstance(j, dict):
+                name_map.update({k: str(v) for k, v in j.items() if isinstance(k, str)})
+    except Exception as e:
+        info('⚠️ 读取 config/names.json 失败: {}（忽略，继续）', e)
+
+    try:
+        for sym, cfg in (getattr(context, 'symbol_config', {}) or {}).items():
+            if isinstance(cfg, dict) and 'name' in cfg and cfg['name']:
+                name_map[sym] = str(cfg['name'])
+    except Exception as e:
+        info('⚠️ 解析 symbols.json 中的 name 字段失败: {}（忽略，继续）', e)
+
+    context.symbol_name_map = name_map
+
+def dsym(context, symbol, style='short'):
+    """
+    返回用于日志/看板展示的标的名：
+      style='short' -> "513230.SS 标普500"
+      style='long'  -> "标普500(513230.SS)"
+    若无中文名，仅返回代码本身。
+    """
+    nm = (getattr(context, 'symbol_name_map', {}) or {}).get(symbol)
+    if not nm:
+        return symbol
+    return f"{symbol} {nm}" if style == 'short' else f"{nm}({symbol})"
 
 # ---------------- HALT-GUARD：有效价与停牌标记 ----------------
 
@@ -203,6 +243,9 @@ def initialize(context):
 
     # 容器
     context.symbol_list = list(context.symbol_config.keys())
+    # 新增：加载中文名映射
+    _load_symbol_names(context)
+
     context.state = {}
     context.latest_data = {}
     context.should_place_order_map = {}   # 占位（不用于市价触发）
@@ -320,13 +363,13 @@ def cancel_all_orders_by_symbol(context, symbol):
             continue
         cache.add(entrust_no)
         total += 1
-        info('[{}] 👉 发现并尝试撤销遗留挂单 entrust_no={}', symbol, entrust_no)
+        info('[{}] 👉 发现并尝试撤销遗留挂单 entrust_no={}', dsym(context, symbol), entrust_no)
         try:
             cancel_order_ex({'entrust_no': entrust_no, 'symbol': api_sym})
         except Exception as e:
-            info('[{}] ⚠️ 撤单异常 entrust_no={}: {}', symbol, entrust_no, e)
+            info('[{}] ⚠️ 撤单异常 entrust_no={}: {}', dsym(context, symbol), entrust_no, e)
     if total > 0:
-        info('[{}] 共{}笔遗留挂单尝试撤销完毕', symbol, total)
+        info('[{}] 共{}笔遗留挂单尝试撤销完毕', dsym(context, symbol), total)
 
 # ---------------- 集合竞价挂单 ----------------
 
@@ -449,12 +492,12 @@ def place_limit_orders(context, symbol, state):
             ratchet_down = is_in_high_pos_range and price <= buy_p_curr
             if ratchet_up:
                 state['base_price'] = sell_p_curr
-                info('[{}] 棘轮上移: 触及卖价，基准抬至 {:.3f}', symbol, sell_p_curr)
+                info('[{}] 棘轮上移: 触及卖价，基准抬至 {:.3f}', dsym(context, symbol), sell_p_curr)
                 cancel_all_orders_by_symbol(context, symbol)
                 buy_p, sell_p = round(sell_p_curr * (1 - buy_sp), 3), round(sell_p_curr * (1 + sell_sp), 3)
             elif ratchet_down:
                 state['base_price'] = buy_p_curr
-                info('[{}] 棘轮下移: 触及买价，基准降至 {:.3f}', symbol, buy_p_curr)
+                info('[{}] 棘轮下移: 触及买价，基准降至 {:.3f}', dsym(context, symbol), buy_p_curr)
                 cancel_all_orders_by_symbol(context, symbol)
                 buy_p, sell_p = round(buy_p_curr * (1 - buy_sp), 3), round(buy_p_curr * (1 + sell_sp), 3)
 
@@ -475,16 +518,16 @@ def place_limit_orders(context, symbol, state):
 
         can_buy = not any(o.amount > 0 and abs(o.price - buy_p) < 1e-3 for o in open_orders)
         if can_buy and pos + unit <= state['max_position']:
-            info('[{}] --> 发起买入委托: {}股 @ {:.3f}', symbol, unit, buy_p)
+            info('[{}] --> 发起买入委托: {}股 @ {:.3f}', dsym(context, symbol), unit, buy_p)
             order(symbol, unit, limit_price=buy_p)
 
         can_sell = not any(o.amount < 0 and abs(o.price - sell_p) < 1e-3 for o in open_orders)
         if can_sell and enable_amount >= unit and pos - unit >= state['base_position']:
-            info('[{}] --> 发起卖出委托: {}股 @ {:.3f}', symbol, unit, sell_p)
+            info('[{}] --> 发起卖出委托: {}股 @ {:.3f}', dsym(context, symbol), unit, sell_p)
             order(symbol, -unit, limit_price=sell_p)
 
     except Exception as e:
-        info('[{}] ⚠️ 限价挂单异常：{}', symbol, e)
+        info('[{}] ⚠️ 限价挂单异常：{}', dsym(context, symbol), e)
     finally:
         safe_save_state(symbol, state)
 
@@ -510,7 +553,7 @@ def on_trade_response(context, trade_list):
         try:
             on_order_filled(context, sym, order_obj)
         except Exception as e:
-            info('[{}] ❌ 成交处理失败：{}', sym, e)
+            info('[{}] ❌ 成交处理失败：{}', dsym(context, sym), e)
 
 def on_order_filled(context, symbol, order):
     state = context.state[symbol]
@@ -520,7 +563,7 @@ def on_order_filled(context, symbol, order):
     if state.get('last_fill_price') == order.price and last_dt and (context.current_dt - last_dt).seconds < 5:
         return
     trade_direction = "买入" if order.amount > 0 else "卖出"
-    info('✅ [{}] 成交回报! 方向: {}, 数量: {}, 价格: {:.3f}', symbol, trade_direction, order.filled, order.price)
+    info('✅ [{}] 成交回报! 方向: {}, 数量: {}, 价格: {:.3f}', dsym(context, symbol), trade_direction, order.filled, order.price)
     state['_last_trade_ts'] = context.current_dt
     state['_last_fill_dt'] = context.current_dt
     state['last_fill_price'] = order.price
@@ -536,7 +579,7 @@ def on_order_filled(context, symbol, order):
 
     # 仅在 14:56 之前继续挂限价
     if is_order_blocking_period():
-        info('[{}] 处于9:25-9:30挂单冻结期，成交后仅更新状态，推迟挂单至9:30后。', symbol)
+        info('[{}] 处于9:25-9:30挂单冻结期，成交后仅更新状态，推迟挂单至9:30后。', dsym(context, symbol))
     elif context.current_dt.time() < time(14, 56):
         place_limit_orders(context, symbol, state)
 
@@ -614,7 +657,7 @@ def log_status(context, symbol, state, price):
     pos = get_position(symbol)
     pnl = (disp_price - pos.cost_basis) * pos.amount if pos.cost_basis > 0 else 0
     info("📊 [{}] 状态: 价:{:.3f} 持仓:{}(可卖:{}) / 底仓:{} 成本:{:.3f} 盈亏:{:.2f} 网格:[买{:.2%},卖{:.2%}]",
-         symbol, disp_price, pos.amount, pos.enable_amount, state['base_position'], pos.cost_basis, pnl, state['buy_grid_spacing'], state['sell_grid_spacing'])
+         dsym(context, symbol), disp_price, pos.amount, pos.enable_amount, state['base_position'], pos.cost_basis, pnl, state['buy_grid_spacing'], state['sell_grid_spacing'])
 
 # ---------------- 动态网格间距（ATR） ----------------
 
@@ -639,13 +682,13 @@ def update_grid_spacing_final(context, symbol, state, curr_pos):
     if new_buy != state.get('buy_grid_spacing') or new_sell != state.get('sell_grid_spacing'):
         state['buy_grid_spacing'], state['sell_grid_spacing'] = new_buy, new_sell
         info('[{}] 🌀 网格动态调整. ATR({:.2%}) -> 基础间距({:.2%}) -> 最终:[买{:.2%},卖{:.2%}]',
-             symbol, (atr_pct or 0.0), base_spacing, new_buy, new_sell)
+             dsym(context, symbol), (atr_pct or 0.0), base_spacing, new_buy, new_sell)
 
 def calculate_atr(context, symbol, atr_period=14):
     try:
         hist = get_history(atr_period + 1, '1d', ['high','low','close'], security_list=[symbol])
         if hist is None or hist.empty or len(hist) < atr_period + 1:
-            info('[{}] ⚠️ ATR计算失败: get_history未能返回足够的数据。', symbol)
+            info('[{}] ⚠️ ATR计算失败: get_history未能返回足够的数据。', dsym(context, symbol))
             return None
         high, low, close = hist['high'].values, hist['low'].values, hist['close'].values
         trs = [max(h - l, abs(h - pc), abs(l - pc)) for h, l, pc in zip(high[1:], low[1:], close[:-1])]
@@ -657,7 +700,7 @@ def calculate_atr(context, symbol, atr_period=14):
             return atr_value / current_price
         return None
     except Exception as e:
-        info('[{}] ❌ ATR计算异常: {}', symbol, e)
+        info('[{}] ❌ ATR计算异常: {}', dsym(context, symbol), e)
         return None
 
 # ---------------- 日终动作（14:56） ----------------
@@ -677,7 +720,7 @@ def end_of_day(context):
 
 def get_target_base_position(context, symbol, state, price, dt):
     if not is_valid_price(price):
-        info('[{}] ⚠️ 停牌/无有效价，跳过VA计算，底仓维持 {}', symbol, state['base_position'])
+        info('[{}] ⚠️ 停牌/无有效价，跳过VA计算，底仓维持 {}', dsym(context, symbol), state['base_position'])
         return state['base_position']
     weeks = get_trade_weeks(context, symbol, state, dt)
     target_val = state['initial_position_value'] + sum(state['dingtou_base'] * (1 + state['dingtou_rate'])**w for w in range(1, weeks + 1))
@@ -690,7 +733,7 @@ def get_target_base_position(context, symbol, state, price, dt):
         current_val = state['base_position'] * price
         delta_val = target_val - current_val
         info('[{}] 价值平均: 目标底仓从 {} 调整至 {}. (目标市值: {:.2f}, 当前市值: {:.2f}, 市值缺口: {:.2f})',
-             symbol, state['base_position'], final_pos, target_val, current_val, delta_val)
+             dsym(context, symbol), state['base_position'], final_pos, target_val, current_val, delta_val)
         state['base_position'] = final_pos
         state['max_position'] = final_pos + state['grid_unit'] * 20
     return final_pos
@@ -737,7 +780,7 @@ def reload_config_if_changed(context):
         old_symbols, new_symbols = set(context.symbol_list), set(new_config.keys())
 
         for sym in old_symbols - new_symbols:
-            info(f'[{sym}] 标的已从配置中移除，将清理其状态和挂单...')
+            info('[{}] 标的已从配置中移除，将清理其状态和挂单...', dsym(context, sym))
             cancel_all_orders_by_symbol(context, sym)
             context.symbol_list.remove(sym)
             if sym in context.state: del context.state[sym]
@@ -747,7 +790,7 @@ def reload_config_if_changed(context):
             context.last_valid_ts.pop(sym, None)
 
         for sym in new_symbols - old_symbols:
-            info(f'[{sym}] 新增标的，正在初始化状态...')
+            info('[{}] 新增标的，正在初始化状态...', dsym(context, sym))
             cfg = new_config[sym]
             st = {**cfg}
             st.update({
@@ -768,7 +811,7 @@ def reload_config_if_changed(context):
 
         for sym in old_symbols.intersection(new_symbols):
             if context.symbol_config[sym] != new_config[sym]:
-                info(f'[{sym}] 参数发生变更，正在更新...')
+                info('[{}] 参数发生变更，正在更新...', dsym(context, sym))
                 state, new_params = context.state[sym], new_config[sym]
                 state.update({
                     'grid_unit': new_params['grid_unit'],
@@ -777,6 +820,7 @@ def reload_config_if_changed(context):
                     'max_position': state['base_position'] + new_params['grid_unit'] * 20
                 })
         context.symbol_config = new_config
+        _load_symbol_names(context)  # 新增：热更新中文名（当 symbols.json 变化时）
         info('✅ 配置文件热重载完成！当前监控标的: {}', context.symbol_list)
     except Exception as e:
         info(f'❌ 配置文件热重载失败: {e}')
@@ -844,7 +888,7 @@ def update_daily_reports(context, data):
                 ]
                 f.write(",".join(headers) + "\n")
             f.write(",".join(map(str, row)) + "\n")
-        info(f'✅ [{symbol}] 已更新每日CSV报表：{report_file}')
+        info('✅ [{}] 已更新每日CSV报表：{}', dsym(context, symbol), report_file)
 
 # ---------------- 成交明细日志 ----------------
 
@@ -868,7 +912,7 @@ def log_trade_details(context, symbol, trade):
             ]
             f.write(",".join(row) + "\n")
     except Exception as e:
-        info(f'❌ 记录交易日志失败: {e}')
+        info('❌ [{}] 记录交易日志失败: {}', dsym(context, symbol), e)
 
 # ---------------- HTML 看板 ----------------
 
@@ -893,8 +937,10 @@ def generate_html_report(context):
         total_unrealized_pnl += unrealized_pnl
         atr_pct = calculate_atr(context, symbol)
         name_price = f"{price:.3f}" + (" (停牌)" if halted else "")
+        disp_name = dsym(context, symbol, style='long')  # 新增：中文名展示
         all_metrics.append({
             "symbol": symbol,
+            "symbol_disp": disp_name,   # 新增
             "position": f"{pos.amount} ({pos.enable_amount})",
             "cost_basis": f"{pos.cost_basis:.3f}",
             "price": name_price,
@@ -990,7 +1036,7 @@ def generate_html_report(context):
         pnl_class = "positive" if float(m["unrealized_pnl"].replace(",", "")) >= 0 else "negative"
         table_rows += f"""
         <tr>
-            <td>{m['symbol']}</td>
+            <td>{m['symbol_disp']}</td>
             <td>{m['position']}</td>
             <td>{m['cost_basis']}</td>
             <td>{m['price']}</td>
