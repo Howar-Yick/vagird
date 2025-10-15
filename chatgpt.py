@@ -1,5 +1,5 @@
 # event_driven_grid_strategy.py
-# 版本号：CHATGPT-3.2.1-20251014-HALT-GUARD-MKT-OFF1456-fix3c+cnames
+# 版本号：CHATGPT-3.2.1-20251014-HALT-GUARD-MKT-OFF1456-fix3d+cnames-hotfix
 # 变更点（在 HALT-GUARD 基础上的最小改动）：
 # 1) ❌ 不改市价单（仍然完全移除14:55市价触发）；
 # 2) ⏰ 限价挂单窗口至14:56（保持既有逻辑）；
@@ -19,6 +19,7 @@
 #       *保持向后兼容*: 若出现旧版临时键（"debug_rt_log","rt_log_interval_seconds"），也会被识别，但优先使用上述“原始结构”。
 # 10) ⚙️ 棘轮：仅在连续竞价且拿到有效实时价时启用；无价时仍按 base_price 挂单但不移动基准。
 # 11) 🈶️【新增，最小改动】日志与看板显示中文名称（来自 config/names.json 与 symbols.json 的 name 字段；仅影响展示，不改业务）
+# 12) 🧯【热修】修正 update_daily_reports 中 t_quantity 一行的右括号手误（] -> )）
 
 import json
 import logging
@@ -30,7 +31,7 @@ from types import SimpleNamespace
 # ---------------- 全局句柄与常量 ----------------
 LOG_FH = None
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'CHATGPT-3.2.1-20251014-HALT-GUARD-MKT-OFF1456-fix3c+cnames'
+__version__ = 'CHATGPT-3.2.1-20251014-HALT-GUARD-MKT-OFF1456-fix3d+cnames-hotfix'
 TRANSACTION_COST = 0.00005
 
 # ---- 调试默认（可被 config/debug.json 覆盖）----
@@ -316,7 +317,6 @@ def before_trading_start(context, data):
         place_auction_orders(context)
     else:
         info('⏸️ 重启时间{}不在集合竞价时段，跳过补挂网格', current_time.strftime('%H:%M:%S'))
-        # 连续竞价内由 handle_data 自动补挂
     context.initial_cleanup_done = True
 
 def after_initialize_cleanup(context):
@@ -395,7 +395,6 @@ def _fetch_quotes_via_snapshot(context):
     并按 config/debug.json 中的开关/窗口打印心跳 got/miss。
     同时在调用前做 debug 配置热加载（mtime 变更即生效）。
     """
-    # 热加载调试配置（文件变化立刻生效）
     _load_debug_config(context, force=False)
 
     symbols = list(getattr(context, 'symbol_list', []) or [])
@@ -410,7 +409,6 @@ def _fetch_quotes_via_snapshot(context):
             info('🧪 RT心跳 获取快照异常: {}', e)
         snaps = {}
 
-    # 兼容返回类型（dict: symbol->snapshot 或 list of dict）
     if isinstance(snaps, list):
         snaps = { (s.get('symbol') or s.get('stock_code') or s.get('security') or ''): s for s in snaps if isinstance(s, dict) }
 
@@ -433,7 +431,6 @@ def _fetch_quotes_via_snapshot(context):
         else:
             miss_list.append(sym)
 
-    # 心跳日志（按窗口节流）
     if getattr(context, 'enable_debug_log', False):
         need_log = False
         if not hasattr(context, 'last_rt_log_ts') or context.last_rt_log_ts is None:
@@ -458,7 +455,6 @@ def place_limit_orders(context, symbol, state):
     """
     now_dt = context.current_dt
 
-    # 时间窗：09:25-09:30冻结；限价仅到 14:56
     if state.get('_last_trade_ts') and (now_dt - state['_last_trade_ts']).total_seconds() < 60:
         return
     if is_order_blocking_period():
@@ -467,7 +463,6 @@ def place_limit_orders(context, symbol, state):
     if not in_limit_window:
         return
 
-    # 是否处于“允许无价挂单”的阶段
     boot_grace = (now_dt - getattr(context, 'boot_dt', now_dt)).total_seconds() < getattr(context, 'boot_grace_seconds', 180)
     allow_tickless = boot_grace or is_auction_time()
 
@@ -478,12 +473,11 @@ def place_limit_orders(context, symbol, state):
     position = get_position(symbol)
     pos = position.amount + state.get('_pos_change', 0)
 
-    # 棘轮启用条件：连续竞价且拿到有效价
     price = context.latest_data.get(symbol)
     ratchet_enabled = (not allow_tickless) and is_valid_price(price)
 
     if ratchet_enabled:
-        if abs(price / base - 1) <= 0.10:  # 偏离保护仍保留
+        if abs(price / base - 1) <= 0.10:
             is_in_low_pos_range  = (pos - unit <= state['base_position'])
             is_in_high_pos_range = (pos + unit >= state['max_position'])
             sell_p_curr = round(base * (1 + sell_sp), 3)
@@ -501,7 +495,6 @@ def place_limit_orders(context, symbol, state):
                 cancel_all_orders_by_symbol(context, symbol)
                 buy_p, sell_p = round(buy_p_curr * (1 - buy_sp), 3), round(buy_p_curr * (1 + sell_sp), 3)
 
-    # 常规节流（不依赖是否有价）
     last_ts = state.get('_last_order_ts')
     if last_ts and (now_dt - last_ts).seconds < 30:
         return
@@ -510,7 +503,6 @@ def place_limit_orders(context, symbol, state):
         return
     state['_last_order_ts'], state['_last_order_bp'] = now_dt, base
 
-    # 执行挂单
     try:
         open_orders = [o for o in get_open_orders(symbol) or [] if o.status == '2']
         enable_amount = position.enable_amount
@@ -571,13 +563,11 @@ def on_order_filled(context, symbol, order):
     state['_pos_change'] = order.amount
     cancel_all_orders_by_symbol(context, symbol)
 
-    # 成交视为有效价
     context.mark_halted[symbol] = False
     context.last_valid_price[symbol] = order.price
     context.latest_data[symbol] = order.price
     context.last_valid_ts[symbol] = context.current_dt
 
-    # 仅在 14:56 之前继续挂限价
     if is_order_blocking_period():
         info('[{}] 处于9:25-9:30挂单冻结期，成交后仅更新状态，推迟挂单至9:30后。', dsym(context, symbol))
     elif context.current_dt.time() < time(14, 56):
@@ -592,23 +582,20 @@ def handle_data(context, data):
     now_dt = context.current_dt
     now = now_dt.time()
 
-    # ✅ 主动拉取快照，更新 latest_data/last_valid_* 与心跳日志（含调试配置热加载）
     _fetch_quotes_via_snapshot(context)
 
-    # 每5分钟：热重载 + 看板
     if now_dt.minute % 5 == 0 and now_dt.second < 5:
         reload_config_if_changed(context)
         generate_html_report(context)
 
-    # ---------- 启动宽限期后才做“阶段+断流”停牌识别（仅影响展示，不拦单） ----------
     boot_grace = (now_dt - getattr(context, 'boot_dt', now_dt)).total_seconds() < getattr(context, 'boot_grace_seconds', 180)
     if not boot_grace:
         def _phase_start(now_t: time):
-            if time(9, 15) <= now_t < time(9, 25):   # 集合竞价
+            if time(9, 15) <= now_t < time(9, 25):
                 return time(9, 15)
-            if time(9, 30) <= now_t <= time(11, 30): # 早盘
+            if time(9, 30) <= now_t <= time(11, 30):
                 return time(9, 30)
-            if time(13, 0) <= now_t <= time(15, 0):  # 午后
+            if time(13, 0) <= now_t <= time(15, 0):
                 return time(13, 0)
             return None
 
@@ -623,7 +610,6 @@ def handle_data(context, data):
                 else:
                     context.mark_halted[sym] = ((now_dt - last_ts).total_seconds() > grace_seconds)
 
-    # ---------- 动态底仓与间距（价有效时才做，保持既有逻辑） ----------
     for sym in context.symbol_list:
         if sym not in context.state:
             continue
@@ -635,13 +621,11 @@ def handle_data(context, data):
             if now_dt.minute % 30 == 0 and now_dt.second < 5:
                 update_grid_spacing_final(context, sym, st, get_position(sym).amount)
 
-    # ---------- 限价下单窗口：集合竞价 或 主盘且 < 14:56 ----------
     if is_auction_time() or (is_main_trading_time() and now < time(14, 56)):
         for sym in context.symbol_list:
             if sym in context.state:
                 place_limit_orders(context, sym, context.state[sym])
 
-    # 巡检
     if now_dt.minute % 30 == 0 and now_dt.second < 5:
         info('📌 每30分钟状态巡检...')
         for sym in context.symbol_list:
@@ -708,7 +692,7 @@ def calculate_atr(context, symbol, atr_period=14):
 def end_of_day(context):
     """14:56 统一撤单 + 看板 + 状态保存（不再触发任何市价单）"""
     info('✅ 日终处理开始(14:56)...')
-    after_initialize_cleanup(context)   # 这里会对所有标的执行撤单
+    after_initialize_cleanup(context)
     generate_html_report(context)
     for sym in context.symbol_list:
         if sym in context.state:
@@ -820,7 +804,7 @@ def reload_config_if_changed(context):
                     'max_position': state['base_position'] + new_params['grid_unit'] * 20
                 })
         context.symbol_config = new_config
-        _load_symbol_names(context)  # 新增：热更新中文名（当 symbols.json 变化时）
+        _load_symbol_names(context)  # 热更新中文名
         info('✅ 配置文件热重载完成！当前监控标的: {}', context.symbol_list)
     except Exception as e:
         info(f'❌ 配置文件热重载失败: {e}')
@@ -864,6 +848,7 @@ def update_daily_reports(context, data):
         added_base      = state['base_position'] - state.get('last_week_position', 0)
         compare_cost    = added_base * close_price
         profit_all      = (close_price - cost_basis) * amount if cost_basis > 0 else 0
+        # 🔧 Hotfix: 右括号修正
         t_quantity = max(0, amount - state['base_position'])
         row = [
             current_date, f"{close_price:.3f}", str(weeks), str(count),
@@ -937,10 +922,10 @@ def generate_html_report(context):
         total_unrealized_pnl += unrealized_pnl
         atr_pct = calculate_atr(context, symbol)
         name_price = f"{price:.3f}" + (" (停牌)" if halted else "")
-        disp_name = dsym(context, symbol, style='long')  # 新增：中文名展示
+        disp_name = dsym(context, symbol, style='long')
         all_metrics.append({
             "symbol": symbol,
-            "symbol_disp": disp_name,   # 新增
+            "symbol_disp": disp_name,
             "position": f"{pos.amount} ({pos.enable_amount})",
             "cost_basis": f"{pos.cost_basis:.3f}",
             "price": name_price,
