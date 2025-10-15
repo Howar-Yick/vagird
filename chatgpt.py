@@ -1,5 +1,5 @@
 # event_driven_grid_strategy.py
-# 版本号：CHATGPT-3.2.1-20251014-HALT-GUARD-MKT-OFF1456-fix2
+# 版本号：CHATGPT-3.2.1-20251014-HALT-GUARD-MKT-OFF1456-fix2+rtlog
 # 变更点（在 HALT-GUARD 基础上的最小改动）：
 # 1) ❌ 删除 14:55 市价下单触发（不再下任何市价单）；
 # 2) ⏰ 限价挂单窗口延长至 14:56 截止；
@@ -9,6 +9,7 @@
 # 6) 🕒 启动宽限期 boot_grace（默认180秒，可配置）：宽限内不做停牌判定；180秒后才开始“阶段+断流”判停；
 # 7) 🛡️ 停牌只影响看板/报表等计算展示，不再拦截挂单（移除 place_limit_orders 中对 mark_halted 的早退）。
 # 8) 🔧 若无当日新价：连续竞价阶段也允许按 base_price 继续挂单；仅在有实时价时启用棘轮移动。
+# 9) 🧪【新增】实时价心跳调试日志（每分钟1行，默认关），开关由 config/debug.json 控制，支持热更新。
 
 import json
 import logging
@@ -20,7 +21,7 @@ from types import SimpleNamespace
 # ---------------- 全局句柄与常量 ----------------
 LOG_FH = None
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'CHATGPT-3.2.1-20251014-HALT-GUARD-MKT-OFF1456-fix2'
+__version__ = 'CHATGPT-3.2.1-20251014-HALT-GUARD-MKT-OFF1456-fix2+rtlog'
 TRANSACTION_COST = 0.00005
 
 # ---------------- 通用路径与工具函数 ----------------
@@ -77,6 +78,45 @@ def is_valid_price(x):
         return True
     except:
         return False
+
+# ================== 🧪 调试心跳：开关与工具 ==================
+
+def _debug_conf_path():
+    return research_path('config', 'debug.json')
+
+def _load_debug_config(context):
+    """
+    从 config/debug.json 读取调试配置；不存在则认为关闭。
+    支持在线热更：用文件 mtime 判断是否需要重载。
+    """
+    try:
+        p = _debug_conf_path()
+        if p.exists():
+            mtime = p.stat().st_mtime
+            if not hasattr(context, '_debug_conf_mtime') or context._debug_conf_mtime != mtime:
+                cfg_text = p.read_text(encoding='utf-8') or "{}"
+                cfg = json.loads(cfg_text)
+                context.enable_debug_log = bool(cfg.get('enable_debug_log', False))
+                context.rt_hb_window_sec = int(cfg.get('rt_heartbeat_window_sec', 65))
+                context.rt_hb_preview = int(cfg.get('rt_heartbeat_preview', 8))
+                context._debug_conf_mtime = mtime
+        else:
+            context.enable_debug_log = False
+            context.rt_hb_window_sec = 65
+            context.rt_hb_preview = 8
+            context._debug_conf_mtime = None
+    except Exception as e:
+        info('⚠️ 调试配置读取失败，将关闭调试日志: {}', e)
+        context.enable_debug_log = False
+        context.rt_hb_window_sec = 65
+        context.rt_hb_preview = 8
+
+def dlog(context, msg, *args):
+    """仅当调试开关开启时输出（沿用 info 的输出与落盘渠道）。"""
+    if getattr(context, 'enable_debug_log', False):
+        info(msg, *args)
+
+# ============================================================
 
 # ---------------- 状态保存 ----------------
 
@@ -157,6 +197,10 @@ def initialize(context):
     # 启动宽限期（重启后 N 秒内不做停牌判定，也不因无价阻断挂单）
     context.boot_dt = getattr(context, 'current_dt', None) or datetime.now()
     context.boot_grace_seconds = int(get_saved_param('boot_grace_seconds', 180))
+
+    # 🧪 初始化调试配置 & 心跳分钟标记
+    _load_debug_config(context)
+    context._last_debug_min_mark = None
 
     # 绑定定时任务（把日终撤单从 14:55 改到 14:56）
     context.initial_cleanup_done = False
@@ -400,7 +444,7 @@ def on_order_filled(context, symbol, order):
     elif context.current_dt.time() < time(14, 56):
         place_limit_orders(context, symbol, state)
 
-    context.should_place_order_map[symbol] = True
+    context.should_place_order_map[sym] = True
     safe_save_state(symbol, state)
 
 # ---------------- 行情主循环 ----------------
@@ -422,6 +466,27 @@ def handle_data(context, data):
             context.last_valid_price[sym] = px
             context.last_valid_ts[sym] = now_dt
             context.mark_halted[sym] = False
+
+    # ---------- 🧪 实时价心跳调试（每分钟 1 行；受 debug.json 开关控制） ----------
+    _load_debug_config(context)  # 支持热更
+    if getattr(context, 'enable_debug_log', False):
+        curr_min = now_dt.strftime('%Y-%m-%d %H:%M')
+        # 避免同一分钟多次打印：second<3 做轻量防抖
+        if context._last_debug_min_mark != curr_min and now_dt.second < 3:
+            total = len(context.symbol_list)
+            got_syms, miss_syms = [], []
+            window = max(1, int(getattr(context, 'rt_hb_window_sec', 65)))
+            for sym in context.symbol_list:
+                ts = context.last_valid_ts.get(sym)
+                if ts and (now_dt - ts).total_seconds() <= window:
+                    got_syms.append(sym)
+                else:
+                    miss_syms.append(sym)
+            preview_n = max(0, int(getattr(context, 'rt_hb_preview', 8)))
+            miss_preview = ",".join(miss_syms[:preview_n]) + ("..." if len(miss_syms) > preview_n else "")
+            dlog(context, '🧪 RT心跳 {} got:{}/{} miss:[{}]',
+                 now_dt.strftime('%H:%M'), len(got_syms), total, miss_preview)
+            context._last_debug_min_mark = curr_min
 
     # ---------- 启动宽限期后才做“阶段+断流”停牌识别（仅影响展示，不拦单） ----------
     boot_grace = (now_dt - getattr(context, 'boot_dt', now_dt)).total_seconds() < getattr(context, 'boot_grace_seconds', 180)
@@ -713,6 +778,7 @@ def update_daily_reports(context, data):
                 f.write(",".join(headers) + "\n")
             f.write(",".join(map(str, row)) + "\n")
         info(f'✅ [{symbol}] 已更新每日CSV报表：{report_file}')
+
 
 # ---------------- 成交明细日志 ----------------
 
