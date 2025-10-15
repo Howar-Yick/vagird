@@ -3,6 +3,10 @@
 # 热修目标：
 #   (1) 关闭14:55后的市价触发链路；
 #   (2) 14:56统一撤单并当日冻结，下单入口全部短路；重启后若>=14:56同样保持冻结且不补挂。
+#
+# 本版在上一版基础上合并了两个“可选微调”：
+#   A) initialize() 末尾将 freeze_date 初始化为当天，避免首次运行出现“跨日复位”提示；
+#   B) 跨日复位时重置 context._mkt_off_logged，使得每天都会打印一次“市价关闭/已冻结”的提醒。
 
 import json
 import logging
@@ -17,7 +21,7 @@ MAX_SAVED_FILLED_IDS = 500
 __version__ = 'CHATGPT-3.2.1b-20251014-MKT-OFF-1456'
 TRANSACTION_COST = 0.00005
 
-# 新增：收盘前统一处理时间点 & 控制开关
+# 收盘前统一处理时间点 & 控制开关
 FREEZE_CUTOFF_TIME = time(14, 56, 0)
 DISABLE_MARKET_AFTER_1455 = True  # 关闭14:55后的市价触发
 
@@ -119,7 +123,7 @@ def initialize(context):
     context.last_valid_price = {}
     context.mark_halted = {}
 
-    # 新增：当日冻结标记（带日期，跨日自动复位）
+    # 当日冻结标记（带日期，跨日自动复位）
     context.trading_frozen_today = False
     context.freeze_set_at = None
     context.freeze_date = None  # 用于跨日复位
@@ -151,9 +155,12 @@ def initialize(context):
     if '回测' not in context.env:
         run_daily(context, place_auction_orders, time='9:15')
         run_daily(context, end_of_day, time='14:55')
-        # 新增：14:56 定时统一撤单并冻结（即使 handle_data 漏调，也有兜底）
+        # 14:56 定时统一撤单并冻结（即使 handle_data 漏调，也有兜底）
         run_daily(context, trigger_1456_cutoff, time='14:56')
         info('✅ 事件驱动模式就绪')
+
+    # ====== 微调 A：初始化 freeze_date 为当天，避免首次运行出现“跨日复位”提示 ======
+    context.freeze_date = date.today()
 
     info('✅ 初始化完成，版本:{}'.format(__version__))
 
@@ -176,6 +183,8 @@ def _reset_freeze_if_new_day(context):
         context.trading_frozen_today = False
         context.freeze_set_at = None
         context.freeze_date = today
+        # ====== 微调 B：重置一次性提示标志，让每天都打印一次“市价关闭/已冻结”的提醒 ======
+        context._mkt_off_logged = False
         info('🌅 跨日复位：解除前一日冻结。')
 
 def _set_freeze_today(context):
@@ -481,7 +490,7 @@ def handle_data(context, data):
 
     # F：14:55 后市价触发——已关闭，只打印一次说明
     if DISABLE_MARKET_AFTER_1455 and time(14, 55) <= now < time(14, 57):
-        if not hasattr(context, '_mkt_off_logged'):
+        if not hasattr(context, '_mkt_off_logged') or not context._mkt_off_logged:
             info('🚫 已按热修关闭14:55后的市价触发；今天14:56已统一撤单并冻结。')
             context._mkt_off_logged = True
 
