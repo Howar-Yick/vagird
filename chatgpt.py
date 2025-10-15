@@ -1,28 +1,28 @@
 # event_driven_grid_strategy.py
-# 版本号：CHATGPT-3.2.1b-20251014-MKT-OFF-1456
-# 热修目标：
-#   (1) 关闭14:55后的市价触发链路；
-#   (2) 14:56统一撤单并当日冻结，下单入口全部短路；重启后若>=14:56同样保持冻结且不补挂。
-#   (3) 修复第二天 9:15 仍显示“已冻结”的问题：run_daily 先于 handle_data 时也能跨日复位。
+# 版本号：CHATGPT-3.2.1-20251014-HALT-GUARD-MKT-OFF1456
+# 变更点（在 HALT-GUARD 基础上的最小改动）：
+# 1) 删除 14:55 市价下单触发（不再下任何市价单）；
+# 2) 限价挂单窗口延长至 14:56 截止；
+# 3) 日终统一撤单从 14:55 改为 14:56；
+# 4) 14:56 后不再发起新的挂单（仅靠时间判断，无冻结标记）。
+#
+# HALT-GUARD 保留：停牌/无价保护、不覆盖 last_valid_price、看板与报表使用 last_valid_price 等。
 
 import json
 import logging
 import math
-from datetime import date, datetime, time
+from datetime import datetime, time
 from pathlib import Path
 from types import SimpleNamespace
 
-# ---------------- 全局常量与变量 ----------------
+# ---------------- 全局句柄与常量 ----------------
 LOG_FH = None
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'CHATGPT-3.2.1b-20251014-MKT-OFF-1456'
+__version__ = 'CHATGPT-3.2.1-20251014-HALT-GUARD-MKT-OFF1456'
 TRANSACTION_COST = 0.00005
 
-# 新增：收盘前统一处理时间点 & 控制开关
-FREEZE_CUTOFF_TIME = time(14, 56, 0)
-DISABLE_MARKET_AFTER_1455 = True  # 关闭14:55后的市价触发
+# ---------------- 通用路径与工具函数 ----------------
 
-# ---------------- 路径与通用工具 ----------------
 def research_path(*parts) -> Path:
     p = Path(get_research_path()).joinpath(*parts)
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -65,11 +65,18 @@ def convert_symbol_to_standard(full_symbol):
         return full_symbol.replace('.XSHG','.SS')
     return full_symbol
 
-def is_valid_price(px):
+# ---------------- HALT-GUARD：有效价与停牌标记 ----------------
+
+def is_valid_price(x):
     try:
-        return px is not None and float(px) > 0 and not math.isnan(float(px))
+        if x is None: return False
+        if isinstance(x, float) and math.isnan(x): return False
+        if x <= 0: return False
+        return True
     except:
         return False
+
+# ---------------- 状态保存 ----------------
 
 def save_state(symbol, state):
     ids = list(state.get('filled_order_ids', set()))
@@ -87,18 +94,18 @@ def safe_save_state(symbol, state):
     except Exception as e:
         info('[{}] ⚠️ 状态保存失败: {}', symbol, e)
 
-# ---------------- 初始化与日内框架 ----------------
+# ---------------- 初始化与时间窗口判断 ----------------
+
 def initialize(context):
     global LOG_FH
     log_file = research_path('logs', 'event_driven_strategy.log')
     LOG_FH = open(log_file, 'a', encoding='utf-8')
     log.info(f'🔍 日志同时写入到 {log_file}')
-
     context.env = check_environment()
     info("当前环境：{}", context.env)
     context.run_cycle = get_saved_param('run_cycle_seconds', 60)
 
-    # 载入symbols配置
+    # 读取配置
     try:
         config_file = research_path('config', 'symbols.json')
         context.config_file_path = config_file
@@ -113,18 +120,15 @@ def initialize(context):
         log.error(f"❌ 加载配置文件失败：{e}")
         context.symbol_config = {}
 
+    # 容器
     context.symbol_list = list(context.symbol_config.keys())
     context.state = {}
     context.latest_data = {}
-    context.should_place_order_map = {}
-    context.last_valid_price = {}
+    context.should_place_order_map = {}   # 仍保留占位（不再用于市价触发）
     context.mark_halted = {}
+    context.last_valid_price = {}
 
-    # 新增：当日冻结标记（带日期，跨日自动复位）
-    context.trading_frozen_today = False
-    context.freeze_set_at = None
-    context.freeze_date = None  # 用于跨日复位
-
+    # 初始化每个标的状态
     for sym, cfg in context.symbol_config.items():
         state_file = research_path('state', f'{sym}.json')
         saved = json.loads(state_file.read_text(encoding='utf-8')) if state_file.exists() else get_saved_param(f'state_{sym}', {}) or {}
@@ -143,23 +147,17 @@ def initialize(context):
         })
         context.state[sym] = st
         context.latest_data[sym] = st['base_price']
-        context.last_valid_price[sym] = st['base_price']
-        context.mark_halted[sym] = False
         context.should_place_order_map[sym] = True
+        context.mark_halted[sym] = False
+        context.last_valid_price[sym] = st['base_price']
 
+    # 绑定定时任务（把日终撤单从 14:55 改到 14:56）
     context.initial_cleanup_done = False
-
     if '回测' not in context.env:
         run_daily(context, place_auction_orders, time='9:15')
-        run_daily(context, end_of_day, time='14:55')
-        # 新增：14:56 定时统一撤单并冻结（即使 handle_data 漏调，也有兜底）
-        run_daily(context, trigger_1456_cutoff, time='14:56')
+        run_daily(context, end_of_day, time='14:56')
         info('✅ 事件驱动模式就绪')
-
-    # FIX(1)：初始化当日，用于跨日判断的基线，避免首日 None
-    context.freeze_date = date.today()
-
-    info('✅ 初始化完成，版本:{}'.format(__version__))
+    info('✅ 初始化完成，版本:{}', __version__)
 
 def is_main_trading_time():
     now = datetime.now().time()
@@ -173,83 +171,20 @@ def is_order_blocking_period():
     now = datetime.now().time()
     return time(9, 25) <= now < time(9, 30)
 
-def _reset_freeze_if_new_day(context):
-    """跨日自动解除冻结（9:15 run_daily / handle_data 都会调用到）"""
-    today = date.today()
-    # FIX(2)：freeze_date 为 None 或不同日都复位
-    if context.freeze_date != today:
-        context.trading_frozen_today = False
-        context.freeze_set_at = None
-        context.freeze_date = today
-        # 每日“市价关闭/已冻结提示”重新打印一次
-        try:
-            context._mkt_off_logged = False
-        except Exception:
-            pass
-        info('🌅 跨日复位：解除前一日冻结。')
-
-def _set_freeze_today(context):
-    if not context.trading_frozen_today:
-        context.trading_frozen_today = True
-        context.freeze_set_at = datetime.now()
-        context.freeze_date = date.today()
-        info('⛔ 当日交易冻结生效（{} 设置）。', context.freeze_set_at.strftime('%H:%M:%S'))
-
-def trigger_1456_cutoff(context):
-    """定时触发：14:56 全撤并冻结"""
-    perform_1456_cutoff(context)
-
-def perform_1456_cutoff(context):
-    """执行 14:56 全撤并冻结"""
-    if context.trading_frozen_today:
-        return
-    info('🧼 14:56 统一撤单开始...')
-    for sym in getattr(context, 'symbol_list', []):
-        cancel_all_orders_by_symbol(context, sym)
-    info('✅ 14:56 统一撤单完成。')
-    _set_freeze_today(context)
+# ---------------- 启动后清理与收敛 ----------------
 
 def before_trading_start(context, data):
     if context.initial_cleanup_done:
         return
-    _reset_freeze_if_new_day(context)
-
     info('🔁 before_trading_start：清理遗留挂单')
     after_initialize_cleanup(context)
-
     current_time = context.current_dt.time()
-    # 若已到/过 14:56：只撤不挂，并设置冻结（重启后不补挂）
-    if current_time >= FREEZE_CUTOFF_TIME:
-        info('⏹ 当前时间 {} ≥ 14:56:00，本日进入冻结模式：不再补挂任何新单。', current_time.strftime('%H:%M:%S'))
-        _set_freeze_today(context)
+    if time(9, 15) <= current_time < time(9, 30):
+        info('⏭ 重启在集合竞价时段，补挂网格')
+        place_auction_orders(context)
     else:
-        if time(9, 15) <= current_time < time(9, 30):
-            info('⏭ 重启在集合竞价时段，补挂网格')
-            place_auction_orders(context)
-        else:
-            info('⏸️ 重启时间{}不在集合竞价时段，跳过竞价补挂', current_time.strftime('%H:%M:%S'))
-            if is_main_trading_time():
-                info('🚀 主盘重启暖启动：撤单后立即补挂网格')
-                for sym in context.symbol_list:
-                    st = context.state[sym]
-                    px = context.last_valid_price.get(sym, st['base_price'])
-                    if not is_valid_price(px):
-                        px = st['base_price']
-                    context.latest_data[sym] = px
-                    try:
-                        place_limit_orders_ignore_halt(context, sym, st)
-                    except Exception as e:
-                        info('[{}] 暖启动补挂异常：{}', sym, e)
-
+        info('⏸️ 重启时间{}不在集合竞价时段，跳过补挂网格', current_time.strftime('%H:%M:%S'))
     context.initial_cleanup_done = True
-
-def place_limit_orders_ignore_halt(context, symbol, state):
-    halted = context.mark_halted.get(symbol, False)
-    try:
-        context.mark_halted[symbol] = False
-        place_limit_orders(context, symbol, state)
-    finally:
-        context.mark_halted[symbol] = halted
 
 def after_initialize_cleanup(context):
     if '回测' in context.env or not hasattr(context, 'symbol_list'):
@@ -258,6 +193,8 @@ def after_initialize_cleanup(context):
     for sym in context.symbol_list:
         cancel_all_orders_by_symbol(context, sym)
     info('✅ 按品种清理完成')
+
+# ---------------- 订单与撤单工具 ----------------
 
 def get_order_status(entrust_no):
     try:
@@ -301,14 +238,10 @@ def cancel_all_orders_by_symbol(context, symbol):
     if total > 0:
         info('[{}] 共{}笔遗留挂单尝试撤销完毕', symbol, total)
 
-def place_auction_orders(context):
-    # FIX(3)：9:15 的 run_daily 可能先于 handle_data 触发，这里先做一次跨日复位
-    _reset_freeze_if_new_day(context)
+# ---------------- 集合竞价挂单 ----------------
 
+def place_auction_orders(context):
     if '回测' in context.env or not (is_auction_time() or is_main_trading_time()):
-        return
-    if context.trading_frozen_today:
-        info('⛔ 已冻结：跳过集合竞价/主盘补挂。')
         return
     info('🆕 清空防抖缓存，开始集合竞价挂单')
     for st in context.state.values():
@@ -321,40 +254,49 @@ def place_auction_orders(context):
         place_limit_orders(context, sym, state)
         safe_save_state(sym, state)
 
+# ---------------- 网格限价挂单主逻辑 ----------------
+
 def place_limit_orders(context, symbol, state):
-    """限价挂单主函数（含棘轮/节流）。"""
-    # 统一短路：冻结后不允许任何新单
-    if context.trading_frozen_today:
+    """
+    限价挂单主函数（含“棘轮”与节流）。
+    HALT-GUARD：若停牌/无价，直接返回，不做任何基准价/棘轮移动。
+    """
+    now_dt = context.current_dt
+
+    # 停牌保护
+    if context.mark_halted.get(symbol, False):
         return
 
-    now_dt = context.current_dt
+    # 时间与节流：把原先 14:50 改为 14:56
     if state.get('_last_trade_ts') and (now_dt - state['_last_trade_ts']).total_seconds() < 60:
         return
     if is_order_blocking_period():
         return
-    if not (is_auction_time() or (is_main_trading_time() and now_dt.time() < time(14, 50))):
-        return
-    if context.mark_halted.get(symbol, False):
+    if not (is_auction_time() or (is_main_trading_time() and now_dt.time() < time(14, 56))):
         return
 
+    # 行情有效性
     price = context.latest_data.get(symbol)
-    if not (price and price > 0):
+    if not is_valid_price(price):
         return
     base = state['base_price']
     if abs(price / base - 1) > 0.10:
         return
 
+    # 网格参数
     unit, buy_sp, sell_sp = state['grid_unit'], state['buy_grid_spacing'], state['sell_grid_spacing']
     buy_p, sell_p = round(base * (1 - buy_sp), 3), round(base * (1 + sell_sp), 3)
 
     position = get_position(symbol)
     pos = position.amount + state.get('_pos_change', 0)
 
-    is_in_low_pos_range = (pos - unit <= state['base_position'])
-    ratchet_up = is_in_low_pos_range and price >= sell_p
+    # 棘轮条件
+    is_in_low_pos_range  = (pos - unit <= state['base_position'])
+    ratchet_up   = is_in_low_pos_range and price >= sell_p
     is_in_high_pos_range = (pos + unit >= state['max_position'])
     ratchet_down = is_in_high_pos_range and price <= buy_p
 
+    # 常规节流
     if not (ratchet_up or ratchet_down):
         last_ts = state.get('_last_order_ts')
         if last_ts and (now_dt - last_ts).seconds < 30:
@@ -364,6 +306,7 @@ def place_limit_orders(context, symbol, state):
             return
         state['_last_order_ts'], state['_last_order_bp'] = now_dt, base
 
+    # 棘轮移动
     if ratchet_up:
         state['base_price'] = sell_p
         info('[{}] 棘轮上移: 价格上涨触及卖价，基准价上移至 {:.3f}', symbol, sell_p)
@@ -375,6 +318,7 @@ def place_limit_orders(context, symbol, state):
         cancel_all_orders_by_symbol(context, symbol)
         buy_p, sell_p = round(buy_p * (1 - state['buy_grid_spacing']), 3), round(buy_p * (1 + state['sell_grid_spacing']), 3)
 
+    # 执行挂单
     try:
         open_orders = [o for o in get_open_orders(symbol) or [] if o.status == '2']
         enable_amount = position.enable_amount
@@ -394,6 +338,8 @@ def place_limit_orders(context, symbol, state):
         info('[{}] ⚠️ 限价挂单异常：{}', symbol, e)
     finally:
         safe_save_state(symbol, state)
+
+# ---------------- 成交回报与后续挂单 ----------------
 
 def on_trade_response(context, trade_list):
     for tr in trade_list:
@@ -430,51 +376,50 @@ def on_order_filled(context, symbol, order):
     state['_last_fill_dt'] = context.current_dt
     state['last_fill_price'] = order.price
     state['base_price'] = order.price
-    context.last_valid_price[symbol] = float(order.price)
-    info('[{}] 🔄 成交后基准价更新为 {:.3f}', symbol, order.price)
     state['_pos_change'] = order.amount
     cancel_all_orders_by_symbol(context, symbol)
 
-    # 冻结后不再补挂
-    if context.trading_frozen_today:
-        info('[{}] 已冻结：成交后不再补挂。', symbol)
-    elif is_order_blocking_period():
+    # 成交视为有效价
+    context.mark_halted[symbol] = False
+    context.last_valid_price[symbol] = order.price
+    context.latest_data[symbol] = order.price
+
+    # 仅在 14:56 之前继续挂限价
+    if is_order_blocking_period():
         info('[{}] 处于9:25-9:30挂单冻结期，成交后仅更新状态，推迟挂单至9:30后。', symbol)
-    elif context.current_dt.time() < time(14, 50):
+    elif context.current_dt.time() < time(14, 56):
         place_limit_orders(context, symbol, state)
 
     context.should_place_order_map[symbol] = True
     safe_save_state(symbol, state)
 
+# ---------------- 行情主循环 ----------------
+
 def handle_data(context, data):
     now_dt = context.current_dt
     now = now_dt.time()
 
-    _reset_freeze_if_new_day(context)
-
-    # A：行情判停
-    for sym in context.symbol_list:
-        if sym in data and data[sym] is not None:
-            px = getattr(data[sym], 'price', None)
-            if is_valid_price(px):
-                px = float(px)
-                context.latest_data[sym] = px
-                context.last_valid_price[sym] = px
-                context.mark_halted[sym] = False
-            else:
-                context.mark_halted[sym] = True
-
-    # B：每5分钟热加载&看板
+    # 每5分钟：热重载 + 看板
     if now_dt.minute % 5 == 0 and now_dt.second < 5:
         reload_config_if_changed(context)
         generate_html_report(context)
 
-    # C：价值平均/动态网格
+    # HALT-GUARD：更新行情与停牌标记
+    for sym in context.symbol_list:
+        if sym in data and data[sym] and is_valid_price(getattr(data[sym], 'price', None)):
+            px = float(data[sym].price)
+            context.latest_data[sym] = px
+            context.last_valid_price[sym] = px
+            context.mark_halted[sym] = False
+        else:
+            context.mark_halted[sym] = True
+
+    # 动态底仓与间距
     for sym in context.symbol_list:
         if sym not in context.state:
             continue
         st = context.state[sym]
-        price = context.latest_data.get(sym) or context.last_valid_price.get(sym)
+        price = context.latest_data.get(sym)
         if not is_valid_price(price):
             continue
         get_target_base_position(context, sym, st, price, now_dt)
@@ -482,40 +427,33 @@ def handle_data(context, data):
         if now_dt.minute % 30 == 0 and now_dt.second < 5:
             update_grid_spacing_final(context, sym, st, get_position(sym).amount)
 
-    # D：时段内限价挂单（若未冻结）
-    if not context.trading_frozen_today and (is_auction_time() or (is_main_trading_time() and now < time(14, 50))):
+    # 限价下单窗口：集合竞价 或 主盘且 < 14:56
+    if is_auction_time() or (is_main_trading_time() and now < time(14, 56)):
         for sym in context.symbol_list:
             if sym in context.state:
                 place_limit_orders(context, sym, context.state[sym])
 
-    # E：14:56 统一撤单并冻结（运行时兜底）
-    if now >= FREEZE_CUTOFF_TIME and not context.trading_frozen_today:
-        perform_1456_cutoff(context)
+    # —— 市价触发路径已删除（不再有 14:55-14:57 市价单）——
 
-    # F：14:55 后市价触发——已关闭，只打印一次说明
-    if DISABLE_MARKET_AFTER_1455 and time(14, 55) <= now < time(14, 57):
-        if not hasattr(context, '_mkt_off_logged') or not context._mkt_off_logged:
-            info('🚫 已按热修关闭14:55后的市价触发；今天14:56已统一撤单并冻结。')
-            context._mkt_off_logged = True
-
-    # G：每30分钟巡检
+    # 巡检
     if now_dt.minute % 30 == 0 and now_dt.second < 5:
         info('📌 每30分钟状态巡检...')
         for sym in context.symbol_list:
             if sym in context.state:
                 log_status(context, sym, context.state[sym], context.latest_data.get(sym))
 
-def place_market_orders_if_triggered(context, symbol, state):
-    """保留函数以兼容，但在热修版本中不会被调用执行（已在handle_data中关闭触发）。"""
-    info('[{}] ⚠️ 市价触发逻辑已在本版关闭（MKT-OFF-1456）。', symbol)
+# ---------------- 监控输出 ----------------
 
 def log_status(context, symbol, state, price):
-    if not price:
+    disp_price = context.last_valid_price.get(symbol, state['base_price'])
+    if not is_valid_price(disp_price):
         return
     pos = get_position(symbol)
-    pnl = (price - pos.cost_basis) * pos.amount if pos.cost_basis > 0 else 0
+    pnl = (disp_price - pos.cost_basis) * pos.amount if pos.cost_basis > 0 else 0
     info("📊 [{}] 状态: 价:{:.3f} 持仓:{}(可卖:{}) / 底仓:{} 成本:{:.3f} 盈亏:{:.2f} 网格:[买{:.2%},卖{:.2%}]",
-         symbol, price, pos.amount, pos.enable_amount, state['base_position'], pos.cost_basis, pnl, state['buy_grid_spacing'], state['sell_grid_spacing'])
+         symbol, disp_price, pos.amount, pos.enable_amount, state['base_position'], pos.cost_basis, pnl, state['buy_grid_spacing'], state['sell_grid_spacing'])
+
+# ---------------- 动态网格间距（ATR） ----------------
 
 def update_grid_spacing_final(context, symbol, state, curr_pos):
     unit, base_pos = state['grid_unit'], state['base_position']
@@ -533,7 +471,7 @@ def update_grid_spacing_final(context, symbol, state, curr_pos):
     else:
         new_buy, new_sell = base_spacing, base_spacing
     max_spacing = 0.03
-    new_buy = round(min(new_buy, max_spacing), 4)
+    new_buy  = round(min(new_buy,  max_spacing), 4)
     new_sell = round(min(new_sell, max_spacing), 4)
     if new_buy != state.get('buy_grid_spacing') or new_sell != state.get('sell_grid_spacing'):
         state['buy_grid_spacing'], state['sell_grid_spacing'] = new_buy, new_sell
@@ -551,18 +489,20 @@ def calculate_atr(context, symbol, atr_period=14):
         if not trs:
             return None
         atr_value = sum(trs) / len(trs)
-        current_price = context.latest_data.get(symbol, close[-1])
-        if current_price > 0:
+        current_price = context.last_valid_price.get(symbol, close[-1])
+        if is_valid_price(current_price):
             return atr_value / current_price
         return None
     except Exception as e:
         info('[{}] ❌ ATR计算异常: {}', symbol, e)
         return None
 
+# ---------------- 日终动作（14:56） ----------------
+
 def end_of_day(context):
-    """保留原14:55日终动作；冻结在14:56由perform_1456_cutoff处理。"""
-    info('✅ 日终处理开始...')
-    after_initialize_cleanup(context)
+    """14:56 统一撤单 + 看板 + 状态保存（不再触发任何市价单）"""
+    info('✅ 日终处理开始(14:56)...')
+    after_initialize_cleanup(context)   # 这里会对所有标的执行撤单
     generate_html_report(context)
     for sym in context.symbol_list:
         if sym in context.state:
@@ -570,7 +510,13 @@ def end_of_day(context):
             context.should_place_order_map[sym] = True
     info('✅ 日终保存状态完成')
 
+# ---------------- 价值平均（VA） ----------------
+
 def get_target_base_position(context, symbol, state, price, dt):
+    if not is_valid_price(price):
+        info('[{}] ⚠️ 停牌/无有效价，跳过VA计算，底仓维持 {}', symbol, state['base_position'])
+        return state['base_position']
+
     weeks = get_trade_weeks(context, symbol, state, dt)
     target_val = state['initial_position_value'] + sum(state['dingtou_base'] * (1 + state['dingtou_rate'])**w for w in range(1, weeks + 1))
     if price <= 0:
@@ -607,12 +553,16 @@ def adjust_grid_unit(state):
             state['max_position'] = base_pos + new_u * 20
             info('🔧 [{}] 底仓增加，网格单位放大: {}->{}', state.get('symbol',''), orig, new_u)
 
+# ---------------- 交易结束回调（平台触发） ----------------
+
 def after_trading_end(context, data):
     if '回测' in context.env:
         return
     info('⏰ 系统调用交易结束处理')
     update_daily_reports(context, data)
     info('✅ 交易结束处理完成')
+
+# ---------------- 配置热重载 ----------------
 
 def reload_config_if_changed(context):
     try:
@@ -630,8 +580,8 @@ def reload_config_if_changed(context):
             context.symbol_list.remove(sym)
             if sym in context.state: del context.state[sym]
             if sym in context.latest_data: del context.latest_data[sym]
-            if sym in context.last_valid_price: del context.last_valid_price[sym]
-            if sym in context.mark_halted: del context.mark_halted[sym]
+            context.mark_halted.pop(sym, None)
+            context.last_valid_price.pop(sym, None)
 
         for sym in new_symbols - old_symbols:
             info(f'[{sym}] 新增标的，正在初始化状态...')
@@ -648,9 +598,9 @@ def reload_config_if_changed(context):
             })
             context.state[sym] = st
             context.latest_data[sym] = st['base_price']
-            context.last_valid_price[sym] = st['base_price']
-            context.mark_halted[sym] = False
             context.symbol_list.append(sym)
+            context.mark_halted[sym] = False
+            context.last_valid_price[sym] = st['base_price']
 
         for sym in old_symbols.intersection(new_symbols):
             if context.symbol_config[sym] != new_config[sym]:
@@ -667,6 +617,8 @@ def reload_config_if_changed(context):
     except Exception as e:
         info(f'❌ 配置文件热重载失败: {e}')
 
+# ---------------- 日报/报表 ----------------
+
 def update_daily_reports(context, data):
     reports_dir = research_path('reports')
     reports_dir.mkdir(parents=True, exist_ok=True)
@@ -677,9 +629,12 @@ def update_daily_reports(context, data):
         pos_obj = get_position(symbol)
         amount = getattr(pos_obj, 'amount', 0)
         cost_basis = getattr(pos_obj, 'cost_basis', state['base_price'])
-        close_price = context.latest_data.get(symbol, state['base_price'])
+        close_price = context.last_valid_price.get(symbol, state['base_price'])
         try:
-            close_price = getattr(close_price, 'price', close_price)
+            if not is_valid_price(close_price):
+                close_price = cost_basis if cost_basis > 0 else state['base_price']
+                if not is_valid_price(close_price):
+                    close_price = 1.0
         except:
             close_price = state['base_price']
         weeks = len(state.get('trade_week_set', []))
@@ -727,6 +682,8 @@ def update_daily_reports(context, data):
             f.write(",".join(map(str, row)) + "\n")
         info(f'✅ [{symbol}] 已更新每日CSV报表：{report_file}')
 
+# ---------------- 成交明细日志 ----------------
+
 def log_trade_details(context, symbol, trade):
     try:
         trade_log_path = research_path('reports', 'a_trade_details.csv')
@@ -749,6 +706,8 @@ def log_trade_details(context, symbol, trade):
     except Exception as e:
         info(f'❌ 记录交易日志失败: {e}')
 
+# ---------------- HTML 看板 ----------------
+
 def generate_html_report(context):
     all_metrics = []
     total_market_value = 0
@@ -758,17 +717,23 @@ def generate_html_report(context):
             continue
         state = context.state[symbol]
         pos = get_position(symbol)
-        price = context.latest_data.get(symbol, 0)
+        price = context.last_valid_price.get(symbol, state['base_price'])
+        halted = context.mark_halted.get(symbol, False)
+        if not is_valid_price(price):
+            price = pos.cost_basis if pos.cost_basis > 0 else state['base_price']
+            if not is_valid_price(price):
+                price = 1.0
         market_value = pos.amount * price
         unrealized_pnl = (price - pos.cost_basis) * pos.amount if pos.cost_basis > 0 else 0
         total_market_value += market_value
         total_unrealized_pnl += unrealized_pnl
         atr_pct = calculate_atr(context, symbol)
+        name_price = f"{price:.3f}" + (" (停牌)" if halted else "")
         all_metrics.append({
             "symbol": symbol,
             "position": f"{pos.amount} ({pos.enable_amount})",
             "cost_basis": f"{pos.cost_basis:.3f}",
-            "price": f"{price:.3f}",
+            "price": name_price,
             "market_value": f"{market_value:,.2f}",
             "unrealized_pnl": f"{unrealized_pnl:,.2f}",
             "pnl_ratio": f"{(unrealized_pnl / (pos.cost_basis * pos.amount) * 100) if pos.cost_basis * pos.amount != 0 else 0:.2f}%",
