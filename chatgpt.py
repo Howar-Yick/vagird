@@ -1,5 +1,5 @@
 # event_driven_grid_strategy.py
-# 版本号：CHATGPT-3.2.1-20251014-HALT-GUARD-MKT-OFF1456-fix3d+cnames-hotfix
+# 版本号：CHATGPT-3.2.1-20251014-HALT-GUARD-MKT-OFF1456-fix3e+cnames-hotfix-rehang
 # 变更点（在 HALT-GUARD 基础上的最小改动）：
 # 1) ❌ 不改市价单（仍然完全移除14:55市价触发）；
 # 2) ⏰ 限价挂单窗口至14:56（保持既有逻辑）；
@@ -18,8 +18,10 @@
 #       }
 #       *保持向后兼容*: 若出现旧版临时键（"debug_rt_log","rt_log_interval_seconds"），也会被识别，但优先使用上述“原始结构”。
 # 10) ⚙️ 棘轮：仅在连续竞价且拿到有效实时价时启用；无价时仍按 base_price 挂单但不移动基准。
-# 11) 🈶️【新增，最小改动】日志与看板显示中文名称（来自 config/names.json 与 symbols.json 的 name 字段；仅影响展示，不改业务）
-# 12) 🧯【热修】修正 update_daily_reports 中 t_quantity 一行的右括号手误（] -> )）
+# 11) 🈶️【已保留】日志与看板显示中文名称（来自 config/names.json 与 symbols.json 的 name 字段；仅影响展示，不改业务）
+# 12) 🧯【已保留】修正 update_daily_reports 中 t_quantity 一行的右括号手误（] -> )）
+# 13) 🔁【新增补丁】成交回报后的一次性补挂：撤掉对手向单后，**仅当次补挂**绕过
+#     a) 60秒成交冷却、b) 30秒下单防抖、c) “基准价相近”防抖；补挂执行后立即回收豁免标记。
 
 import json
 import logging
@@ -31,7 +33,7 @@ from types import SimpleNamespace
 # ---------------- 全局句柄与常量 ----------------
 LOG_FH = None
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'CHATGPT-3.2.1-20251014-HALT-GUARD-MKT-OFF1456-fix3d+cnames-hotfix'
+__version__ = 'CHATGPT-3.2.1-20251014-HALT-GUARD-MKT-OFF1456-fix3e+cnames-hotfix-rehang'
 TRANSACTION_COST = 0.00005
 
 # ---- 调试默认（可被 config/debug.json 覆盖）----
@@ -455,14 +457,19 @@ def place_limit_orders(context, symbol, state):
     """
     now_dt = context.current_dt
 
-    if state.get('_last_trade_ts') and (now_dt - state['_last_trade_ts']).total_seconds() < 60:
+    # ✅ 成交后冷却：允许“仅当次补挂”绕过；之后自动恢复
+    rehang_bypass = bool(state.get('_rehang_bypass_once'))
+    if (not rehang_bypass) and state.get('_last_trade_ts') \
+       and (now_dt - state['_last_trade_ts']).total_seconds() < 60:
         return
+
     if is_order_blocking_period():
         return
     in_limit_window = is_auction_time() or (is_main_trading_time() and now_dt.time() < time(14, 56))
     if not in_limit_window:
         return
 
+    # 是否处于“允许无价挂单”的阶段
     boot_grace = (now_dt - getattr(context, 'boot_dt', now_dt)).total_seconds() < getattr(context, 'boot_grace_seconds', 180)
     allow_tickless = boot_grace or is_auction_time()
 
@@ -473,11 +480,12 @@ def place_limit_orders(context, symbol, state):
     position = get_position(symbol)
     pos = position.amount + state.get('_pos_change', 0)
 
+    # 棘轮启用条件：连续竞价且拿到有效价
     price = context.latest_data.get(symbol)
     ratchet_enabled = (not allow_tickless) and is_valid_price(price)
 
     if ratchet_enabled:
-        if abs(price / base - 1) <= 0.10:
+        if abs(price / base - 1) <= 0.10:  # 偏离保护仍保留
             is_in_low_pos_range  = (pos - unit <= state['base_position'])
             is_in_high_pos_range = (pos + unit >= state['max_position'])
             sell_p_curr = round(base * (1 + sell_sp), 3)
@@ -495,6 +503,7 @@ def place_limit_orders(context, symbol, state):
                 cancel_all_orders_by_symbol(context, symbol)
                 buy_p, sell_p = round(buy_p_curr * (1 - buy_sp), 3), round(buy_p_curr * (1 + sell_sp), 3)
 
+    # 常规节流（不依赖是否有价）
     last_ts = state.get('_last_order_ts')
     if last_ts and (now_dt - last_ts).seconds < 30:
         return
@@ -503,6 +512,7 @@ def place_limit_orders(context, symbol, state):
         return
     state['_last_order_ts'], state['_last_order_bp'] = now_dt, base
 
+    # 执行挂单
     try:
         open_orders = [o for o in get_open_orders(symbol) or [] if o.status == '2']
         enable_amount = position.enable_amount
@@ -521,6 +531,8 @@ def place_limit_orders(context, symbol, state):
     except Exception as e:
         info('[{}] ⚠️ 限价挂单异常：{}', dsym(context, symbol), e)
     finally:
+        # 若本次是“成交后的当次补挂”，到此为止豁免已用一次，立即回收标记
+        state.pop('_rehang_bypass_once', None)
         safe_save_state(symbol, state)
 
 # ---------------- 成交回报与后续挂单 ----------------
@@ -563,11 +575,18 @@ def on_order_filled(context, symbol, order):
     state['_pos_change'] = order.amount
     cancel_all_orders_by_symbol(context, symbol)
 
+    # 成交视为有效价
     context.mark_halted[symbol] = False
     context.last_valid_price[symbol] = order.price
     context.latest_data[symbol] = order.price
     context.last_valid_ts[symbol] = context.current_dt
 
+    # ✅【仅当次补挂豁免】：确保撤掉对手向单后能立即补挂一轮
+    state['_rehang_bypass_once'] = True        # 开一次性绕过冷却
+    state.pop('_last_order_ts', None)           # 解除30秒下单防抖
+    state.pop('_last_order_bp', None)           # 解除“基准价相近”防抖
+
+    # 仅在 9:25-9:30 冻结期外、且 <14:56 才补挂
     if is_order_blocking_period():
         info('[{}] 处于9:25-9:30挂单冻结期，成交后仅更新状态，推迟挂单至9:30后。', dsym(context, symbol))
     elif context.current_dt.time() < time(14, 56):
@@ -582,20 +601,23 @@ def handle_data(context, data):
     now_dt = context.current_dt
     now = now_dt.time()
 
+    # ✅ 主动拉取快照，更新 latest_data/last_valid_* 与心跳日志（含调试配置热加载）
     _fetch_quotes_via_snapshot(context)
 
+    # 每5分钟：热重载 + 看板
     if now_dt.minute % 5 == 0 and now_dt.second < 5:
         reload_config_if_changed(context)
         generate_html_report(context)
 
+    # ---------- 启动宽限期后才做“阶段+断流”停牌识别（仅影响展示，不拦单） ----------
     boot_grace = (now_dt - getattr(context, 'boot_dt', now_dt)).total_seconds() < getattr(context, 'boot_grace_seconds', 180)
     if not boot_grace:
         def _phase_start(now_t: time):
-            if time(9, 15) <= now_t < time(9, 25):
+            if time(9, 15) <= now_t < time(9, 25):   # 集合竞价
                 return time(9, 15)
-            if time(9, 30) <= now_t <= time(11, 30):
+            if time(9, 30) <= now_t <= time(11, 30): # 早盘
                 return time(9, 30)
-            if time(13, 0) <= now_t <= time(15, 0):
+            if time(13, 0) <= now_t <= time(15, 0):  # 午后
                 return time(13, 0)
             return None
 
@@ -610,6 +632,7 @@ def handle_data(context, data):
                 else:
                     context.mark_halted[sym] = ((now_dt - last_ts).total_seconds() > grace_seconds)
 
+    # ---------- 动态底仓与间距（价有效时才做，保持既有逻辑） ----------
     for sym in context.symbol_list:
         if sym not in context.state:
             continue
@@ -621,11 +644,13 @@ def handle_data(context, data):
             if now_dt.minute % 30 == 0 and now_dt.second < 5:
                 update_grid_spacing_final(context, sym, st, get_position(sym).amount)
 
+    # ---------- 限价下单窗口：集合竞价 或 主盘且 < 14:56 ----------
     if is_auction_time() or (is_main_trading_time() and now < time(14, 56)):
         for sym in context.symbol_list:
             if sym in context.state:
                 place_limit_orders(context, sym, context.state[sym])
 
+    # 巡检
     if now_dt.minute % 30 == 0 and now_dt.second < 5:
         info('📌 每30分钟状态巡检...')
         for sym in context.symbol_list:
@@ -692,7 +717,7 @@ def calculate_atr(context, symbol, atr_period=14):
 def end_of_day(context):
     """14:56 统一撤单 + 看板 + 状态保存（不再触发任何市价单）"""
     info('✅ 日终处理开始(14:56)...')
-    after_initialize_cleanup(context)
+    after_initialize_cleanup(context)   # 这里会对所有标的执行撤单
     generate_html_report(context)
     for sym in context.symbol_list:
         if sym in context.state:
