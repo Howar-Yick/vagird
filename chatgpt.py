@@ -1,5 +1,5 @@
 # event_driven_grid_strategy.py
-# 版本号：CHATGPT-3.2.1-20251014-HALT-GUARD-MKT-OFF1456-fix3e+cnames-hotfix-rehang
+# 版本号：CHATGPT-3.2.1-20251014-HALT-GUARD-MKT-OFF1456-fix3f+cnames-hotfix-rehang+va-throttle
 # 变更点（在 HALT-GUARD 基础上的最小改动）：
 # 1) ❌ 不改市价单（仍然完全移除14:55市价触发）；
 # 2) ⏰ 限价挂单窗口至14:56（保持既有逻辑）；
@@ -20,8 +20,12 @@
 # 10) ⚙️ 棘轮：仅在连续竞价且拿到有效实时价时启用；无价时仍按 base_price 挂单但不移动基准。
 # 11) 🈶️【已保留】日志与看板显示中文名称（来自 config/names.json 与 symbols.json 的 name 字段；仅影响展示，不改业务）
 # 12) 🧯【已保留】修正 update_daily_reports 中 t_quantity 一行的右括号手误（] -> )）
-# 13) 🔁【新增补丁】成交回报后的一次性补挂：撤掉对手向单后，**仅当次补挂**绕过
+# 13) 🔁【已保留补丁】成交回报后的一次性补挂：撤掉对手向单后，**仅当次补挂**绕过
 #     a) 60秒成交冷却、b) 30秒下单防抖、c) “基准价相近”防抖；补挂执行后立即回收豁免标记。
+# 14) 📉【新增补丁】VA“价值缺口阈值”去抖动：仅当 |目标市值-当前底仓市值| ≥ k*(grid_unit*price) 才调整底仓；
+# 15) ⏱️【新增补丁】VA“限频器”：相邻两次调整间隔 ≥ min_update_interval_minutes；每日最多 max_updates_per_day 次；
+# 16) 🪜【新增补丁】VA“步长对齐”：底仓调整数量为 grid_unit 的整数倍；
+# 17) ⚙️【新增补丁】VA参数热加载：可选读取 config/va.json（若不存在则走内置默认值），运行中热加载。
 
 import json
 import logging
@@ -33,13 +37,18 @@ from types import SimpleNamespace
 # ---------------- 全局句柄与常量 ----------------
 LOG_FH = None
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'CHATGPT-3.2.1-20251014-HALT-GUARD-MKT-OFF1456-fix3e+cnames-hotfix-rehang'
+__version__ = 'CHATGPT-3.2.1-20251014-HALT-GUARD-MKT-OFF1456-fix3f+cnames-hotfix-rehang+va-throttle'
 TRANSACTION_COST = 0.00005
 
 # ---- 调试默认（可被 config/debug.json 覆盖）----
 DBG_ENABLE_DEFAULT = True
 DBG_RT_WINDOW_SEC_DEFAULT = 60
 DBG_RT_PREVIEW_DEFAULT = 8
+
+# ---- VA 去抖动与限频 默认参数（可被 config/va.json 覆盖）----
+VA_VALUE_THRESHOLD_K_DEFAULT = 1.0          # 价值缺口门槛：k * (grid_unit * price)
+VA_MIN_UPDATE_INTERVAL_MIN_DEFAULT = 60     # 相邻两次底仓更新的最小间隔（分钟）
+VA_MAX_UPDATES_PER_DAY_DEFAULT = 3          # 每日底仓最多调整次数
 
 # ---------------- 通用路径与工具函数 ----------------
 
@@ -218,6 +227,52 @@ def _load_debug_config(context, force=False):
     else:
         info('🧪 调试配置生效: enable=False（关闭心跳日志）')
 
+# ---------------- VA 参数：从研究目录 config/va.json 读取 + 热加载（新增） ----------------
+
+def _load_va_config(context, force=False):
+    """
+    可选文件：config/va.json
+    {
+      "value_threshold_k": 1.0,
+      "min_update_interval_minutes": 60,
+      "max_updates_per_day": 3
+    }
+    """
+    cfg_file = research_path('config', 'va.json')
+    try:
+        mtime = cfg_file.stat().st_mtime if cfg_file.exists() else None
+    except:
+        mtime = None
+
+    if (not force) and hasattr(context, 'va_cfg_mtime') and context.va_cfg_mtime == mtime:
+        return
+
+    k = VA_VALUE_THRESHOLD_K_DEFAULT
+    min_int = VA_MIN_UPDATE_INTERVAL_MIN_DEFAULT
+    max_per_day = VA_MAX_UPDATES_PER_DAY_DEFAULT
+    try:
+        if cfg_file.exists():
+            j = json.loads(cfg_file.read_text(encoding='utf-8'))
+            if isinstance(j, dict):
+                if 'value_threshold_k' in j:
+                    try: k = max(0.0, float(j['value_threshold_k']))
+                    except: pass
+                if 'min_update_interval_minutes' in j:
+                    try: min_int = max(0, int(j['min_update_interval_minutes']))
+                    except: pass
+                if 'max_updates_per_day' in j:
+                    try: max_per_day = max(0, int(j['max_updates_per_day']))
+                    except: pass
+    except Exception as e:
+        info('⚠️ 读取 VA 配置失败: {}（采用默认 k={}, minInt={}m, maxDaily={}）',
+             e, k, min_int, max_per_day)
+
+    context.va_value_threshold_k = k
+    context.va_min_update_interval_minutes = min_int
+    context.va_max_updates_per_day = max_per_day
+    context.va_cfg_mtime = mtime
+    info('⚙️ VA配置生效: k={} minInterval={}m maxDaily={}', k, min_int, max_per_day)
+
 # ---------------- 初始化与时间窗口判断 ----------------
 
 def initialize(context):
@@ -271,7 +326,11 @@ def initialize(context):
             'initial_position_value': cfg['initial_base_position'] * cfg['base_price'],
             'buy_grid_spacing': 0.005,
             'sell_grid_spacing': 0.005,
-            'max_position': saved.get('max_position', saved.get('base_position', cfg['initial_base_position']) + saved.get('grid_unit', cfg['grid_unit']) * 20)
+            'max_position': saved.get('max_position', saved.get('base_position', cfg['initial_base_position']) + saved.get('grid_unit', cfg['grid_unit']) * 20),
+            # —— VA 限频状态（新增）——
+            'va_last_update_dt': None,
+            'va_update_count_date': None,
+            'va_updates_today': 0
         })
         context.state[sym] = st
         context.latest_data[sym] = st['base_price']
@@ -283,8 +342,9 @@ def initialize(context):
     context.boot_dt = getattr(context, 'current_dt', None) or datetime.now()
     context.boot_grace_seconds = int(get_saved_param('boot_grace_seconds', 180))
 
-    # 调试配置（首次加载）
+    # 调试 & VA 配置（首次加载）
     _load_debug_config(context, force=True)
+    _load_va_config(context, force=True)
 
     # 绑定定时任务
     context.initial_cleanup_done = False
@@ -398,6 +458,7 @@ def _fetch_quotes_via_snapshot(context):
     同时在调用前做 debug 配置热加载（mtime 变更即生效）。
     """
     _load_debug_config(context, force=False)
+    _load_va_config(context, force=False)  # 🆕 同步热加载 VA 参数
 
     symbols = list(getattr(context, 'symbol_list', []) or [])
     if not symbols:
@@ -601,7 +662,7 @@ def handle_data(context, data):
     now_dt = context.current_dt
     now = now_dt.time()
 
-    # ✅ 主动拉取快照，更新 latest_data/last_valid_* 与心跳日志（含调试配置热加载）
+    # ✅ 主动拉取快照，更新 latest_data/last_valid_* 与心跳日志（含调试/VA配置热加载）
     _fetch_quotes_via_snapshot(context)
 
     # 每5分钟：热重载 + 看板
@@ -728,24 +789,85 @@ def end_of_day(context):
 # ---------------- 价值平均（VA） ----------------
 
 def get_target_base_position(context, symbol, state, price, dt):
+    """
+    【改造点】
+    - 引入基于“价值缺口”的阈值：|target_val - base_position*price| ≥ k*(grid_unit*price) 才调整；
+    - 限频：相邻两次调整 ≥ va_min_update_interval_minutes；每日最多 va_max_updates_per_day 次；
+    - 步长对齐：调整数量为 grid_unit 的整数倍；
+    - 日切：每日计数在自然日切换时清零；
+    - 保持原有最小底仓 min_base 约束与 max_position = base + 20*grid_unit。
+    """
     if not is_valid_price(price):
         info('[{}] ⚠️ 停牌/无有效价，跳过VA计算，底仓维持 {}', dsym(context, symbol), state['base_position'])
         return state['base_position']
+
+    # —— 计算目标价值曲线 —— #
     weeks = get_trade_weeks(context, symbol, state, dt)
     target_val = state['initial_position_value'] + sum(state['dingtou_base'] * (1 + state['dingtou_rate'])**w for w in range(1, weeks + 1))
     if price <= 0:
         return state['base_position']
-    new_pos = target_val / price
+
+    # —— 每日计数：自然日切换则重置 —— #
+    today = dt.date()
+    if state.get('va_update_count_date') != today:
+        state['va_update_count_date'] = today
+        state['va_updates_today'] = 0
+
+    # —— 阈值与限频参数 —— #
+    k = float(getattr(context, 'va_value_threshold_k', VA_VALUE_THRESHOLD_K_DEFAULT))
+    min_int_min = int(getattr(context, 'va_min_update_interval_minutes', VA_MIN_UPDATE_INTERVAL_MIN_DEFAULT))
+    max_daily = int(getattr(context, 'va_max_updates_per_day', VA_MAX_UPDATES_PER_DAY_DEFAULT))
+
+    # —— 价值缺口与网格价值 —— #
+    current_val = state['base_position'] * price
+    delta_val = target_val - current_val
+    grid_value = state['grid_unit'] * price
+
+    # —— 阈值判定：缺口不达阈值 -> 不调整 —— #
+    if abs(delta_val) < k * grid_value:
+        # 静默跳过，避免日志噪音
+        return state['base_position']
+
+    # —— 限频判定：与上次调整的间隔 —— #
+    last_dt = state.get('va_last_update_dt')
+    if last_dt is not None:
+        if (dt - last_dt).total_seconds() < min_int_min * 60:
+            return state['base_position']
+
+    # —— 每日次数上限 —— #
+    if state.get('va_updates_today', 0) >= max_daily:
+        return state['base_position']
+
+    # —— 计算应调整的“份额步长” = grid_unit 的整数倍 —— #
+    # 目标份额差（以股计）≈ delta_val / price
+    desired_shares = delta_val / price
+    # 取整到 grid_unit 的整数倍（至少为 1 个步长）
+    step = state['grid_unit']
+    steps = int(round(desired_shares / step))
+    if steps == 0:
+        # 达阈值但四舍五入后为 0，强制按 1 个步长以避免长期卡在阈值边缘
+        steps = 1 if desired_shares > 0 else -1
+    adj_shares = steps * step
+
+    # —— 最小底仓约束 —— #
     min_base = round(state['initial_position_value'] / state['base_price'] / 100) * 100 if state['base_price'] > 0 else 0
-    final_pos = round(max(min_base, new_pos) / 100) * 100
-    if final_pos != state['base_position']:
-        current_val = state['base_position'] * price
-        delta_val = target_val - current_val
-        info('[{}] 价值平均: 目标底仓从 {} 调整至 {}. (目标市值: {:.2f}, 当前市值: {:.2f}, 市值缺口: {:.2f})',
-             dsym(context, symbol), state['base_position'], final_pos, target_val, current_val, delta_val)
-        state['base_position'] = final_pos
-        state['max_position'] = final_pos + state['grid_unit'] * 20
-    return final_pos
+    new_base_pos = max(min_base, state['base_position'] + adj_shares)
+
+    if new_base_pos == state['base_position']:
+        return state['base_position']
+
+    # —— 应用调整 —— #
+    info('[{}] 价值平均(阈值/限频): 目标底仓从 {} 调整至 {} (Δ{}股, 单位:{}). 目标市值:{:.2f}, 当前市值:{:.2f}, 缺口:{:.2f}',
+         dsym(context, symbol),
+         state['base_position'], new_base_pos, (new_base_pos - state['base_position']),
+         state['grid_unit'], target_val, current_val, delta_val)
+
+    state['base_position'] = new_base_pos
+    state['max_position'] = new_base_pos + state['grid_unit'] * 20
+    state['va_last_update_dt'] = dt
+    state['va_updates_today'] = int(state.get('va_updates_today', 0)) + 1
+
+    return new_base_pos
 
 def get_trade_weeks(context, symbol, state, dt):
     y, w, _ = dt.date().isocalendar()
@@ -809,7 +931,11 @@ def reload_config_if_changed(context):
                 'last_week_position': cfg['initial_base_position'],
                 'initial_position_value': cfg['initial_base_position'] * cfg['base_price'],
                 'buy_grid_spacing': 0.005, 'sell_grid_spacing': 0.005,
-                'max_position': cfg['initial_base_position'] + cfg['grid_unit'] * 20
+                'max_position': cfg['initial_base_position'] + cfg['grid_unit'] * 20,
+                # VA 限频字段补齐
+                'va_last_update_dt': None,
+                'va_update_count_date': None,
+                'va_updates_today': 0
             })
             context.state[sym] = st
             context.latest_data[sym] = st['base_price']
