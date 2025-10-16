@@ -1,25 +1,29 @@
 # event_driven_grid_strategy.py
-# 版本号：CHATGPT-3.2.2-20251016-HALT-GUARD-MKT-OFF1456+VA-THROTTLE+HALT-SKIPPLACE
-# 变更点（在 HALT-GUARD 基础上的最小改动）：
+# 版本号：CHATGPT-3.2.3-20251016-HALT-GUARD-MKT-OFF1456+VA-THROTTLE+HALT-SKIPPLACE+STRATEGY-CONF
+# 变更点（在 3.2.2 基础上的最小改动）：
 # 1) ❌ 不改市价单（仍然完全移除14:55市价触发）；
 # 2) ⏰ 限价挂单窗口至14:56（保持既有逻辑）；
 # 3) 🧹 日终统一撤单14:56（保持既有逻辑）；
 # 4) 📴 14:56后不再发起新挂单（保持既有逻辑）；
 # 5) 🪫 重启/竞价按 base_price 补挂网格；无实时价不阻断挂单（保持既有逻辑）；
 # 6) 🕒 启动宽限期 boot_grace（默认180秒，可配置参数保留）；
-# 7) 🛡️ 停牌仅影响展示（历史逻辑保留），但新增“连续竞价停牌跳过挂单”可选保护；
-# 8) 🔧 ✅ 实时价获取：用 get_snapshot(...) 的 last_px 更新 latest_data/last_valid_*；
-# 9) 🧪 ✅ 实时价心跳：每“窗口秒”输出 got/miss；调试开关从【研究目录/config/debug.json】热加载；
-# 10) ⚙️ 棘轮：仅在连续竞价且拿到有效实时价时启用；无价时仍按 base_price 挂单但不移动基准。
-# 11) 🈶️【已保留】日志与看板显示中文名称（来自 config/names.json 与 symbols.json 的 name 字段；仅影响展示，不改业务）
-# 12) 🧯【已保留】修正 update_daily_reports 中 t_quantity 一行的右括号手误（] -> )）
-# 13) 🔁【已保留补丁】成交回报后的一次性补挂：撤掉对手向单后，仅当次补挂绕过（成交冷却/下单防抖/基准接近）
-# 14) 📉【已保留补丁】VA去抖动：|目标市值-当前底仓市值| ≥ k*(grid_unit*price) 才调整底仓；
-# 15) ⏱️【已保留补丁】VA限频器：相邻两次调整 ≥ min_update_interval_minutes；每日最多 max_updates_per_day 次；
-# 16) 🪜【已保留补丁】VA步长对齐：底仓调整数量为 grid_unit 的整数倍；
-# 17) ⚙️【已保留补丁】VA参数热加载：config/va.json（可选）；
-# 18) ⛔【新增补丁】停牌跳过挂单（可配置）：config/market.json（可选），连续竞价阶段断流超阈值则暂停**新挂单**但不撤现有单；
-# 19) 🏷️【版本规范】主.次.修 + 合入日期更新，补丁标签精简。
+# 7) 🛡️ 停牌仅影响展示（历史逻辑保留），但“连续竞价停牌跳过挂单”保护可选；
+# 8) 🔧 ✅ 实时价获取：get_snapshot(...) 的 last_px 更新 latest_data/last_valid_*；
+# 9) 🧪 ✅ 实时价心跳：窗口秒 got/miss；调试开关支持热加载；
+# 10) ⚙️ 棘轮：仅连续竞价且拿到有效实时价时启用；
+# 11) 🈶️ 中文名称展示（names.json 与 symbols.json.name）；
+# 12) 🧯 CSV 报表括号手误修复（保留）；
+# 13) 🔁 成交回报后一次性补挂（保留）；
+# 14) 📉 VA去抖动：|目标市值-当前底仓市值| ≥ k*(grid_unit*price)（保留）；
+# 15) ⏱️ VA限频器：最小间隔 + 每日次数上限（保留）；
+# 16) 🪜 VA步长对齐：按 grid_unit 整数倍（保留）；
+# 17) ⚙️ VA参数热加载：config/va.json（保留）；
+# 18) ⛔ 停牌跳过挂单：config/market.json（保留）；
+# 19) 🧩【新增】统一参数：config/strategy.json（新增）
+#     - 结构: {"debug": {...}, "va": {...}, "market": {...}}
+#     - **优先级最高**：存在则覆盖对应子配置；缺失项自动回退到旧文件
+#     - 首次加载与热加载时均按 “先旧文件、后 strategy.json 覆盖” 的顺序，保证 strategy.json 优先
+# 20) 🏷️ 版本规范：主.次.修 与日期已更新
 
 import json
 import logging
@@ -31,7 +35,7 @@ from types import SimpleNamespace
 # ---------------- 全局句柄与常量 ----------------
 LOG_FH = None
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'CHATGPT-3.2.2-20251016-HALT-GUARD-MKT-OFF1456+VA-THROTTLE+HALT-SKIPPLACE'
+__version__ = 'CHATGPT-3.2.3-20251016-HALT-GUARD-MKT-OFF1456+VA-THROTTLE+HALT-SKIPPLACE+STRATEGY-CONF'
 TRANSACTION_COST = 0.00005
 
 # ---- 调试默认（可被 config/debug.json 覆盖）----
@@ -236,7 +240,7 @@ def _load_va_config(context, force=False):
     context.va_cfg_mtime = mtime
     info('⚙️ VA配置生效: k={} minInterval={}m maxDaily={}', k, min_int, max_per_day)
 
-# ---------------- 市场参数：config/market.json（新增） ----------------
+# ---------------- 市场参数：config/market.json（保留） ----------------
 
 def _load_market_config(context, force=False):
     cfg_file = research_path('config', 'market.json')
@@ -273,6 +277,72 @@ def _load_market_config(context, force=False):
     context.market_cfg_mtime = mtime
     info('⚙️ 市场配置生效: haltSkip={} after={}s logEvery={}m',
          halt_skip, halt_after, halt_log_m)
+
+# ---------------- 统一参数：config/strategy.json（新增，优先级最高） ----------------
+def _load_strategy_config(context, force=False):
+    """
+    统一参数文件优先覆盖子配置：
+    - 若 strategy.json 存在，则其下的 debug/va/market 字段覆盖 context 中已有值
+    - 若缺失或字段不完整，保持现有值（即来自默认或旧分文件）
+    - 首次加载与热加载：建议“先加载旧分文件，再调用本函数进行覆盖”
+    """
+    strat_file = research_path('config', 'strategy.json')
+    try:
+        mtime = strat_file.stat().st_mtime if strat_file.exists() else None
+    except:
+        mtime = None
+
+    if (not force) and hasattr(context, 'strategy_cfg_mtime') and context.strategy_cfg_mtime == mtime:
+        return
+
+    if not strat_file.exists():
+        # 没有统一文件，静默返回（回退到旧分文件）
+        context.strategy_cfg_mtime = None
+        return
+
+    try:
+        j = json.loads(strat_file.read_text(encoding='utf-8')) or {}
+    except Exception as e:
+        info('⚠️ 读取统一配置 strategy.json 失败: {}（保留现有参数）', e)
+        return
+
+    # 覆盖 debug
+    dbg = j.get('debug') or {}
+    if isinstance(dbg, dict) and dbg:
+        if 'enable_debug_log' in dbg: context.enable_debug_log = bool(dbg['enable_debug_log'])
+        if 'rt_heartbeat_window_sec' in dbg:
+            try: context.rt_heartbeat_window_sec = max(5, int(dbg['rt_heartbeat_window_sec']))
+            except: pass
+        if 'rt_heartbeat_preview' in dbg:
+            try: context.rt_heartbeat_preview = max(1, int(dbg['rt_heartbeat_preview']))
+            except: pass
+
+    # 覆盖 va
+    va = j.get('va') or {}
+    if isinstance(va, dict) and va:
+        if 'value_threshold_k' in va:
+            try: context.va_value_threshold_k = max(0.0, float(va['value_threshold_k']))
+            except: pass
+        if 'min_update_interval_minutes' in va:
+            try: context.va_min_update_interval_minutes = max(0, int(va['min_update_interval_minutes']))
+            except: pass
+        if 'max_updates_per_day' in va:
+            try: context.va_max_updates_per_day = max(0, int(va['max_updates_per_day']))
+            except: pass
+
+    # 覆盖 market
+    mk = j.get('market') or {}
+    if isinstance(mk, dict) and mk:
+        if 'halt_skip_place' in mk: context.halt_skip_place = bool(mk['halt_skip_place'])
+        if 'halt_skip_after_seconds' in mk:
+            try: context.halt_skip_after_seconds = max(0, int(mk['halt_skip_after_seconds']))
+            except: pass
+        if 'halt_log_every_minutes' in mk:
+            try: context.halt_log_every_minutes = max(1, int(mk['halt_log_every_minutes']))
+            except: pass
+
+    context.strategy_cfg_mtime = mtime
+    info('🧩 统一参数生效：读取 strategy.json 并覆盖子配置')
 
 # ---------------- 初始化与时间窗口判断 ----------------
 
@@ -344,10 +414,11 @@ def initialize(context):
     context.boot_dt = getattr(context, 'current_dt', None) or datetime.now()
     context.boot_grace_seconds = int(get_saved_param('boot_grace_seconds', 180))
 
-    # 配置（首次加载）
+    # ⚙️ 参数首次加载：先子配置（默认/旧文件），再统一文件覆盖（优先）
     _load_debug_config(context, force=True)
     _load_va_config(context, force=True)
     _load_market_config(context, force=True)
+    _load_strategy_config(context, force=True)   # <- 覆盖
 
     # 绑定定时任务
     context.initial_cleanup_done = False
@@ -455,9 +526,11 @@ def place_auction_orders(context):
 # ---------------- 实时价：快照获取 + 心跳日志（支持热加载配置） ----------------
 
 def _fetch_quotes_via_snapshot(context):
+    # 热加载：先子配置（旧文件），再统一文件覆盖
     _load_debug_config(context, force=False)
     _load_va_config(context, force=False)
     _load_market_config(context, force=False)
+    _load_strategy_config(context, force=False)  # <- 覆盖
 
     symbols = list(getattr(context, 'symbol_list', []) or [])
     if not symbols:
@@ -535,7 +608,6 @@ def place_limit_orders(context, symbol, state):
         if getattr(context, 'halt_skip_place', MKT_HALT_SKIP_PLACE_DEFAULT):
             last_ts = context.last_valid_ts.get(symbol)
             halt_after = int(getattr(context, 'halt_skip_after_seconds', MKT_HALT_SKIP_AFTER_SECONDS_DEFAULT))
-            # mark_halted 在 handle_data 中由“阶段+断流”识别逻辑维护
             if context.mark_halted.get(symbol, False) and last_ts:
                 if (now_dt - last_ts).total_seconds() >= halt_after:
                     # 日志压频
