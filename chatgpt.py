@@ -1,5 +1,5 @@
 # event_driven_grid_strategy.py
-# 版本号：CHATGPT-3.2.1-20251014-HALT-GUARD-MKT-OFF1456-fix3f+cnames-hotfix-rehang+va-throttle
+# 版本号：CHATGPT-3.2.2-20251016-HALT-GUARD-MKT-OFF1456+VA-THROTTLE+HALT-SKIPPLACE
 # 变更点（在 HALT-GUARD 基础上的最小改动）：
 # 1) ❌ 不改市价单（仍然完全移除14:55市价触发）；
 # 2) ⏰ 限价挂单窗口至14:56（保持既有逻辑）；
@@ -7,25 +7,19 @@
 # 4) 📴 14:56后不再发起新挂单（保持既有逻辑）；
 # 5) 🪫 重启/竞价按 base_price 补挂网格；无实时价不阻断挂单（保持既有逻辑）；
 # 6) 🕒 启动宽限期 boot_grace（默认180秒，可配置参数保留）；
-# 7) 🛡️ 停牌仅影响展示，不拦截挂单（保持既有逻辑）；
+# 7) 🛡️ 停牌仅影响展示（历史逻辑保留），但新增“连续竞价停牌跳过挂单”可选保护；
 # 8) 🔧 ✅ 实时价获取：用 get_snapshot(...) 的 last_px 更新 latest_data/last_valid_*；
-# 9) 🧪 ✅ 实时价心跳：每“窗口秒”输出 got/miss；调试开关从【研究目录/config/debug.json】热加载：
-#       原始结构：
-#       {
-#         "enable_debug_log": true,
-#         "rt_heartbeat_window_sec": 65,
-#         "rt_heartbeat_preview": 8
-#       }
-#       *保持向后兼容*: 若出现旧版临时键（"debug_rt_log","rt_log_interval_seconds"），也会被识别，但优先使用上述“原始结构”。
+# 9) 🧪 ✅ 实时价心跳：每“窗口秒”输出 got/miss；调试开关从【研究目录/config/debug.json】热加载；
 # 10) ⚙️ 棘轮：仅在连续竞价且拿到有效实时价时启用；无价时仍按 base_price 挂单但不移动基准。
 # 11) 🈶️【已保留】日志与看板显示中文名称（来自 config/names.json 与 symbols.json 的 name 字段；仅影响展示，不改业务）
 # 12) 🧯【已保留】修正 update_daily_reports 中 t_quantity 一行的右括号手误（] -> )）
-# 13) 🔁【已保留补丁】成交回报后的一次性补挂：撤掉对手向单后，**仅当次补挂**绕过
-#     a) 60秒成交冷却、b) 30秒下单防抖、c) “基准价相近”防抖；补挂执行后立即回收豁免标记。
-# 14) 📉【新增补丁】VA“价值缺口阈值”去抖动：仅当 |目标市值-当前底仓市值| ≥ k*(grid_unit*price) 才调整底仓；
-# 15) ⏱️【新增补丁】VA“限频器”：相邻两次调整间隔 ≥ min_update_interval_minutes；每日最多 max_updates_per_day 次；
-# 16) 🪜【新增补丁】VA“步长对齐”：底仓调整数量为 grid_unit 的整数倍；
-# 17) ⚙️【新增补丁】VA参数热加载：可选读取 config/va.json（若不存在则走内置默认值），运行中热加载。
+# 13) 🔁【已保留补丁】成交回报后的一次性补挂：撤掉对手向单后，仅当次补挂绕过（成交冷却/下单防抖/基准接近）
+# 14) 📉【已保留补丁】VA去抖动：|目标市值-当前底仓市值| ≥ k*(grid_unit*price) 才调整底仓；
+# 15) ⏱️【已保留补丁】VA限频器：相邻两次调整 ≥ min_update_interval_minutes；每日最多 max_updates_per_day 次；
+# 16) 🪜【已保留补丁】VA步长对齐：底仓调整数量为 grid_unit 的整数倍；
+# 17) ⚙️【已保留补丁】VA参数热加载：config/va.json（可选）；
+# 18) ⛔【新增补丁】停牌跳过挂单（可配置）：config/market.json（可选），连续竞价阶段断流超阈值则暂停**新挂单**但不撤现有单；
+# 19) 🏷️【版本规范】主.次.修 + 合入日期更新，补丁标签精简。
 
 import json
 import logging
@@ -37,7 +31,7 @@ from types import SimpleNamespace
 # ---------------- 全局句柄与常量 ----------------
 LOG_FH = None
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'CHATGPT-3.2.1-20251014-HALT-GUARD-MKT-OFF1456-fix3f+cnames-hotfix-rehang+va-throttle'
+__version__ = 'CHATGPT-3.2.2-20251016-HALT-GUARD-MKT-OFF1456+VA-THROTTLE+HALT-SKIPPLACE'
 TRANSACTION_COST = 0.00005
 
 # ---- 调试默认（可被 config/debug.json 覆盖）----
@@ -49,6 +43,11 @@ DBG_RT_PREVIEW_DEFAULT = 8
 VA_VALUE_THRESHOLD_K_DEFAULT = 1.0          # 价值缺口门槛：k * (grid_unit * price)
 VA_MIN_UPDATE_INTERVAL_MIN_DEFAULT = 60     # 相邻两次底仓更新的最小间隔（分钟）
 VA_MAX_UPDATES_PER_DAY_DEFAULT = 3          # 每日底仓最多调整次数
+
+# ---- 停牌下单保护默认（可被 config/market.json 覆盖）----
+MKT_HALT_SKIP_PLACE_DEFAULT = True          # 停牌/长时间断流时暂停“新挂单”
+MKT_HALT_SKIP_AFTER_SECONDS_DEFAULT = 180   # 连续拿不到有效价的秒数阈值
+MKT_HALT_LOG_EVERY_MINUTES_DEFAULT = 10     # 停牌暂停状态下的重复日志压频（分钟）
 
 # ---------------- 通用路径与工具函数 ----------------
 
@@ -94,14 +93,9 @@ def convert_symbol_to_standard(full_symbol):
         return full_symbol.replace('.XSHG','.SS')
     return full_symbol
 
-# ---------------- 标的中文名：可选读取 + 显示辅助（新增，最小改动） ----------------
+# ---------------- 标的中文名（保持） ----------------
 
 def _load_symbol_names(context):
-    """
-    从两个地方读取中文名（有则用，无则忽略，不影响其它功能）：
-    1) 研究目录 config/names.json   -> 形如 {"513230.SS":"标普500", ...}
-    2) symbols.json 中每个标的可选字段 name -> 覆盖 names.json 的同名项
-    """
     name_map = {}
     try:
         names_file = research_path('config', 'names.json')
@@ -122,12 +116,6 @@ def _load_symbol_names(context):
     context.symbol_name_map = name_map
 
 def dsym(context, symbol, style='short'):
-    """
-    返回用于日志/看板展示的标的名：
-      style='short' -> "513230.SS 标普500"
-      style='long'  -> "标普500(513230.SS)"
-    若无中文名，仅返回代码本身。
-    """
     nm = (getattr(context, 'symbol_name_map', {}) or {}).get(symbol)
     if not nm:
         return symbol
@@ -162,20 +150,9 @@ def safe_save_state(symbol, state):
     except Exception as e:
         info('[{}] ⚠️ 状态保存失败: {}', symbol, e)
 
-# ---------------- 调试配置：从研究目录 config/debug.json 读取 + 热加载 ----------------
+# ---------------- 调试配置：config/debug.json ----------------
 
 def _load_debug_config(context, force=False):
-    """
-    读取/热加载 config/debug.json：
-    原始结构（优先）：
-      enable_debug_log: bool
-      rt_heartbeat_window_sec: int
-      rt_heartbeat_preview: int
-    兼容字段（次优先）：
-      debug_rt_log: bool
-      rt_log_interval_seconds: int   （兼容为窗口秒）
-      rt_log_preview: int            （若有人写错键名时也兜底）
-    """
     cfg_file = research_path('config', 'debug.json')
     try:
         mtime = cfg_file.stat().st_mtime if cfg_file.exists() else None
@@ -183,9 +160,8 @@ def _load_debug_config(context, force=False):
         mtime = None
 
     if not force and hasattr(context, 'debug_cfg_mtime') and context.debug_cfg_mtime == mtime:
-        return  # 无变化不重读
+        return
 
-    # 默认值
     enable = DBG_ENABLE_DEFAULT
     winsec = DBG_RT_WINDOW_SEC_DEFAULT
     preview = DBG_RT_PREVIEW_DEFAULT
@@ -194,7 +170,6 @@ def _load_debug_config(context, force=False):
         if cfg_file.exists():
             j = json.loads(cfg_file.read_text(encoding='utf-8'))
             if isinstance(j, dict):
-                # 优先原始结构
                 if 'enable_debug_log' in j: enable = bool(j['enable_debug_log'])
                 if 'rt_heartbeat_window_sec' in j:
                     try: winsec = max(5, int(j['rt_heartbeat_window_sec']))
@@ -202,10 +177,7 @@ def _load_debug_config(context, force=False):
                 if 'rt_heartbeat_preview' in j:
                     try: preview = max(1, int(j['rt_heartbeat_preview']))
                     except: pass
-
-                # 兼容老临时键（仅在原始结构缺失时生效）
-                if 'enable_debug_log' not in j and 'debug_rt_log' in j:
-                    enable = bool(j['debug_rt_log'])
+                if 'enable_debug_log' not in j and 'debug_rt_log' in j: enable = bool(j['debug_rt_log'])
                 if 'rt_heartbeat_window_sec' not in j and 'rt_log_interval_seconds' in j:
                     try: winsec = max(5, int(j['rt_log_interval_seconds']))
                     except: pass
@@ -220,24 +192,15 @@ def _load_debug_config(context, force=False):
     context.rt_heartbeat_window_sec = winsec
     context.rt_heartbeat_preview = preview
     context.debug_cfg_mtime = mtime
-    # 首次加载或配置变化时，允许立即打一条心跳
     context.last_rt_log_ts = None
     if enable:
         info('🧪 调试配置生效: enable={} window={}s preview={}', enable, winsec, preview)
     else:
         info('🧪 调试配置生效: enable=False（关闭心跳日志）')
 
-# ---------------- VA 参数：从研究目录 config/va.json 读取 + 热加载（新增） ----------------
+# ---------------- VA 参数：config/va.json ----------------
 
 def _load_va_config(context, force=False):
-    """
-    可选文件：config/va.json
-    {
-      "value_threshold_k": 1.0,
-      "min_update_interval_minutes": 60,
-      "max_updates_per_day": 3
-    }
-    """
     cfg_file = research_path('config', 'va.json')
     try:
         mtime = cfg_file.stat().st_mtime if cfg_file.exists() else None
@@ -273,6 +236,44 @@ def _load_va_config(context, force=False):
     context.va_cfg_mtime = mtime
     info('⚙️ VA配置生效: k={} minInterval={}m maxDaily={}', k, min_int, max_per_day)
 
+# ---------------- 市场参数：config/market.json（新增） ----------------
+
+def _load_market_config(context, force=False):
+    cfg_file = research_path('config', 'market.json')
+    try:
+        mtime = cfg_file.stat().st_mtime if cfg_file.exists() else None
+    except:
+        mtime = None
+
+    if (not force) and hasattr(context, 'market_cfg_mtime') and context.market_cfg_mtime == mtime:
+        return
+
+    halt_skip = MKT_HALT_SKIP_PLACE_DEFAULT
+    halt_after = MKT_HALT_SKIP_AFTER_SECONDS_DEFAULT
+    halt_log_m = MKT_HALT_LOG_EVERY_MINUTES_DEFAULT
+    try:
+        if cfg_file.exists():
+            j = json.loads(cfg_file.read_text(encoding='utf-8'))
+            if isinstance(j, dict):
+                if 'halt_skip_place' in j:
+                    halt_skip = bool(j['halt_skip_place'])
+                if 'halt_skip_after_seconds' in j:
+                    try: halt_after = max(0, int(j['halt_skip_after_seconds']))
+                    except: pass
+                if 'halt_log_every_minutes' in j:
+                    try: halt_log_m = max(1, int(j['halt_log_every_minutes']))
+                    except: pass
+    except Exception as e:
+        info('⚠️ 读取 market 配置失败: {}（采用默认 skip={} after={}s logEvery={}m）',
+             e, halt_skip, halt_after, halt_log_m)
+
+    context.halt_skip_place = halt_skip
+    context.halt_skip_after_seconds = halt_after
+    context.halt_log_every_minutes = halt_log_m
+    context.market_cfg_mtime = mtime
+    info('⚙️ 市场配置生效: haltSkip={} after={}s logEvery={}m',
+         halt_skip, halt_after, halt_log_m)
+
 # ---------------- 初始化与时间窗口判断 ----------------
 
 def initialize(context):
@@ -301,12 +302,11 @@ def initialize(context):
 
     # 容器
     context.symbol_list = list(context.symbol_config.keys())
-    # 新增：加载中文名映射
     _load_symbol_names(context)
 
     context.state = {}
     context.latest_data = {}
-    context.should_place_order_map = {}   # 占位（不用于市价触发）
+    context.should_place_order_map = {}
     context.mark_halted = {}
     context.last_valid_price = {}
     context.last_valid_ts = {sym: None for sym in context.symbol_list}
@@ -327,10 +327,12 @@ def initialize(context):
             'buy_grid_spacing': 0.005,
             'sell_grid_spacing': 0.005,
             'max_position': saved.get('max_position', saved.get('base_position', cfg['initial_base_position']) + saved.get('grid_unit', cfg['grid_unit']) * 20),
-            # —— VA 限频状态（新增）——
+            # —— VA 限频状态 —— 
             'va_last_update_dt': None,
             'va_update_count_date': None,
-            'va_updates_today': 0
+            'va_updates_today': 0,
+            # —— 停牌日志压频（每标的）——
+            '_halt_next_log_dt': None
         })
         context.state[sym] = st
         context.latest_data[sym] = st['base_price']
@@ -342,9 +344,10 @@ def initialize(context):
     context.boot_dt = getattr(context, 'current_dt', None) or datetime.now()
     context.boot_grace_seconds = int(get_saved_param('boot_grace_seconds', 180))
 
-    # 调试 & VA 配置（首次加载）
+    # 配置（首次加载）
     _load_debug_config(context, force=True)
     _load_va_config(context, force=True)
+    _load_market_config(context, force=True)
 
     # 绑定定时任务
     context.initial_cleanup_done = False
@@ -452,13 +455,9 @@ def place_auction_orders(context):
 # ---------------- 实时价：快照获取 + 心跳日志（支持热加载配置） ----------------
 
 def _fetch_quotes_via_snapshot(context):
-    """
-    用 PTRADE get_snapshot 拉取快照（字段 last_px ）更新价格缓存。
-    并按 config/debug.json 中的开关/窗口打印心跳 got/miss。
-    同时在调用前做 debug 配置热加载（mtime 变更即生效）。
-    """
     _load_debug_config(context, force=False)
-    _load_va_config(context, force=False)  # 🆕 同步热加载 VA 参数
+    _load_va_config(context, force=False)
+    _load_market_config(context, force=False)
 
     symbols = list(getattr(context, 'symbol_list', []) or [])
     if not symbols:
@@ -512,9 +511,10 @@ def _fetch_quotes_via_snapshot(context):
 
 def place_limit_orders(context, symbol, state):
     """
-    限价挂单主函数（含“棘轮”与节流）。
+    限价挂单主函数（含“棘轮”与节流 + 停牌挂单保护）。
     - 集合竞价/启动宽限期：允许“无价”按 base_price 挂单，不启用棘轮；
     - 连续竞价阶段：仅当拿到有效实时价才启用棘轮；无价也允许按 base_price 挂单。
+    - 停牌/断流保护（可配置）：连续竞价且断流超过阈值 -> 暂停**新挂单**（不撤已有单）。
     """
     now_dt = context.current_dt
 
@@ -529,6 +529,22 @@ def place_limit_orders(context, symbol, state):
     in_limit_window = is_auction_time() or (is_main_trading_time() and now_dt.time() < time(14, 56))
     if not in_limit_window:
         return
+
+    # —— 停牌/断流保护：仅在“连续竞价阶段”启用 —— #
+    if is_main_trading_time() and not is_auction_time():
+        if getattr(context, 'halt_skip_place', MKT_HALT_SKIP_PLACE_DEFAULT):
+            last_ts = context.last_valid_ts.get(symbol)
+            halt_after = int(getattr(context, 'halt_skip_after_seconds', MKT_HALT_SKIP_AFTER_SECONDS_DEFAULT))
+            # mark_halted 在 handle_data 中由“阶段+断流”识别逻辑维护
+            if context.mark_halted.get(symbol, False) and last_ts:
+                if (now_dt - last_ts).total_seconds() >= halt_after:
+                    # 日志压频
+                    next_log = state.get('_halt_next_log_dt')
+                    if (not next_log) or now_dt >= next_log:
+                        info('[{}] ⛔ 停牌/断流超过{}s：暂停新挂单（保留已挂单，不撤）。', dsym(context, symbol), halt_after)
+                        state['_halt_next_log_dt'] = now_dt + timedelta(minutes=int(getattr(context, 'halt_log_every_minutes', MKT_HALT_LOG_EVERY_MINUTES_DEFAULT)))
+                        safe_save_state(symbol, state)
+                    return
 
     # 是否处于“允许无价挂单”的阶段
     boot_grace = (now_dt - getattr(context, 'boot_dt', now_dt)).total_seconds() < getattr(context, 'boot_grace_seconds', 180)
@@ -592,7 +608,6 @@ def place_limit_orders(context, symbol, state):
     except Exception as e:
         info('[{}] ⚠️ 限价挂单异常：{}', dsym(context, symbol), e)
     finally:
-        # 若本次是“成交后的当次补挂”，到此为止豁免已用一次，立即回收标记
         state.pop('_rehang_bypass_once', None)
         safe_save_state(symbol, state)
 
@@ -636,18 +651,15 @@ def on_order_filled(context, symbol, order):
     state['_pos_change'] = order.amount
     cancel_all_orders_by_symbol(context, symbol)
 
-    # 成交视为有效价
     context.mark_halted[symbol] = False
     context.last_valid_price[symbol] = order.price
     context.latest_data[symbol] = order.price
     context.last_valid_ts[symbol] = context.current_dt
 
-    # ✅【仅当次补挂豁免】：确保撤掉对手向单后能立即补挂一轮
-    state['_rehang_bypass_once'] = True        # 开一次性绕过冷却
-    state.pop('_last_order_ts', None)           # 解除30秒下单防抖
-    state.pop('_last_order_bp', None)           # 解除“基准价相近”防抖
+    state['_rehang_bypass_once'] = True
+    state.pop('_last_order_ts', None)
+    state.pop('_last_order_bp', None)
 
-    # 仅在 9:25-9:30 冻结期外、且 <14:56 才补挂
     if is_order_blocking_period():
         info('[{}] 处于9:25-9:30挂单冻结期，成交后仅更新状态，推迟挂单至9:30后。', dsym(context, symbol))
     elif context.current_dt.time() < time(14, 56):
@@ -662,7 +674,6 @@ def handle_data(context, data):
     now_dt = context.current_dt
     now = now_dt.time()
 
-    # ✅ 主动拉取快照，更新 latest_data/last_valid_* 与心跳日志（含调试/VA配置热加载）
     _fetch_quotes_via_snapshot(context)
 
     # 每5分钟：热重载 + 看板
@@ -670,7 +681,7 @@ def handle_data(context, data):
         reload_config_if_changed(context)
         generate_html_report(context)
 
-    # ---------- 启动宽限期后才做“阶段+断流”停牌识别（仅影响展示，不拦单） ----------
+    # ---------- 启动宽限期后才做“阶段+断流”停牌识别（仅影响展示；与停牌挂单保护配合） ----------
     boot_grace = (now_dt - getattr(context, 'boot_dt', now_dt)).total_seconds() < getattr(context, 'boot_grace_seconds', 180)
     if not boot_grace:
         def _phase_start(now_t: time):
@@ -693,7 +704,7 @@ def handle_data(context, data):
                 else:
                     context.mark_halted[sym] = ((now_dt - last_ts).total_seconds() > grace_seconds)
 
-    # ---------- 动态底仓与间距（价有效时才做，保持既有逻辑） ----------
+    # ---------- 动态底仓与间距（价有效时才做） ----------
     for sym in context.symbol_list:
         if sym not in context.state:
             continue
@@ -705,7 +716,7 @@ def handle_data(context, data):
             if now_dt.minute % 30 == 0 and now_dt.second < 5:
                 update_grid_spacing_final(context, sym, st, get_position(sym).amount)
 
-    # ---------- 限价下单窗口：集合竞价 或 主盘且 < 14:56 ----------
+    # ---------- 限价下单窗口 ----------
     if is_auction_time() or (is_main_trading_time() and now < time(14, 56)):
         for sym in context.symbol_list:
             if sym in context.state:
@@ -776,9 +787,8 @@ def calculate_atr(context, symbol, atr_period=14):
 # ---------------- 日终动作（14:56） ----------------
 
 def end_of_day(context):
-    """14:56 统一撤单 + 看板 + 状态保存（不再触发任何市价单）"""
     info('✅ 日终处理开始(14:56)...')
-    after_initialize_cleanup(context)   # 这里会对所有标的执行撤单
+    after_initialize_cleanup(context)
     generate_html_report(context)
     for sym in context.symbol_list:
         if sym in context.state:
@@ -789,74 +799,51 @@ def end_of_day(context):
 # ---------------- 价值平均（VA） ----------------
 
 def get_target_base_position(context, symbol, state, price, dt):
-    """
-    【改造点】
-    - 引入基于“价值缺口”的阈值：|target_val - base_position*price| ≥ k*(grid_unit*price) 才调整；
-    - 限频：相邻两次调整 ≥ va_min_update_interval_minutes；每日最多 va_max_updates_per_day 次；
-    - 步长对齐：调整数量为 grid_unit 的整数倍；
-    - 日切：每日计数在自然日切换时清零；
-    - 保持原有最小底仓 min_base 约束与 max_position = base + 20*grid_unit。
-    """
     if not is_valid_price(price):
         info('[{}] ⚠️ 停牌/无有效价，跳过VA计算，底仓维持 {}', dsym(context, symbol), state['base_position'])
         return state['base_position']
 
-    # —— 计算目标价值曲线 —— #
     weeks = get_trade_weeks(context, symbol, state, dt)
     target_val = state['initial_position_value'] + sum(state['dingtou_base'] * (1 + state['dingtou_rate'])**w for w in range(1, weeks + 1))
     if price <= 0:
         return state['base_position']
 
-    # —— 每日计数：自然日切换则重置 —— #
+    # 每日计数：自然日切换则重置
     today = dt.date()
     if state.get('va_update_count_date') != today:
         state['va_update_count_date'] = today
         state['va_updates_today'] = 0
 
-    # —— 阈值与限频参数 —— #
+    # 阈值与限频参数
     k = float(getattr(context, 'va_value_threshold_k', VA_VALUE_THRESHOLD_K_DEFAULT))
     min_int_min = int(getattr(context, 'va_min_update_interval_minutes', VA_MIN_UPDATE_INTERVAL_MIN_DEFAULT))
     max_daily = int(getattr(context, 'va_max_updates_per_day', VA_MAX_UPDATES_PER_DAY_DEFAULT))
 
-    # —— 价值缺口与网格价值 —— #
     current_val = state['base_position'] * price
     delta_val = target_val - current_val
     grid_value = state['grid_unit'] * price
 
-    # —— 阈值判定：缺口不达阈值 -> 不调整 —— #
     if abs(delta_val) < k * grid_value:
-        # 静默跳过，避免日志噪音
         return state['base_position']
 
-    # —— 限频判定：与上次调整的间隔 —— #
     last_dt = state.get('va_last_update_dt')
-    if last_dt is not None:
-        if (dt - last_dt).total_seconds() < min_int_min * 60:
-            return state['base_position']
-
-    # —— 每日次数上限 —— #
+    if last_dt is not None and (dt - last_dt).total_seconds() < min_int_min * 60:
+        return state['base_position']
     if state.get('va_updates_today', 0) >= max_daily:
         return state['base_position']
 
-    # —— 计算应调整的“份额步长” = grid_unit 的整数倍 —— #
-    # 目标份额差（以股计）≈ delta_val / price
     desired_shares = delta_val / price
-    # 取整到 grid_unit 的整数倍（至少为 1 个步长）
     step = state['grid_unit']
     steps = int(round(desired_shares / step))
     if steps == 0:
-        # 达阈值但四舍五入后为 0，强制按 1 个步长以避免长期卡在阈值边缘
         steps = 1 if desired_shares > 0 else -1
     adj_shares = steps * step
 
-    # —— 最小底仓约束 —— #
     min_base = round(state['initial_position_value'] / state['base_price'] / 100) * 100 if state['base_price'] > 0 else 0
     new_base_pos = max(min_base, state['base_position'] + adj_shares)
-
     if new_base_pos == state['base_position']:
         return state['base_position']
 
-    # —— 应用调整 —— #
     info('[{}] 价值平均(阈值/限频): 目标底仓从 {} 调整至 {} (Δ{}股, 单位:{}). 目标市值:{:.2f}, 当前市值:{:.2f}, 缺口:{:.2f}',
          dsym(context, symbol),
          state['base_position'], new_base_pos, (new_base_pos - state['base_position']),
@@ -932,10 +919,10 @@ def reload_config_if_changed(context):
                 'initial_position_value': cfg['initial_base_position'] * cfg['base_price'],
                 'buy_grid_spacing': 0.005, 'sell_grid_spacing': 0.005,
                 'max_position': cfg['initial_base_position'] + cfg['grid_unit'] * 20,
-                # VA 限频字段补齐
                 'va_last_update_dt': None,
                 'va_update_count_date': None,
-                'va_updates_today': 0
+                'va_updates_today': 0,
+                '_halt_next_log_dt': None
             })
             context.state[sym] = st
             context.latest_data[sym] = st['base_price']
@@ -955,7 +942,7 @@ def reload_config_if_changed(context):
                     'max_position': state['base_position'] + new_params['grid_unit'] * 20
                 })
         context.symbol_config = new_config
-        _load_symbol_names(context)  # 热更新中文名
+        _load_symbol_names(context)
         info('✅ 配置文件热重载完成！当前监控标的: {}', context.symbol_list)
     except Exception as e:
         info(f'❌ 配置文件热重载失败: {e}')
@@ -999,7 +986,6 @@ def update_daily_reports(context, data):
         added_base      = state['base_position'] - state.get('last_week_position', 0)
         compare_cost    = added_base * close_price
         profit_all      = (close_price - cost_basis) * amount if cost_basis > 0 else 0
-        # 🔧 Hotfix: 右括号修正
         t_quantity = max(0, amount - state['base_position'])
         row = [
             current_date, f"{close_price:.3f}", str(weeks), str(count),
