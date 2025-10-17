@@ -1,6 +1,7 @@
+
 # event_driven_grid_strategy.py
-# 版本号：CHATGPT-3.2.3-20251016-HALT-GUARD-MKT-OFF1456+VA-THROTTLE+HALT-SKIPPLACE+STRATEGY-CONF
-# 变更点（在 3.2.2 基础上的最小改动）：
+# 版本号：CHATGPT-3.2.3-20251016-HALT-GUARD-MKT-OFF1456+VA-THROTTLE+HALT-SKIPPLACE+STRATEGY-CONF+DIAG-LOGR01
+# 变更点（在 3.2.2 基础上的最小改动）且仅新增日志：
 # 1) ❌ 不改市价单（仍然完全移除14:55市价触发）；
 # 2) ⏰ 限价挂单窗口至14:56（保持既有逻辑）；
 # 3) 🧹 日终统一撤单14:56（保持既有逻辑）；
@@ -23,7 +24,8 @@
 #     - 结构: {"debug": {...}, "va": {...}, "market": {...}}
 #     - **优先级最高**：存在则覆盖对应子配置；缺失项自动回退到旧文件
 #     - 首次加载与热加载时均按 “先旧文件、后 strategy.json 覆盖” 的顺序，保证 strategy.json 优先
-# 20) 🏷️ 版本规范：主.次.修 与日期已更新
+# 20)不改任何功能逻辑，只在关键分支添加诊断日志，定位“成交后只挂一边”的原因。
+# - 诊断点覆盖：成交冷却、时间窗口、停牌保护、节流、同价在途、持仓/可卖/底仓门槛、撤单后快照、心跳与last_valid_ts间隔等。
 
 import json
 import logging
@@ -35,7 +37,7 @@ from types import SimpleNamespace
 # ---------------- 全局句柄与常量 ----------------
 LOG_FH = None
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'CHATGPT-3.2.3-20251016-HALT-GUARD-MKT-OFF1456+VA-THROTTLE+HALT-SKIPPLACE+STRATEGY-CONF'
+__version__ = 'CHATGPT-3.2.3-20251016-HALT-GUARD-MKT-OFF1456+VA-THROTTLE+HALT-SKIPPLACE+STRATEGY-CONF+DIAG-LOGR01'
 TRANSACTION_COST = 0.00005
 
 # ---- 调试默认（可被 config/debug.json 覆盖）----
@@ -505,7 +507,7 @@ def cancel_all_orders_by_symbol(context, symbol):
         except Exception as e:
             info('[{}] ⚠️ 撤单异常 entrust_no={}: {}', dsym(context, symbol), entrust_no, e)
     if total > 0:
-        info('[{}] 共{}笔遗留挂单尝试撤销完毕', dsym(context, symbol), total)
+        info('[{}] 共{}笔遗留挂单尝试撤销完毕（将于下一次 get_open_orders 快照核验）', dsym(context, symbol), total)
 
 # ---------------- 集合竞价挂单 ----------------
 
@@ -579,6 +581,14 @@ def _fetch_quotes_via_snapshot(context):
             miss_preview = ','.join(miss_list[:preview_n]) + ('...' if len(miss_list) > preview_n else '')
             info('🧪 RT心跳 {} got:{}/{} miss:[{}]',
                  now_dt.strftime('%H:%M'), got, len(symbols), miss_preview)
+            # 附加：打印各标的 last_valid_ts 与当前时间的gap，帮助定位HALT_GUARD
+            try:
+                for ksym in symbols:
+                    lts = context.last_valid_ts.get(ksym)
+                    gap = (now_dt - lts).total_seconds() if lts else -1
+                    info('[{}] ⏱️ last_valid_ts={} gap_sec={:.1f}', dsym(context, ksym), lts, gap)
+            except Exception:
+                pass
 
 # ---------------- 网格限价挂单主逻辑 ----------------
 
@@ -590,17 +600,24 @@ def place_limit_orders(context, symbol, state):
     - 停牌/断流保护（可配置）：连续竞价且断流超过阈值 -> 暂停**新挂单**（不撤已有单）。
     """
     now_dt = context.current_dt
+    dbg_tag = f"[{dsym(context, symbol)}]"
 
     # ✅ 成交后冷却：允许“仅当次补挂”绕过；之后自动恢复
     rehang_bypass = bool(state.get('_rehang_bypass_once'))
     if (not rehang_bypass) and state.get('_last_trade_ts') \
        and (now_dt - state['_last_trade_ts']).total_seconds() < 60:
+        info('{} ❎ PLACE-SKIP REASON=COOLDOWN last_trade_ts={} secs_since={:.1f}',
+             dbg_tag,
+             state.get('_last_trade_ts'),
+             (now_dt - state.get('_last_trade_ts')).total_seconds() if state.get('_last_trade_ts') else -1)
         return
 
     if is_order_blocking_period():
+        info('{} ❎ PLACE-SKIP REASON=BLOCKING_PERIOD(9:25-9:30)', dbg_tag)
         return
     in_limit_window = is_auction_time() or (is_main_trading_time() and now_dt.time() < time(14, 56))
     if not in_limit_window:
+        info('{} ❎ PLACE-SKIP REASON=OUT_OF_LIMIT_WINDOW now={}', dbg_tag, now_dt.time())
         return
 
     # —— 停牌/断流保护：仅在“连续竞价阶段”启用 —— #
@@ -610,7 +627,9 @@ def place_limit_orders(context, symbol, state):
             halt_after = int(getattr(context, 'halt_skip_after_seconds', MKT_HALT_SKIP_AFTER_SECONDS_DEFAULT))
             if context.mark_halted.get(symbol, False) and last_ts:
                 if (now_dt - last_ts).total_seconds() >= halt_after:
-                    # 日志压频
+                    info('{} ❎ PLACE-SKIP REASON=HALT_GUARD last_valid_ts={} gap_sec={:.1f} threshold={}s',
+                         dbg_tag, last_ts, (now_dt - last_ts).total_seconds(), halt_after)
+                    # 日志压频（原逻辑保留）
                     next_log = state.get('_halt_next_log_dt')
                     if (not next_log) or now_dt >= next_log:
                         info('[{}] ⛔ 停牌/断流超过{}s：暂停新挂单（保留已挂单，不撤）。', dsym(context, symbol), halt_after)
@@ -632,6 +651,9 @@ def place_limit_orders(context, symbol, state):
     # 棘轮启用条件：连续竞价且拿到有效价
     price = context.latest_data.get(symbol)
     ratchet_enabled = (not allow_tickless) and is_valid_price(price)
+
+    info('{} ▶ PLACE-CHECK ctx: allow_tickless={} boot_grace={} price={} base={} buy_sp={:.4f} sell_sp={:.4f} ratchet={}',
+         dbg_tag, allow_tickless, boot_grace, price, base, buy_sp, sell_sp, ratchet_enabled)
 
     if ratchet_enabled:
         if abs(price / base - 1) <= 0.10:  # 偏离保护仍保留
@@ -655,27 +677,54 @@ def place_limit_orders(context, symbol, state):
     # 常规节流（不依赖是否有价）
     last_ts = state.get('_last_order_ts')
     if last_ts and (now_dt - last_ts).seconds < 30:
+        info('{} ❎ PLACE-SKIP REASON=THROTTLE_TIME last_order_ts={} secs_since={}', dbg_tag, last_ts, (now_dt - last_ts).seconds)
         return
     last_bp = state.get('_last_order_bp')
     if last_bp and abs(base / last_bp - 1) < buy_sp / 2:
+        info('{} ❎ PLACE-SKIP REASON=THROTTLE_BASE_BP last_bp={} base={} Δ%={:.4f} thres={:.4f}',
+             dbg_tag, last_bp, base, abs(base/last_bp - 1), buy_sp/2)
         return
     state['_last_order_ts'], state['_last_order_bp'] = now_dt, base
 
     # 执行挂单
     try:
         open_orders = [o for o in get_open_orders(symbol) or [] if o.status == '2']
+        same_buy  = any(o.amount > 0 and abs(o.price - buy_p)  < 1e-3 for o in open_orders)
+        same_sell = any(o.amount < 0 and abs(o.price - sell_p) < 1e-3 for o in open_orders)
+        pend_buy  = sum(o.amount for o in open_orders if o.amount > 0)
+        pend_sell = sum(-o.amount for o in open_orders if o.amount < 0)
+
         enable_amount = position.enable_amount
         state.pop('_pos_change', None)
+        info('{} ▶ STATE pos={} enable={} base_pos={} unit={} max_pos={} open_orders={} pend_buy={} pend_sell={} same_buy={} same_sell={}',
+             dbg_tag, position.amount, enable_amount, state['base_position'], unit, state['max_position'],
+             len(open_orders), pend_buy, pend_sell, same_buy, same_sell)
 
-        can_buy = not any(o.amount > 0 and abs(o.price - buy_p) < 1e-3 for o in open_orders)
+        can_buy = not same_buy
         if can_buy and pos + unit <= state['max_position']:
             info('[{}] --> 发起买入委托: {}股 @ {:.3f}', dsym(context, symbol), unit, buy_p)
             order(symbol, unit, limit_price=buy_p)
+        else:
+            if not can_buy:
+                info('{} ❎ BUY-SKIP REASON=DUP_SAME_PRICE buy_p={:.3f}', dbg_tag, buy_p)
+            elif pos + unit > state['max_position']:
+                info('{} ❎ BUY-SKIP REASON=POS_CAP pos={} unit={} max_pos={}', dbg_tag, pos, unit, state['max_position'])
 
-        can_sell = not any(o.amount < 0 and abs(o.price - sell_p) < 1e-3 for o in open_orders)
+        can_sell = not same_sell
         if can_sell and enable_amount >= unit and pos - unit >= state['base_position']:
             info('[{}] --> 发起卖出委托: {}股 @ {:.3f}', dsym(context, symbol), unit, sell_p)
             order(symbol, -unit, limit_price=sell_p)
+        else:
+            # 逐项给出原因
+            reasons = []
+            if not can_sell:
+                reasons.append('DUP_SAME_PRICE')
+            if enable_amount < unit:
+                reasons.append(f'ENABLE_LT_UNIT enable={enable_amount} unit={unit}')
+            if pos - unit < state['base_position']:
+                reasons.append(f'BASE_GUARD pos={pos} base={state["base_position"]} unit={unit}')
+            if reasons:
+                info('{} ❎ SELL-SKIP REASONS={}', dbg_tag, ';'.join(reasons))
 
     except Exception as e:
         info('[{}] ⚠️ 限价挂单异常：{}', dsym(context, symbol), e)
@@ -722,6 +771,14 @@ def on_order_filled(context, symbol, order):
     state['base_price'] = order.price
     state['_pos_change'] = order.amount
     cancel_all_orders_by_symbol(context, symbol)
+    # 撤单后快照
+    try:
+        _oo = [o for o in (get_open_orders(symbol) or []) if o.status == '2']
+        pend_buy  = sum(o.amount for o in _oo if o.amount > 0)
+        pend_sell = sum(-o.amount for o in _oo if o.amount < 0)
+        info('[{}] 📥 AFTER-CANCEL open_orders={} pend_buy={} pend_sell={}', dsym(context, symbol), len(_oo), pend_buy, pend_sell)
+    except Exception as _e:
+        info('[{}] ⚠️ AFTER-CANCEL snapshot error: {}', dsym(context, symbol), _e)
 
     context.mark_halted[symbol] = False
     context.last_valid_price[symbol] = order.price
@@ -735,6 +792,7 @@ def on_order_filled(context, symbol, order):
     if is_order_blocking_period():
         info('[{}] 处于9:25-9:30挂单冻结期，成交后仅更新状态，推迟挂单至9:30后。', dsym(context, symbol))
     elif context.current_dt.time() < time(14, 56):
+        info('[{}] ▶ FILL->REHANG base_price={:.3f} rehang_bypass_once={} now={}', dsym(context, symbol), state['base_price'], state.get('_rehang_bypass_once'), context.current_dt.time())
         place_limit_orders(context, symbol, state)
 
     context.should_place_order_map[symbol] = True
@@ -1227,7 +1285,11 @@ def generate_html_report(context):
     """
     table_rows = ""
     for m in all_metrics:
-        pnl_class = "positive" if float(m["unrealized_pnl"].replace(",", "")) >= 0 else "negative"
+        try:
+            pnl_val = float(m["unrealized_pnl"].replace(",", ""))
+        except Exception:
+            pnl_val = 0.0
+        pnl_class = "positive" if pnl_val >= 0 else "negative"
         table_rows += f"""
         <tr>
             <td>{m['symbol_disp']}</td>
@@ -1255,3 +1317,4 @@ def generate_html_report(context):
         report_path.write_text(final_html, encoding='utf-8')
     except Exception as e:
         info(f'❌ 生成HTML看板失败: {e}')
+
