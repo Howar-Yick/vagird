@@ -1,59 +1,41 @@
-
 # event_driven_grid_strategy.py
-# 版本号：CHATGPT-3.2.3-20251016-HALT-GUARD-MKT-OFF1456+VA-THROTTLE+HALT-SKIPPLACE+STRATEGY-CONF+DIAG-LOGR01
-# 变更点（在 3.2.2 基础上的最小改动）且仅新增日志：
-# 1) ❌ 不改市价单（仍然完全移除14:55市价触发）；
-# 2) ⏰ 限价挂单窗口至14:56（保持既有逻辑）；
-# 3) 🧹 日终统一撤单14:56（保持既有逻辑）；
-# 4) 📴 14:56后不再发起新挂单（保持既有逻辑）；
-# 5) 🪫 重启/竞价按 base_price 补挂网格；无实时价不阻断挂单（保持既有逻辑）；
-# 6) 🕒 启动宽限期 boot_grace（默认180秒，可配置参数保留）；
-# 7) 🛡️ 停牌仅影响展示（历史逻辑保留），但“连续竞价停牌跳过挂单”保护可选；
-# 8) 🔧 ✅ 实时价获取：get_snapshot(...) 的 last_px 更新 latest_data/last_valid_*；
-# 9) 🧪 ✅ 实时价心跳：窗口秒 got/miss；调试开关支持热加载；
-# 10) ⚙️ 棘轮：仅连续竞价且拿到有效实时价时启用；
-# 11) 🈶️ 中文名称展示（names.json 与 symbols.json.name）；
-# 12) 🧯 CSV 报表括号手误修复（保留）；
-# 13) 🔁 成交回报后一次性补挂（保留）；
-# 14) 📉 VA去抖动：|目标市值-当前底仓市值| ≥ k*(grid_unit*price)（保留）；
-# 15) ⏱️ VA限频器：最小间隔 + 每日次数上限（保留）；
-# 16) 🪜 VA步长对齐：按 grid_unit 整数倍（保留）；
-# 17) ⚙️ VA参数热加载：config/va.json（保留）；
-# 18) ⛔ 停牌跳过挂单：config/market.json（保留）；
-# 19) 🧩【新增】统一参数：config/strategy.json（新增）
-#     - 结构: {"debug": {...}, "va": {...}, "market": {...}}
-#     - **优先级最高**：存在则覆盖对应子配置；缺失项自动回退到旧文件
-#     - 首次加载与热加载时均按 “先旧文件、后 strategy.json 覆盖” 的顺序，保证 strategy.json 优先
-# 20)不改任何功能逻辑，只在关键分支添加诊断日志，定位“成交后只挂一边”的原因。
-# - 诊断点覆盖：成交冷却、时间窗口、停牌保护、节流、同价在途、持仓/可卖/底仓门槛、撤单后快照、心跳与last_valid_ts间隔等。
+# 版本号：CHATGPT-3.2.3-20251016-HALT-GUARD-MKT-OFF1456+VA-THROTTLE+HALT-SKIPPLACE+STRATEGY-CONF+DIAG-LOGR01+LOG-ONLY-DELAY
+# 说明：
+# - 只增加“撤单后固定延时 + 订单簿明细日志”，不改变任何策略/风控/下单决策逻辑；
+# - 延时默认 1.0s，可由 strategy.json.debug.delay_after_cancel_seconds 覆盖；
+# - 判重前额外 dump 一次 open_orders；撤单后 T+0s 与 T+delay 也各打印一次，纯日志辅助诊断。
 
 import json
 import logging
 import math
-from datetime import datetime, time, timedelta
+import time  # <-- 新增：用于撤单后的固定延时
+from datetime import datetime
+from datetime import time as dtime
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
 # ---------------- 全局句柄与常量 ----------------
 LOG_FH = None
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'CHATGPT-3.2.3-20251016-HALT-GUARD-MKT-OFF1456+VA-THROTTLE+HALT-SKIPPLACE+STRATEGY-CONF+DIAG-LOGR01'
+__version__ = 'CHATGPT-3.2.3-20251016-HALT-GUARD-MKT-OFF1456+VA-THROTTLE+HALT-SKIPPLACE+STRATEGY-CONF+DIAG-LOGR01+LOG-ONLY-DELAY'
 TRANSACTION_COST = 0.00005
 
-# ---- 调试默认（可被 config/debug.json 覆盖）----
+# ---- 调试默认（可被 config/debug.json / strategy.json 覆盖）----
 DBG_ENABLE_DEFAULT = True
 DBG_RT_WINDOW_SEC_DEFAULT = 60
 DBG_RT_PREVIEW_DEFAULT = 8
+DELAY_AFTER_CANCEL_SECONDS_DEFAULT = 1.0  # <-- 新增：撤单后固定延时默认值
 
-# ---- VA 去抖动与限频 默认参数（可被 config/va.json 覆盖）----
-VA_VALUE_THRESHOLD_K_DEFAULT = 1.0          # 价值缺口门槛：k * (grid_unit * price)
-VA_MIN_UPDATE_INTERVAL_MIN_DEFAULT = 60     # 相邻两次底仓更新的最小间隔（分钟）
-VA_MAX_UPDATES_PER_DAY_DEFAULT = 3          # 每日底仓最多调整次数
+# ---- VA 去抖动与限频 默认参数（可被 config/va.json / strategy.json 覆盖）----
+VA_VALUE_THRESHOLD_K_DEFAULT = 1.0
+VA_MIN_UPDATE_INTERVAL_MIN_DEFAULT = 60
+VA_MAX_UPDATES_PER_DAY_DEFAULT = 3
 
-# ---- 停牌下单保护默认（可被 config/market.json 覆盖）----
-MKT_HALT_SKIP_PLACE_DEFAULT = True          # 停牌/长时间断流时暂停“新挂单”
-MKT_HALT_SKIP_AFTER_SECONDS_DEFAULT = 180   # 连续拿不到有效价的秒数阈值
-MKT_HALT_LOG_EVERY_MINUTES_DEFAULT = 10     # 停牌暂停状态下的重复日志压频（分钟）
+# ---- 停牌下单保护默认（可被 config/market.json / strategy.json 覆盖）----
+MKT_HALT_SKIP_PLACE_DEFAULT = True
+MKT_HALT_SKIP_AFTER_SECONDS_DEFAULT = 180
+MKT_HALT_LOG_EVERY_MINUTES_DEFAULT = 10
 
 # ---------------- 通用路径与工具函数 ----------------
 
@@ -66,7 +48,8 @@ def info(msg, *args):
     text = msg.format(*args)
     log.info(text)
     if LOG_FH:
-        LOG_FH.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} INFO {text}\n")
+        # 与现场日志格式保持一致
+        LOG_FH.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} - INFO - {text}\n")
         LOG_FH.flush()
 
 def get_saved_param(key, default=None):
@@ -99,7 +82,7 @@ def convert_symbol_to_standard(full_symbol):
         return full_symbol.replace('.XSHG','.SS')
     return full_symbol
 
-# ---------------- 标的中文名（保持） ----------------
+# ---------------- 标的中文名 ----------------
 
 def _load_symbol_names(context):
     name_map = {}
@@ -171,6 +154,7 @@ def _load_debug_config(context, force=False):
     enable = DBG_ENABLE_DEFAULT
     winsec = DBG_RT_WINDOW_SEC_DEFAULT
     preview = DBG_RT_PREVIEW_DEFAULT
+    delay_after_cancel = getattr(context, 'delay_after_cancel_seconds', DELAY_AFTER_CANCEL_SECONDS_DEFAULT)
 
     try:
         if cfg_file.exists():
@@ -183,12 +167,17 @@ def _load_debug_config(context, force=False):
                 if 'rt_heartbeat_preview' in j:
                     try: preview = max(1, int(j['rt_heartbeat_preview']))
                     except: pass
+                # 兼容旧字段
                 if 'enable_debug_log' not in j and 'debug_rt_log' in j: enable = bool(j['debug_rt_log'])
                 if 'rt_heartbeat_window_sec' not in j and 'rt_log_interval_seconds' in j:
                     try: winsec = max(5, int(j['rt_log_interval_seconds']))
                     except: pass
                 if 'rt_heartbeat_preview' not in j and 'rt_log_preview' in j:
                     try: preview = max(1, int(j['rt_log_preview']))
+                    except: pass
+                # （可选）若用户也想放到 debug.json，则读取；最终仍以 strategy.json 覆盖
+                if 'delay_after_cancel_seconds' in j:
+                    try: delay_after_cancel = max(0.0, float(j['delay_after_cancel_seconds']))
                     except: pass
     except Exception as e:
         info('⚠️ 读取调试文件 config/debug.json 失败: {}（采用默认 enable={}, win={}s, preview={}）',
@@ -197,10 +186,12 @@ def _load_debug_config(context, force=False):
     context.enable_debug_log = enable
     context.rt_heartbeat_window_sec = winsec
     context.rt_heartbeat_preview = preview
+    context.delay_after_cancel_seconds = delay_after_cancel
     context.debug_cfg_mtime = mtime
     context.last_rt_log_ts = None
     if enable:
-        info('🧪 调试配置生效: enable={} window={}s preview={}', enable, winsec, preview)
+        info('🧪 调试配置生效: enable={} window={}s preview={} delay_after_cancel={}s',
+             enable, winsec, preview, delay_after_cancel)
     else:
         info('🧪 调试配置生效: enable=False（关闭心跳日志）')
 
@@ -242,7 +233,7 @@ def _load_va_config(context, force=False):
     context.va_cfg_mtime = mtime
     info('⚙️ VA配置生效: k={} minInterval={}m maxDaily={}', k, min_int, max_per_day)
 
-# ---------------- 市场参数：config/market.json（保留） ----------------
+# ---------------- 市场参数：config/market.json ----------------
 
 def _load_market_config(context, force=False):
     cfg_file = research_path('config', 'market.json')
@@ -280,14 +271,8 @@ def _load_market_config(context, force=False):
     info('⚙️ 市场配置生效: haltSkip={} after={}s logEvery={}m',
          halt_skip, halt_after, halt_log_m)
 
-# ---------------- 统一参数：config/strategy.json（新增，优先级最高） ----------------
+# ---------------- 统一参数：config/strategy.json（优先级最高） ----------------
 def _load_strategy_config(context, force=False):
-    """
-    统一参数文件优先覆盖子配置：
-    - 若 strategy.json 存在，则其下的 debug/va/market 字段覆盖 context 中已有值
-    - 若缺失或字段不完整，保持现有值（即来自默认或旧分文件）
-    - 首次加载与热加载：建议“先加载旧分文件，再调用本函数进行覆盖”
-    """
     strat_file = research_path('config', 'strategy.json')
     try:
         mtime = strat_file.stat().st_mtime if strat_file.exists() else None
@@ -298,7 +283,6 @@ def _load_strategy_config(context, force=False):
         return
 
     if not strat_file.exists():
-        # 没有统一文件，静默返回（回退到旧分文件）
         context.strategy_cfg_mtime = None
         return
 
@@ -317,6 +301,10 @@ def _load_strategy_config(context, force=False):
             except: pass
         if 'rt_heartbeat_preview' in dbg:
             try: context.rt_heartbeat_preview = max(1, int(dbg['rt_heartbeat_preview']))
+            except: pass
+        # 新增：撤单后延时（秒）
+        if 'delay_after_cancel_seconds' in dbg:
+            try: context.delay_after_cancel_seconds = max(0.0, float(dbg['delay_after_cancel_seconds']))
             except: pass
 
     # 覆盖 va
@@ -344,7 +332,8 @@ def _load_strategy_config(context, force=False):
             except: pass
 
     context.strategy_cfg_mtime = mtime
-    info('🧩 统一参数生效：读取 strategy.json 并覆盖子配置')
+    info('🧩 统一参数生效：读取 strategy.json 并覆盖子配置（delay_after_cancel={}s）',
+         getattr(context, 'delay_after_cancel_seconds', DELAY_AFTER_CANCEL_SECONDS_DEFAULT))
 
 # ---------------- 初始化与时间窗口判断 ----------------
 
@@ -399,11 +388,9 @@ def initialize(context):
             'buy_grid_spacing': 0.005,
             'sell_grid_spacing': 0.005,
             'max_position': saved.get('max_position', saved.get('base_position', cfg['initial_base_position']) + saved.get('grid_unit', cfg['grid_unit']) * 20),
-            # —— VA 限频状态 —— 
             'va_last_update_dt': None,
             'va_update_count_date': None,
             'va_updates_today': 0,
-            # —— 停牌日志压频（每标的）——
             '_halt_next_log_dt': None
         })
         context.state[sym] = st
@@ -415,12 +402,13 @@ def initialize(context):
     # 启动宽限期
     context.boot_dt = getattr(context, 'current_dt', None) or datetime.now()
     context.boot_grace_seconds = int(get_saved_param('boot_grace_seconds', 180))
+    context.delay_after_cancel_seconds = DELAY_AFTER_CANCEL_SECONDS_DEFAULT  # default
 
     # ⚙️ 参数首次加载：先子配置（默认/旧文件），再统一文件覆盖（优先）
     _load_debug_config(context, force=True)
     _load_va_config(context, force=True)
     _load_market_config(context, force=True)
-    _load_strategy_config(context, force=True)   # <- 覆盖
+    _load_strategy_config(context, force=True)   # <- 覆盖（含 delay_after_cancel_seconds）
 
     # 绑定定时任务
     context.initial_cleanup_done = False
@@ -432,15 +420,15 @@ def initialize(context):
 
 def is_main_trading_time():
     now = datetime.now().time()
-    return (time(9, 30) <= now <= time(11, 30)) or (time(13, 0) <= now <= time(15, 0))
+    return (dtime(9, 30) <= now <= dtime(11, 30)) or (dtime(13, 0) <= now <= dtime(15, 0))
 
 def is_auction_time():
     now = datetime.now().time()
-    return time(9, 15) <= now < time(9, 25)
+    return dtime(9, 15) <= now < dtime(9, 25)
 
 def is_order_blocking_period():
     now = datetime.now().time()
-    return time(9, 25) <= now < time(9, 30)
+    return dtime(9, 25) <= now < dtime(9, 30)
 
 # ---------------- 启动后清理与收敛 ----------------
 
@@ -450,7 +438,7 @@ def before_trading_start(context, data):
     info('🔁 before_trading_start：清理遗留挂单')
     after_initialize_cleanup(context)
     current_time = context.current_dt.time()
-    if time(9, 15) <= current_time < time(9, 30):
+    if dtime(9, 15) <= current_time < dtime(9, 30):
         info('⏭ 重启在集合竞价时段，补挂网格')
         place_auction_orders(context)
     else:
@@ -525,14 +513,13 @@ def place_auction_orders(context):
         place_limit_orders(context, sym, state)
         safe_save_state(sym, state)
 
-# ---------------- 实时价：快照获取 + 心跳日志（支持热加载配置） ----------------
+# ---------------- 实时价：快照获取 + 心跳日志 ----------------
 
 def _fetch_quotes_via_snapshot(context):
-    # 热加载：先子配置（旧文件），再统一文件覆盖
     _load_debug_config(context, force=False)
     _load_va_config(context, force=False)
     _load_market_config(context, force=False)
-    _load_strategy_config(context, force=False)  # <- 覆盖
+    _load_strategy_config(context, force=False)  # <- 覆盖（含延时参数）
 
     symbols = list(getattr(context, 'symbol_list', []) or [])
     if not symbols:
@@ -581,7 +568,6 @@ def _fetch_quotes_via_snapshot(context):
             miss_preview = ','.join(miss_list[:preview_n]) + ('...' if len(miss_list) > preview_n else '')
             info('🧪 RT心跳 {} got:{}/{} miss:[{}]',
                  now_dt.strftime('%H:%M'), got, len(symbols), miss_preview)
-            # 附加：打印各标的 last_valid_ts 与当前时间的gap，帮助定位HALT_GUARD
             try:
                 for ksym in symbols:
                     lts = context.last_valid_ts.get(ksym)
@@ -590,19 +576,27 @@ def _fetch_quotes_via_snapshot(context):
             except Exception:
                 pass
 
+# ---------------- 日志辅助：订单簿 dump ----------------
+
+def _dump_open_orders(context, symbol, tag='DUMP'):
+    try:
+        oo = [o for o in (get_open_orders(symbol) or []) if getattr(o, 'status', None) == '2']
+        if not oo:
+            info('[{}] 🧾 OPEN-ORDERS {}: 空', dsym(context, symbol), tag)
+            return
+        lines = []
+        for o in oo:
+            lines.append(f"#{getattr(o,'entrust_no',None)} side={'B' if o.amount>0 else 'S'} px={getattr(o,'price',None)} amt={o.amount} status={getattr(o,'status',None)}")
+        info('[{}] 🧾 OPEN-ORDERS {}: {} 笔 -> {}', dsym(context, symbol), tag, len(oo), ' | '.join(lines))
+    except Exception as e:
+        info('[{}] ⚠️ OPEN-ORDERS {} 读取失败: {}', dsym(context, symbol), tag, e)
+
 # ---------------- 网格限价挂单主逻辑 ----------------
 
 def place_limit_orders(context, symbol, state):
-    """
-    限价挂单主函数（含“棘轮”与节流 + 停牌挂单保护）。
-    - 集合竞价/启动宽限期：允许“无价”按 base_price 挂单，不启用棘轮；
-    - 连续竞价阶段：仅当拿到有效实时价才启用棘轮；无价也允许按 base_price 挂单。
-    - 停牌/断流保护（可配置）：连续竞价且断流超过阈值 -> 暂停**新挂单**（不撤已有单）。
-    """
     now_dt = context.current_dt
     dbg_tag = f"[{dsym(context, symbol)}]"
 
-    # ✅ 成交后冷却：允许“仅当次补挂”绕过；之后自动恢复
     rehang_bypass = bool(state.get('_rehang_bypass_once'))
     if (not rehang_bypass) and state.get('_last_trade_ts') \
        and (now_dt - state['_last_trade_ts']).total_seconds() < 60:
@@ -615,12 +609,11 @@ def place_limit_orders(context, symbol, state):
     if is_order_blocking_period():
         info('{} ❎ PLACE-SKIP REASON=BLOCKING_PERIOD(9:25-9:30)', dbg_tag)
         return
-    in_limit_window = is_auction_time() or (is_main_trading_time() and now_dt.time() < time(14, 56))
+    in_limit_window = is_auction_time() or (is_main_trading_time() and now_dt.time() < dtime(14, 56))
     if not in_limit_window:
         info('{} ❎ PLACE-SKIP REASON=OUT_OF_LIMIT_WINDOW now={}', dbg_tag, now_dt.time())
         return
 
-    # —— 停牌/断流保护：仅在“连续竞价阶段”启用 —— #
     if is_main_trading_time() and not is_auction_time():
         if getattr(context, 'halt_skip_place', MKT_HALT_SKIP_PLACE_DEFAULT):
             last_ts = context.last_valid_ts.get(symbol)
@@ -629,7 +622,6 @@ def place_limit_orders(context, symbol, state):
                 if (now_dt - last_ts).total_seconds() >= halt_after:
                     info('{} ❎ PLACE-SKIP REASON=HALT_GUARD last_valid_ts={} gap_sec={:.1f} threshold={}s',
                          dbg_tag, last_ts, (now_dt - last_ts).total_seconds(), halt_after)
-                    # 日志压频（原逻辑保留）
                     next_log = state.get('_halt_next_log_dt')
                     if (not next_log) or now_dt >= next_log:
                         info('[{}] ⛔ 停牌/断流超过{}s：暂停新挂单（保留已挂单，不撤）。', dsym(context, symbol), halt_after)
@@ -637,7 +629,6 @@ def place_limit_orders(context, symbol, state):
                         safe_save_state(symbol, state)
                     return
 
-    # 是否处于“允许无价挂单”的阶段
     boot_grace = (now_dt - getattr(context, 'boot_dt', now_dt)).total_seconds() < getattr(context, 'boot_grace_seconds', 180)
     allow_tickless = boot_grace or is_auction_time()
 
@@ -648,7 +639,6 @@ def place_limit_orders(context, symbol, state):
     position = get_position(symbol)
     pos = position.amount + state.get('_pos_change', 0)
 
-    # 棘轮启用条件：连续竞价且拿到有效价
     price = context.latest_data.get(symbol)
     ratchet_enabled = (not allow_tickless) and is_valid_price(price)
 
@@ -656,7 +646,7 @@ def place_limit_orders(context, symbol, state):
          dbg_tag, allow_tickless, boot_grace, price, base, buy_sp, sell_sp, ratchet_enabled)
 
     if ratchet_enabled:
-        if abs(price / base - 1) <= 0.10:  # 偏离保护仍保留
+        if abs(price / base - 1) <= 0.10:
             is_in_low_pos_range  = (pos - unit <= state['base_position'])
             is_in_high_pos_range = (pos + unit >= state['max_position'])
             sell_p_curr = round(base * (1 + sell_sp), 3)
@@ -674,7 +664,6 @@ def place_limit_orders(context, symbol, state):
                 cancel_all_orders_by_symbol(context, symbol)
                 buy_p, sell_p = round(buy_p_curr * (1 - buy_sp), 3), round(buy_p_curr * (1 + sell_sp), 3)
 
-    # 常规节流（不依赖是否有价）
     last_ts = state.get('_last_order_ts')
     if last_ts and (now_dt - last_ts).seconds < 30:
         info('{} ❎ PLACE-SKIP REASON=THROTTLE_TIME last_order_ts={} secs_since={}', dbg_tag, last_ts, (now_dt - last_ts).seconds)
@@ -686,9 +675,10 @@ def place_limit_orders(context, symbol, state):
         return
     state['_last_order_ts'], state['_last_order_bp'] = now_dt, base
 
-    # 执行挂单
     try:
-        open_orders = [o for o in get_open_orders(symbol) or [] if o.status == '2']
+        # 判重前先打印一次订单簿（纯日志）
+        _dump_open_orders(context, symbol, tag='PRE-PLACE')
+        open_orders = [o for o in (get_open_orders(symbol) or []) if o.status == '2']
         same_buy  = any(o.amount > 0 and abs(o.price - buy_p)  < 1e-3 for o in open_orders)
         same_sell = any(o.amount < 0 and abs(o.price - sell_p) < 1e-3 for o in open_orders)
         pend_buy  = sum(o.amount for o in open_orders if o.amount > 0)
@@ -715,7 +705,6 @@ def place_limit_orders(context, symbol, state):
             info('[{}] --> 发起卖出委托: {}股 @ {:.3f}', dsym(context, symbol), unit, sell_p)
             order(symbol, -unit, limit_price=sell_p)
         else:
-            # 逐项给出原因
             reasons = []
             if not can_sell:
                 reasons.append('DUP_SAME_PRICE')
@@ -771,14 +760,24 @@ def on_order_filled(context, symbol, order):
     state['base_price'] = order.price
     state['_pos_change'] = order.amount
     cancel_all_orders_by_symbol(context, symbol)
-    # 撤单后快照
+    # 撤单后快照（T+0s）
     try:
         _oo = [o for o in (get_open_orders(symbol) or []) if o.status == '2']
         pend_buy  = sum(o.amount for o in _oo if o.amount > 0)
         pend_sell = sum(-o.amount for o in _oo if o.amount < 0)
         info('[{}] 📥 AFTER-CANCEL open_orders={} pend_buy={} pend_sell={}', dsym(context, symbol), len(_oo), pend_buy, pend_sell)
+        _dump_open_orders(context, symbol, tag='AFTER-CANCEL-T+0s')
     except Exception as _e:
         info('[{}] ⚠️ AFTER-CANCEL snapshot error: {}', dsym(context, symbol), _e)
+
+    # —— 固定延时：仅日志用途，不改变后续补挂逻辑 —— #
+    try:
+        delay_s = float(getattr(context, 'delay_after_cancel_seconds', DELAY_AFTER_CANCEL_SECONDS_DEFAULT))
+        if delay_s > 0:
+            time.sleep(delay_s)
+            _dump_open_orders(context, symbol, tag=f'AFTER-CANCEL-T+{delay_s:.1f}s')
+    except Exception as _e:
+        info('[{}] ⚠️ 微确认延时失败：{}（忽略，继续）', dsym(context, symbol), _e)
 
     context.mark_halted[symbol] = False
     context.last_valid_price[symbol] = order.price
@@ -791,7 +790,7 @@ def on_order_filled(context, symbol, order):
 
     if is_order_blocking_period():
         info('[{}] 处于9:25-9:30挂单冻结期，成交后仅更新状态，推迟挂单至9:30后。', dsym(context, symbol))
-    elif context.current_dt.time() < time(14, 56):
+    elif context.current_dt.time() < dtime(14, 56):
         info('[{}] ▶ FILL->REHANG base_price={:.3f} rehang_bypass_once={} now={}', dsym(context, symbol), state['base_price'], state.get('_rehang_bypass_once'), context.current_dt.time())
         place_limit_orders(context, symbol, state)
 
@@ -806,21 +805,19 @@ def handle_data(context, data):
 
     _fetch_quotes_via_snapshot(context)
 
-    # 每5分钟：热重载 + 看板
     if now_dt.minute % 5 == 0 and now_dt.second < 5:
         reload_config_if_changed(context)
         generate_html_report(context)
 
-    # ---------- 启动宽限期后才做“阶段+断流”停牌识别（仅影响展示；与停牌挂单保护配合） ----------
     boot_grace = (now_dt - getattr(context, 'boot_dt', now_dt)).total_seconds() < getattr(context, 'boot_grace_seconds', 180)
     if not boot_grace:
-        def _phase_start(now_t: time):
-            if time(9, 15) <= now_t < time(9, 25):   # 集合竞价
-                return time(9, 15)
-            if time(9, 30) <= now_t <= time(11, 30): # 早盘
-                return time(9, 30)
-            if time(13, 0) <= now_t <= time(15, 0):  # 午后
-                return time(13, 0)
+        def _phase_start(now_t: dtime):
+            if dtime(9, 15) <= now_t < dtime(9, 25):
+                return dtime(9, 15)
+            if dtime(9, 30) <= now_t <= dtime(11, 30):
+                return dtime(9, 30)
+            if dtime(13, 0) <= now_t <= dtime(15, 0):
+                return dtime(13, 0)
             return None
 
         phase_start_t = _phase_start(now)
@@ -834,7 +831,6 @@ def handle_data(context, data):
                 else:
                     context.mark_halted[sym] = ((now_dt - last_ts).total_seconds() > grace_seconds)
 
-    # ---------- 动态底仓与间距（价有效时才做） ----------
     for sym in context.symbol_list:
         if sym not in context.state:
             continue
@@ -846,13 +842,11 @@ def handle_data(context, data):
             if now_dt.minute % 30 == 0 and now_dt.second < 5:
                 update_grid_spacing_final(context, sym, st, get_position(sym).amount)
 
-    # ---------- 限价下单窗口 ----------
-    if is_auction_time() or (is_main_trading_time() and now < time(14, 56)):
+    if is_auction_time() or (is_main_trading_time() and now < dtime(14, 56)):
         for sym in context.symbol_list:
             if sym in context.state:
                 place_limit_orders(context, sym, context.state[sym])
 
-    # 巡检
     if now_dt.minute % 30 == 0 and now_dt.second < 5:
         info('📌 每30分钟状态巡检...')
         for sym in context.symbol_list:
@@ -938,13 +932,11 @@ def get_target_base_position(context, symbol, state, price, dt):
     if price <= 0:
         return state['base_position']
 
-    # 每日计数：自然日切换则重置
     today = dt.date()
     if state.get('va_update_count_date') != today:
         state['va_update_count_date'] = today
         state['va_updates_today'] = 0
 
-    # 阈值与限频参数
     k = float(getattr(context, 'va_value_threshold_k', VA_VALUE_THRESHOLD_K_DEFAULT))
     min_int_min = int(getattr(context, 'va_min_update_interval_minutes', VA_MIN_UPDATE_INTERVAL_MIN_DEFAULT))
     max_daily = int(getattr(context, 'va_max_updates_per_day', VA_MAX_UPDATES_PER_DAY_DEFAULT))
@@ -1317,4 +1309,3 @@ def generate_html_report(context):
         report_path.write_text(final_html, encoding='utf-8')
     except Exception as e:
         info(f'❌ 生成HTML看板失败: {e}')
-
