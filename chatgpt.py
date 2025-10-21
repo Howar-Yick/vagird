@@ -1,5 +1,5 @@
 # event_driven_grid_strategy.py
-# 版本号：CHATGPT-3.2.3-20251016+DAILY-LOG
+# 版本号：CHATGPT-3.2.4-20251021+DAILY-LOG
 # 说明：
 # - 日志改为“按交易日分文件”写入：{研究目录}/logs/YYYY-MM-DD_strategy.log
 # - 跨日自动切换日志文件；其余策略/风控/下单逻辑均保持 LOG-ONLY-DELAY 版不变
@@ -20,7 +20,7 @@ from types import SimpleNamespace
 LOG_FH = None
 LOG_DATE = None  # 当前已打开日志文件对应的日期（YYYY-MM-DD）
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'CHATGPT-3.2.3-20251016+DAILY-LOG'
+__version__ = 'CHATGPT-3.2.4-20251021+DAILY-LOG'
 TRANSACTION_COST = 0.00005
 
 # ---- 调试默认（可被 config/debug.json / strategy.json 覆盖）----
