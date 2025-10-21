@@ -1,14 +1,15 @@
 # event_driven_grid_strategy.py
-# 版本号：CHATGPT-3.2.3-20251016-HALT-GUARD-MKT-OFF1456+VA-THROTTLE+HALT-SKIPPLACE+STRATEGY-CONF+DIAG-LOGR01+LOG-ONLY-DELAY
+# 版本号：CHATGPT-3.2.3-20251016+DAILY-LOG
 # 说明：
-# - 只增加“撤单后固定延时 + 订单簿明细日志”，不改变任何策略/风控/下单决策逻辑；
-# - 延时默认 1.0s，可由 strategy.json.debug.delay_after_cancel_seconds 覆盖；
-# - 判重前额外 dump 一次 open_orders；撤单后 T+0s 与 T+delay 也各打印一次，纯日志辅助诊断。
+# - 日志改为“按交易日分文件”写入：{研究目录}/logs/YYYY-MM-DD_strategy.log
+# - 跨日自动切换日志文件；其余策略/风控/下单逻辑均保持 LOG-ONLY-DELAY 版不变
+# - 延时默认 1.0s，可由 strategy.json.debug.delay_after_cancel_seconds 覆盖
+# - 判重前 dump open_orders；撤单后 T+0s 与 T+delay 也各打印一次（纯日志辅助）
 
 import json
 import logging
 import math
-import time  # <-- 新增：用于撤单后的固定延时
+import time  # 撤单后的固定延时
 from datetime import datetime
 from datetime import time as dtime
 from datetime import timedelta
@@ -17,15 +18,16 @@ from types import SimpleNamespace
 
 # ---------------- 全局句柄与常量 ----------------
 LOG_FH = None
+LOG_DATE = None  # 当前已打开日志文件对应的日期（YYYY-MM-DD）
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'CHATGPT-3.2.3-20251016-HALT-GUARD-MKT-OFF1456+VA-THROTTLE+HALT-SKIPPLACE+STRATEGY-CONF+DIAG-LOGR01+LOG-ONLY-DELAY'
+__version__ = 'CHATGPT-3.2.3-20251016+DAILY-LOG'
 TRANSACTION_COST = 0.00005
 
 # ---- 调试默认（可被 config/debug.json / strategy.json 覆盖）----
 DBG_ENABLE_DEFAULT = True
 DBG_RT_WINDOW_SEC_DEFAULT = 60
 DBG_RT_PREVIEW_DEFAULT = 8
-DELAY_AFTER_CANCEL_SECONDS_DEFAULT = 1.0  # <-- 新增：撤单后固定延时默认值
+DELAY_AFTER_CANCEL_SECONDS_DEFAULT = 1.0  # 撤单后固定延时默认值
 
 # ---- VA 去抖动与限频 默认参数（可被 config/va.json / strategy.json 覆盖）----
 VA_VALUE_THRESHOLD_K_DEFAULT = 1.0
@@ -44,9 +46,36 @@ def research_path(*parts) -> Path:
     p.parent.mkdir(parents=True, exist_ok=True)
     return p
 
+def _ensure_daily_logfile():
+    """确保 LOG_FH 指向当日文件；跨日自动切换。返回当前日志文件路径。"""
+    global LOG_FH, LOG_DATE
+    today_str = datetime.now().strftime('%Y-%m-%d')
+    if LOG_DATE != today_str or LOG_FH is None:
+        # 关闭旧文件
+        try:
+            if LOG_FH:
+                LOG_FH.flush()
+                LOG_FH.close()
+        except:
+            pass
+        # 打开当日文件：YYYY-MM-DD_strategy.log
+        log_dir = research_path('logs')
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / f"{today_str}_strategy.log"
+        LOG_FH = open(log_path, 'a', encoding='utf-8')
+        LOG_DATE = today_str
+        try:
+            log.info(f'🔍 日志切换到 {log_path}')
+        except:
+            pass
+        return log_path
+    return research_path('logs', f"{today_str}_strategy.log")
+
 def info(msg, *args):
     text = msg.format(*args)
     log.info(text)
+    # 确保按日切换
+    log_path = _ensure_daily_logfile()
     if LOG_FH:
         # 与现场日志格式保持一致
         LOG_FH.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} - INFO - {text}\n")
@@ -339,8 +368,8 @@ def _load_strategy_config(context, force=False):
 
 def initialize(context):
     global LOG_FH
-    log_file = research_path('logs', 'event_driven_strategy.log')
-    LOG_FH = open(log_file, 'a', encoding='utf-8')
+    # 打开/切换到当日日志文件（YYYY-MM-DD_strategy.log）
+    log_file = _ensure_daily_logfile()
     log.info(f'🔍 日志同时写入到 {log_file}')
     context.env = check_environment()
     info("当前环境：{}", context.env)
@@ -388,9 +417,11 @@ def initialize(context):
             'buy_grid_spacing': 0.005,
             'sell_grid_spacing': 0.005,
             'max_position': saved.get('max_position', saved.get('base_position', cfg['initial_base_position']) + saved.get('grid_unit', cfg['grid_unit']) * 20),
+            # —— VA 限频状态 —— 
             'va_last_update_dt': None,
             'va_update_count_date': None,
             'va_updates_today': 0,
+            # —— 停牌日志压频（每标的）——
             '_halt_next_log_dt': None
         })
         context.state[sym] = st
@@ -1116,7 +1147,7 @@ def update_daily_reports(context, data):
             str(state['initial_base_position']), str(state['base_position']),
             f"{state['base_position'] * close_price:.0f}", f"{weekly_bottom_profit:.0f}",
             f"{total_bottom_profit:.0f}", str(state['base_position']), str(amount),
-            str(state['grid_unit']), str(t_quantity), str(standard_qty),
+            str(state['grid_unit']), str(t_quantity), str(standard_qty}),
             str(intermediate_qty), str(state['max_position']), f"{cost_basis:.3f}",
             f"{compare_cost:.3f}", f"{profit_all:.0f}"
         ]
