@@ -1147,7 +1147,7 @@ def update_daily_reports(context, data):
             str(state['initial_base_position']), str(state['base_position']),
             f"{state['base_position'] * close_price:.0f}", f"{weekly_bottom_profit:.0f}",
             f"{total_bottom_profit:.0f}", str(state['base_position']), str(amount),
-            str(state['grid_unit']), str(t_quantity), str(standard_qty}),
+            str(state['grid_unit']), str(t_quantity), str(standard_qty),
             str(intermediate_qty), str(state['max_position']), f"{cost_basis:.3f}",
             f"{compare_cost:.3f}", f"{profit_all:.0f}"
         ]
