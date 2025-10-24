@@ -1,9 +1,10 @@
 # event_driven_grid_strategy.py
-# 版本号：CHATGPT-3.2.5-20251022+FILL-RECOVER
-# 变更说明（相对 3.2.4-20251021+DAILY-LOG）：
-# - 新增 FILL-RECOVER：复牌/撤单后补偿式成交检测，解决集合竞价/复牌漏回报导致的不撤单/不补挂
-# - 新增 成交去重键 与 轻节流，解决偶发“重复挂单”
-# - 其余交易/风控/VA/看板逻辑不变；仅加诊断日志
+# 版本号：CHATGPT-3.2.6-20251024-FILL-RECOVER-GUARD
+# 相对 3.2.5 的新增/修改要点：
+# - 【误判成交保护】开盘/复牌时段仅在“持仓发生≥一个网格单位跳变”且“订单簿掉单持续≥2s”时才补偿成交；
+#   订单簿瞬时为空（API空窗）不再触发合成成交，修复 161129 集合竞价后误判的问题。
+# - 新增状态字段：_oo_drop_seen_ts、_oo_confirm_deadline（逐标的保存“掉单首次发现时间”和确认截止）。
+# - 其他交易/风控/VA/看板逻辑保持与 3.2.5 一致，仅增强诊断日志与保护。
 
 import json
 import logging
@@ -20,7 +21,7 @@ from types import SimpleNamespace
 LOG_FH = None
 LOG_DATE = None
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'CHATGPT-3.2.5-20251022+FILL-RECOVER'
+__version__ = 'CHATGPT-3.2.6-20251024-FILL-RECOVER-GUARD'
 TRANSACTION_COST = 0.00005
 
 # ---- 调试默认（可被 config/debug.json / strategy.json 覆盖）----
@@ -72,7 +73,7 @@ def _ensure_daily_logfile():
 def info(msg, *args):
     text = msg.format(*args)
     log.info(text)
-    log_path = _ensure_daily_logfile()
+    _ensure_daily_logfile()
     if LOG_FH:
         LOG_FH.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} - INFO - {text}\n")
         LOG_FH.flush()
@@ -284,7 +285,7 @@ def _load_market_config(context, force=False):
     context.halt_skip_after_seconds = halt_after
     context.halt_log_every_minutes = halt_log_m
     context.market_cfg_mtime = mtime
-    info('⚙️ 市场配置生效: haltSkip={} after={}s logEvery={}m',
+    info('⚙️ 市场配置生效: haltSkip={} after={}s logEvery={}',
          halt_skip, halt_after, halt_log_m)
 
 # ---------------- 统一参数：config/strategy.json（优先级最高） ----------------
@@ -353,7 +354,6 @@ def _load_strategy_config(context, force=False):
 # ---------------- 初始化与时间窗口判断 ----------------
 
 def initialize(context):
-    # 打开/切换到当日日志文件
     log_file = _ensure_daily_logfile()
     log.info(f'🔍 日志同时写入到 {log_file}')
     context.env = check_environment()
@@ -375,7 +375,6 @@ def initialize(context):
         log.error(f"❌ 加载配置文件失败：{e}")
         context.symbol_config = {}
 
-    # 容器
     context.symbol_list = list(context.symbol_config.keys())
     _load_symbol_names(context)
 
@@ -415,7 +414,9 @@ def initialize(context):
             '_oo_last': 0,                 # 上次看到的进行中挂单笔数
             '_last_pos_seen': None,        # 上次看到的持仓
             '_recover_until': None,        # 复牌/时窗补偿截止
-            '_after_cancel_until': None    # 撤单后补偿截止
+            '_after_cancel_until': None,   # 撤单后补偿截止
+            '_oo_drop_seen_ts': None,      # 订单簿“掉单”首次发现时间
+            '_oo_confirm_deadline': None   # 二次确认截止时刻
         })
         context.state[sym] = st
         context.latest_data[sym] = st['base_price']
@@ -423,18 +424,15 @@ def initialize(context):
         context.mark_halted[sym] = False
         context.last_valid_price[sym] = st['base_price']
 
-    # 启动宽限期
     context.boot_dt = getattr(context, 'current_dt', None) or datetime.now()
     context.boot_grace_seconds = int(get_saved_param('boot_grace_seconds', 180))
-    context.delay_after_cancel_seconds = DELAY_AFTER_CANCEL_SECONDS_DEFAULT  # default
+    context.delay_after_cancel_seconds = DELAY_AFTER_CANCEL_SECONDS_DEFAULT
 
-    # 参数加载
     _load_debug_config(context, force=True)
     _load_va_config(context, force=True)
     _load_market_config(context, force=True)
     _load_strategy_config(context, force=True)
 
-    # 绑定定时任务
     context.initial_cleanup_done = False
     if '回测' not in context.env:
         run_daily(context, place_auction_orders, time='9:15')
@@ -747,7 +745,7 @@ def place_limit_orders(context, symbol, state):
              dbg_tag, position.amount, enable_amount, state['base_position'], unit, state['max_position'],
              len(open_orders), pend_buy, pend_sell, same_buy, same_sell)
 
-        # 记录订单簿与持仓快照，供 FILL-RECOVER 使用
+        # 记录订单簿与持仓快照（供 FILL-RECOVER）
         state['_oo_last'] = len(open_orders)
         if state.get('_last_pos_seen') is None:
             state['_last_pos_seen'] = position.amount
@@ -843,10 +841,9 @@ def on_order_filled(context, symbol, order):
     except Exception as _e:
         info('[{}] ⚠️ AFTER-CANCEL snapshot error: {}', dsym(context, symbol), _e)
 
-    # 固定延时（仅日志辅助）
+    # 固定延时（仅日志辅助）+ 撤单后补偿窗
     try:
         delay_s = float(getattr(context, 'delay_after_cancel_seconds', DELAY_AFTER_CANCEL_SECONDS_DEFAULT))
-        # 同时开启“撤单后补偿窗”
         state['_after_cancel_until'] = context.current_dt + timedelta(seconds=max(delay_s, 2.5))
         if delay_s > 0:
             time.sleep(delay_s)
@@ -873,16 +870,25 @@ def on_order_filled(context, symbol, order):
     # 更新 FILL-RECOVER 参考快照
     state['_last_pos_seen'] = get_position(symbol).amount
     state['_oo_last'] = len([o for o in (get_open_orders(symbol) or []) if getattr(o, 'status', None) == '2'])
+    # 清理掉单确认状态
+    state['_oo_drop_seen_ts'] = None
+    state['_oo_confirm_deadline'] = None
     safe_save_state(symbol, state)
 
-# ---------------- FILL-RECOVER：补偿式成交检测 ----------------
+# ---------------- FILL-RECOVER：补偿式成交检测（含误判保护） ----------------
 
 def _fill_recover_watch(context, symbol, state):
-    """在复牌/关键时段 & 撤单后短窗内，轻量核验订单簿与持仓，补偿漏回报。"""
+    """
+    在复牌/关键时段 & 撤单后短窗内，核验订单簿与持仓，补偿漏回报。
+    误判保护：
+      1) 必须出现 “持仓跳变(>=grid_unit)” 才可能触发补偿成交；
+      2) 若仅出现 “订单簿掉单(oo_last>0 -> 当前=0)” 则记录时间并二次确认（持续>=2秒才继续判断），
+         若期间没有持仓跳变，则不触发。
+    """
     now_dt = context.current_dt
     in_window = False
 
-    # 关键时段：复牌/开盘/午后开市 ±35s
+    # 关键时段：复牌/开盘/午后开市 ±35s（仅观测，不因为“掉单”立即补偿）
     if _in_reopen_window(now_dt.time()):
         in_window = True
 
@@ -895,6 +901,12 @@ def _fill_recover_watch(context, symbol, state):
         in_window = True
 
     if not in_window:
+        # 非窗口期也要更新快照基线，避免下一次误差
+        if state.get('_last_pos_seen') is None:
+            try:
+                state['_last_pos_seen'] = get_position(symbol).amount
+            except:
+                pass
         return
 
     try:
@@ -908,37 +920,60 @@ def _fill_recover_watch(context, symbol, state):
         state['_last_pos_seen'] = pos_now
 
     pos_delta = pos_now - state['_last_pos_seen']
-    oo_drop = (state.get('_oo_last', 0) > 0 and oo_n < state.get('_oo_last', 0))
-
-    # 触发条件：订单簿减少 或 持仓跳变（≥ grid_unit）
     unit = max(1, int(state.get('grid_unit', 100)))
-    if (abs(pos_delta) >= unit) or (oo_drop and pos_delta != 0):
-        # 构造补偿成交
-        filled_qty = int(abs(pos_delta) // unit * unit)
-        if filled_qty == 0:
-            filled_qty = unit  # 最小按一个网格单位
-        amount = filled_qty if pos_delta > 0 else -filled_qty
-        price  = context.latest_data.get(symbol, state['base_price']) or state['base_price']
-        key = _make_fill_key(symbol, amount, price, now_dt)
-        if _is_dup_fill(context, key):
-            info('[{}] 🔁 DUP-RECOVER 去重: amt={} px={}', dsym(context, symbol), amount, price)
-            # 仍然刷新快照，避免重复触发
-            state['_oo_last'] = oo_n
-            state['_last_pos_seen'] = pos_now
-            return
-        _remember_fill(context, key)
 
-        info('[{}] 🕵️ FILL-RECOVER 触发: oo_last={} -> {} | posΔ={} | synth amt={} px={:.3f}',
-             dsym(context, symbol), state.get('_oo_last', 0), oo_n, pos_delta, amount, price)
+    # —— 仅“订单簿掉单”的空窗确认 —— #
+    oo_drop_now = (state.get('_oo_last', 0) > 0 and oo_n == 0)
+    if oo_drop_now and abs(pos_delta) < unit:
+        # 首次观测到掉单，记录时间；持续>=2秒才有效
+        if state.get('_oo_drop_seen_ts') is None:
+            state['_oo_drop_seen_ts'] = now_dt
+            state['_oo_confirm_deadline'] = now_dt + timedelta(seconds=2.0)
+            info('[{}] 👀 观察到订单簿掉单(无持仓跳变)，进入2s确认期', dsym(context, symbol))
+        else:
+            # 仍在确认期内：仅刷新日志，不合成
+            if now_dt < state.get('_oo_confirm_deadline'):
+                info('[{}] ⏳ 掉单确认中(无持仓跳变) remain={:.1f}s',
+                     dsym(context, symbol),
+                     (state['_oo_confirm_deadline'] - now_dt).total_seconds())
+            else:
+                info('[{}] ✅ 掉单确认结束(仍无持仓跳变)，判定为API空窗，不触发补偿', dsym(context, symbol))
+                state['_oo_drop_seen_ts'] = None
+                state['_oo_confirm_deadline'] = None
+        # 更新oo快照并返回
+        state['_oo_last'] = oo_n
+        state['_last_pos_seen'] = pos_now
+        safe_save_state(symbol, state)
+        return
 
-        synth = SimpleNamespace(order_id=f"SYN-{int(time.time())}",
-                                amount=amount,
-                                filled=abs(amount),
-                                price=price)
-        try:
-            on_order_filled(context, symbol, synth)
-        except Exception as e:
-            info('[{}] ❌ FILL-RECOVER 调用 on_order_filled 失败: {}', dsym(context, symbol), e)
+    # 若此刻已出现“持仓跳变(>=unit)”，再结合掉单持久性才触发补偿
+    if abs(pos_delta) >= unit:
+        # 如果之前记录过“掉单确认”，要求当前时间已过确认门槛（或没有掉单记录，说明是纯持仓跳变）
+        require_passed = True
+        if state.get('_oo_drop_seen_ts') is not None:
+            require_passed = now_dt >= state.get('_oo_confirm_deadline', now_dt)
+        if require_passed:
+            filled_qty = int(abs(pos_delta) // unit * unit)
+            amount = filled_qty if pos_delta > 0 else -filled_qty
+            price  = context.latest_data.get(symbol, state['base_price']) or state['base_price']
+            key = _make_fill_key(symbol, amount, price, now_dt)
+            if _is_dup_fill(context, key):
+                info('[{}] 🔁 DUP-RECOVER 去重: amt={} px={}', dsym(context, symbol), amount, price)
+            else:
+                _remember_fill(context, key)
+                info('[{}] 🕵️ FILL-RECOVER 触发: posΔ={} (>=unit {}) | synth amt={} px={:.3f}',
+                     dsym(context, symbol), pos_delta, unit, amount, price)
+                synth = SimpleNamespace(order_id=f"SYN-{int(time.time())}",
+                                        amount=amount,
+                                        filled=abs(amount),
+                                        price=price)
+                try:
+                    on_order_filled(context, symbol, synth)
+                except Exception as e:
+                    info('[{}] ❌ FILL-RECOVER 调用 on_order_filled 失败: {}', dsym(context, symbol), e)
+            # 无论是否触发，清理确认状态并更新基线
+            state['_oo_drop_seen_ts'] = None
+            state['_oo_confirm_deadline'] = None
 
     # 更新快照
     state['_oo_last'] = oo_n
@@ -999,7 +1034,7 @@ def handle_data(context, data):
             if sym in context.state:
                 place_limit_orders(context, sym, context.state[sym])
 
-    # FILL-RECOVER：关键时段 & 撤单后补偿窗
+    # FILL-RECOVER：关键时段 & 撤单后补偿窗（带误判保护）
     for sym in context.symbol_list:
         st = context.state.get(sym)
         if not st:
@@ -1205,7 +1240,8 @@ def reload_config_if_changed(context):
                 'va_update_count_date': None,
                 'va_updates_today': 0,
                 '_halt_next_log_dt': None,
-                '_oo_last': 0, '_last_pos_seen': None, '_recover_until': None, '_after_cancel_until': None
+                '_oo_last': 0, '_last_pos_seen': None, '_recover_until': None,
+                '_after_cancel_until': None, '_oo_drop_seen_ts': None, '_oo_confirm_deadline': None
             })
             context.state[sym] = st
             context.latest_data[sym] = st['base_price']
