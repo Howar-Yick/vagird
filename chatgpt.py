@@ -1,12 +1,10 @@
 # event_driven_grid_strategy.py
-# 版本号：CHATGPT-3.2.7-20251024-FILL-RECOVER-GUARD
-# 变更要点（相对 3.2.5/3.2.6）：
-# - FILL-RECOVER：在复牌/关键时刻与撤单后短窗内，按“订单簿变化+持仓跳变”做补偿式成交检测
-# - 竞价/复牌双挂保护（REOPEN-GUARD）：关键开市点±35s仅允许首批成对挂单（避免买卖各挂两笔）
-# - 撤单后再挂保护（PLACE-GUARD）：成交->撤单后，在“确认窗”内只允许按需补挂，不重复对称下单
-# - 成交去重 ring（按 symbol/side/qty/minute 轻节流），防止偶发重复挂单/重复回报
-# - 日志：关键动作都有详细 tag，方便复盘；同时按交易日分文件写入 /research/logs/YYYY-MM-DD_strategy.log
-# - 其它逻辑（网格、VA、ATR、看板、报表）保持向后兼容
+# 版本号：CHATGPT-3.2.8-20251024-REOPEN-GUARD
+# 变更要点（相对 3.2.6）：
+# - 新增 REOPEN-GUARD：在复牌/关键开市点 ±35s 内，仅允许“首批成对挂单”执行一次，避免买卖各挂两笔
+# - 其余逻辑（网格、FILL-RECOVER、去重、风控/VA/ATR/看板/报表）与 3.2.6 保持一致
+#
+# 注：本版本刻意不包含 3.2.7 的“PLACE-GUARD（撤单后只补缺侧）”改动，以避免“只挂单边”的副作用。
 
 import json
 import logging
@@ -23,7 +21,7 @@ from types import SimpleNamespace
 LOG_FH = None
 LOG_DATE = None
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'CHATGPT-3.2.7-20251024-FILL-RECOVER-GUARD'
+__version__ = 'CHATGPT-3.2.8-20251024-REOPEN-GUARD'
 TRANSACTION_COST = 0.00005
 
 # ---- 调试默认（可被 config/debug.json / strategy.json 覆盖）----
@@ -419,9 +417,8 @@ def initialize(context):
             '_last_pos_seen': None,        # 上次看到的持仓
             '_recover_until': None,        # 复牌/时窗补偿截止
             '_after_cancel_until': None,   # 撤单后补偿截止
-            # —— GUARD 运行态 —— 
-            '_place_guard_until': None,    # 撤单后“只补缺侧”确认窗
-            '_reopen_guard_until': None    # 复牌/开市关键点“仅一次成对挂单”确认窗
+            # —— REOPEN-GUARD 窗口 ——
+            '_reopen_guard_until': None    # 关键窗口“仅一次成对挂单”保护截止时间
         })
         context.state[sym] = st
         context.latest_data[sym] = st['base_price']
@@ -529,9 +526,17 @@ def cancel_all_orders_by_symbol(context, symbol):
 
 # ---------------- 集合竞价挂单 ----------------
 
-def _set_reopen_guard(state, now_dt):
-    """关键开市点设置‘仅一次成对挂单’保护窗（±35s 内仅首批）。"""
-    state['_reopen_guard_until'] = now_dt + timedelta(seconds=35)
+def _in_reopen_window(now_t: dtime):
+    """关键复牌/开市点窗口：9:30、10:30、13:00，±35s"""
+    anchors = [dtime(9,30,0), dtime(10,30,0), dtime(13,0,0)]
+    for a in anchors:
+        if abs((datetime.combine(datetime.today(), now_t) - datetime.combine(datetime.today(), a)).total_seconds()) <= 35:
+            return True
+    return False
+
+def _set_reopen_guard(state, now_dt, seconds=35):
+    """在关键窗口内，限制仅进行一次成对挂单，避免买卖重复各挂两笔。"""
+    state['_reopen_guard_until'] = now_dt + timedelta(seconds=seconds)
 
 def place_auction_orders(context):
     if '回测' in context.env or not (is_auction_time() or is_main_trading_time()):
@@ -544,7 +549,7 @@ def place_auction_orders(context):
         adjust_grid_unit(state)
         cancel_all_orders_by_symbol(context, sym)
         context.latest_data[sym] = state['base_price']
-        # 开市前后的首轮挂单，开启 REOPEN-GUARD
+        # 👉 首轮挂单打开 REOPEN-GUARD
         _set_reopen_guard(state, context.current_dt)
         place_limit_orders(context, sym, state)
         safe_save_state(sym, state)
@@ -654,14 +659,6 @@ def _is_dup_fill(context, key, ttl_sec=5):
 def _remember_fill(context, key):
     context.recent_fill_ring.append((key, context.current_dt))
 
-def _in_reopen_window(now_t: dtime):
-    # 复牌/关键时刻：9:30、10:30、13:00，窗口 ±35s
-    anchors = [dtime(9,30,0), dtime(10,30,0), dtime(13,0,0)]
-    for a in anchors:
-        if abs((datetime.combine(datetime.today(), now_t) - datetime.combine(datetime.today(), a)).total_seconds()) <= 35:
-            return True
-    return False
-
 # ---------------- 网格限价挂单主逻辑 ----------------
 
 def place_limit_orders(context, symbol, state):
@@ -734,11 +731,6 @@ def place_limit_orders(context, symbol, state):
                 cancel_all_orders_by_symbol(context, symbol)
                 buy_p, sell_p = round(buy_p_curr * (1 - buy_sp), 3), round(buy_p_curr * (1 + sell_sp), 3)
 
-    # ----------- GUARD 1：撤单后“只补缺侧”保护窗 ----------- #
-    place_guard_active = state.get('_place_guard_until') and now_dt <= state['_place_guard_until']
-    # ----------- GUARD 2：复牌/开市“仅一次成对挂单”保护窗 ----------- #
-    reopen_guard_active = state.get('_reopen_guard_until') and now_dt <= state['_reopen_guard_until']
-
     last_ts = state.get('_last_order_ts')
     if last_ts and (now_dt - last_ts).seconds < 30:
         info('{} ❎ PLACE-SKIP REASON=THROTTLE_TIME last_order_ts={} secs_since={}', dbg_tag, last_ts, (now_dt - last_ts).seconds)
@@ -760,65 +752,41 @@ def place_limit_orders(context, symbol, state):
 
         enable_amount = position.enable_amount
         state.pop('_pos_change', None)
-        info('{} ▶ STATE pos={} enable={} base_pos={} unit={} max_pos={} open_orders={} pend_buy={} pend_sell={} same_buy={} same_sell={} guards(place={}, reopen={})',
+        info('{} ▶ STATE pos={} enable={} base_pos={} unit={} max_pos={} open_orders={} pend_buy={} pend_sell={} same_buy={} same_sell={}',
              dbg_tag, position.amount, enable_amount, state['base_position'], unit, state['max_position'],
-             len(open_orders), pend_buy, pend_sell, same_buy, same_sell, bool(place_guard_active), bool(reopen_guard_active))
+             len(open_orders), pend_buy, pend_sell, same_buy, same_sell)
 
         # 记录订单簿与持仓快照，供 FILL-RECOVER 使用
         state['_oo_last'] = len(open_orders)
         if state.get('_last_pos_seen') is None:
             state['_last_pos_seen'] = position.amount
 
-        # === 决策：根据 GUARD 选择挂单侧 ===
+        # === 计算是否处于 REOPEN-GUARD 保护窗 ===
+        reopen_guard_active = state.get('_reopen_guard_until') and (context.current_dt <= state['_reopen_guard_until'])
+
+        # 目标意图
         want_buy  = (not same_buy)  and (pos + unit <= state['max_position'])
         want_sell = (not same_sell) and (enable_amount >= unit and pos - unit >= state['base_position'])
 
-        # 保护逻辑：
-        # 1) reopen_guard_active：只允许“首批成对挂单一次”；如果某侧已挂/不满足，就只挂满足的一侧；之后窗口期内不再重复对称补另侧。
-        # 2) place_guard_active：成交撤单后的确认窗内，只补缺侧（例如成交为卖出，则只优先补买单），不做对称双挂。
         if reopen_guard_active:
-            # 只执行一次：优先成对 -> 其次择一 -> 执行即关闭窗口
+            # 关键开市点窗口：仅首批挂单一次，执行后立即关闭窗口，避免重复双挂
             if want_buy and want_sell:
-                info('{} 🛡️ REOPEN-GUARD 首批成对挂单', dbg_tag)
+                info('[{}] 🛡️ REOPEN-GUARD 首批成对挂单', dsym(context, symbol))
                 order(symbol,  unit, limit_price=buy_p)
                 order(symbol, -unit, limit_price=sell_p)
             elif want_buy:
-                info('{} 🛡️ REOPEN-GUARD 单侧首批(买)挂单', dbg_tag)
+                info('[{}] 🛡️ REOPEN-GUARD 单侧首批(买)挂单', dsym(context, symbol))
                 order(symbol,  unit, limit_price=buy_p)
             elif want_sell:
-                info('{} 🛡️ REOPEN-GUARD 单侧首批(卖)挂单', dbg_tag)
+                info('[{}] 🛡️ REOPEN-GUARD 单侧首批(卖)挂单', dsym(context, symbol))
                 order(symbol, -unit, limit_price=sell_p)
             else:
-                info('{} 🛡️ REOPEN-GUARD 无可挂单侧（价格/仓位限制）', dbg_tag)
-            # 首次执行后即可关闭
+                info('[{}] 🛡️ REOPEN-GUARD 无可挂单侧（价格/仓位限制）', dsym(context, symbol))
             state['_reopen_guard_until'] = None
             safe_save_state(symbol, state)
             return
 
-        if place_guard_active:
-            # 撤单后确认窗：只补缺侧（以最近成交方向为依据）
-            last_dir = state.get('_last_trade_dir')  # 'BUY' or 'SELL'
-            if last_dir == 'SELL':
-                # 卖出成交后，优先补买，不补卖
-                if want_buy:
-                    info('{} 🛡️ PLACE-GUARD 补缺(卖后补买) -> 买 {} @ {:.3f}', dbg_tag, unit, buy_p)
-                    order(symbol, unit, limit_price=buy_p)
-                else:
-                    info('{} 🛡️ PLACE-GUARD 卖后补买条件不满足，暂不挂', dbg_tag)
-                return
-            elif last_dir == 'BUY':
-                # 买入成交后，优先补卖，不补买
-                if want_sell:
-                    info('{} 🛡️ PLACE-GUARD 补缺(买后补卖) -> 卖 {} @ {:.3f}', dbg_tag, unit, sell_p)
-                    order(symbol, -unit, limit_price=sell_p)
-                else:
-                    info('{} 🛡️ PLACE-GUARD 买后补卖条件不满足，暂不挂', dbg_tag)
-                return
-            else:
-                info('{} 🛡️ PLACE-GUARD 未知最近成交方向，安全起见本轮不挂', dbg_tag)
-                return
-
-        # —— 常规分支（无 GUARD 生效）——
+        # —— 常规分支 ——
         if want_buy:
             info('[{}] --> 发起买入委托: {}股 @ {:.3f}', dsym(context, symbol), unit, buy_p)
             order(symbol, unit, limit_price=buy_p)
@@ -892,7 +860,6 @@ def on_order_filled(context, symbol, order):
     trade_direction = "买入" if order.amount > 0 else "卖出"
     info('✅ [{}] 成交回报! 方向: {}, 数量: {}, 价格: {:.3f}', dsym(context, symbol), trade_direction, order.filled, order.price)
     state['_last_trade_ts'] = context.current_dt
-    state['_last_trade_dir'] = 'BUY' if order.amount > 0 else 'SELL'
     state['_last_fill_dt'] = context.current_dt
     state['last_fill_price'] = order.price
     state['base_price'] = order.price
@@ -910,13 +877,10 @@ def on_order_filled(context, symbol, order):
     except Exception as _e:
         info('[{}] ⚠️ AFTER-CANCEL snapshot error: {}', dsym(context, symbol), _e)
 
-    # 固定延时（仅日志辅助） + 设置“撤单后补偿窗 & 只补缺侧保护窗”
+    # 固定延时（仅日志辅助） + 开启撤单后短窗供 FILL-RECOVER 观察
     try:
         delay_s = float(getattr(context, 'delay_after_cancel_seconds', DELAY_AFTER_CANCEL_SECONDS_DEFAULT))
-        # 补偿窗（允许 FILL-RECOVER 观察）
         state['_after_cancel_until'] = context.current_dt + timedelta(seconds=max(delay_s, 2.5))
-        # 只补缺侧保护窗
-        state['_place_guard_until'] = context.current_dt + timedelta(seconds=max(delay_s, 2.5))
         if delay_s > 0:
             time.sleep(delay_s)
             _dump_open_orders(context, symbol, tag=f'AFTER-CANCEL-T+{delay_s:.1f}s')
@@ -954,7 +918,7 @@ def _fill_recover_watch(context, symbol, state):
     # 关键时段：复牌/开盘/午后开市 ±35s
     if _in_reopen_window(now_dt.time()):
         in_window = True
-        # 关键时刻也默认打开“只一次成对挂单”的保护窗（避免重复双挂）
+        # 若未设置过 REOPEN-GUARD，则兜底打开一次，防止重启错过
         if state.get('_reopen_guard_until') is None:
             _set_reopen_guard(state, now_dt)
 
@@ -962,7 +926,7 @@ def _fill_recover_watch(context, symbol, state):
     if state.get('_after_cancel_until') and now_dt <= state['_after_cancel_until']:
         in_window = True
 
-    # 主动开启的“复牌监控窗”
+    # 主动开启的“复牌监控窗”（保留接口）
     if state.get('_recover_until') and now_dt <= state['_recover_until']:
         in_window = True
 
@@ -1265,7 +1229,7 @@ def reload_config_if_changed(context):
             context.symbol_list.remove(sym)
             if sym in context.state: del context.state[sym]
             if sym in context.latest_data: del context.latest_data[sym]
-            context.mark_halted.pop(sym, None)
+            context.mark_halted[sym] = False
             context.last_valid_price.pop(sym, None)
             context.last_valid_ts.pop(sym, None)
 
@@ -1284,10 +1248,10 @@ def reload_config_if_changed(context):
                 'max_position': cfg['initial_base_position'] + cfg['grid_unit'] * 20,
                 'va_last_update_dt': None, 'va_update_count_date': None, 'va_updates_today': 0,
                 '_halt_next_log_dt': None,
-                # FILL-RECOVER & GUARD 运行字段
+                # FILL-RECOVER & REOPEN-GUARD
                 '_oo_last': 0, '_last_pos_seen': None,
                 '_recover_until': None, '_after_cancel_until': None,
-                '_place_guard_until': None, '_reopen_guard_until': None
+                '_reopen_guard_until': None
             })
             context.state[sym] = st
             context.latest_data[sym] = st['base_price']
