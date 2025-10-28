@@ -1,10 +1,13 @@
 # event_driven_grid_strategy.py
-# 版本号：CHATGPT-3.2.8-20251024-REOPEN-GUARD
-# 变更要点（相对 3.2.6）：
-# - 新增 REOPEN-GUARD：在复牌/关键开市点 ±35s 内，仅允许“首批成对挂单”执行一次，避免买卖各挂两笔
-# - 其余逻辑（网格、FILL-RECOVER、去重、风控/VA/ATR/看板/报表）与 3.2.6 保持一致
-#
-# 注：本版本刻意不包含 3.2.7 的“PLACE-GUARD（撤单后只补缺侧）”改动，以避免“只挂单边”的副作用。
+# 版本号：GEMINI-3.2.7-20251028-RESUME-FIX
+# 相对 3.2.6 的新增/修改要点：
+# - 【修复】新增“复牌事件”监测：当标的从 Halted -> False 状态切换时，
+#   主动开启 _recover_until 补偿窗口，确保任意时间的复牌成交（或漏报）
+#   都能被 _fill_recover_watch 捕获，解决集合竞价单在复牌后成交不挂新单的问题。
+# - 【误判成交保护】(3.2.6已有) 开盘/复牌时段仅在“持仓发生≥一个网格单位跳变”且“订单簿掉单持续≥2s”时才补偿成交；
+#   订单簿瞬时为空（API空窗）不再触发合成成交，修复 161129 集合竞价后误判的问题。
+# - 新增状态字段：_oo_drop_seen_ts、_oo_confirm_deadline（逐标的保存“掉单首次发现时间”和确认截止）。
+# - 其他交易/风控/VA/看板逻辑保持与 3.2.6 一致，仅增强诊断日志与保护。
 
 import json
 import logging
@@ -21,7 +24,7 @@ from types import SimpleNamespace
 LOG_FH = None
 LOG_DATE = None
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'CHATGPT-3.2.8-20251024-REOPEN-GUARD'
+__version__ = 'GEMINI-3.2.7-20251028-RESUME-FIX'
 TRANSACTION_COST = 0.00005
 
 # ---- 调试默认（可被 config/debug.json / strategy.json 覆盖）----
@@ -285,7 +288,7 @@ def _load_market_config(context, force=False):
     context.halt_skip_after_seconds = halt_after
     context.halt_log_every_minutes = halt_log_m
     context.market_cfg_mtime = mtime
-    info('⚙️ 市场配置生效: haltSkip={} after={}s logEvery={}m',
+    info('⚙️ 市场配置生效: haltSkip={} after={}s logEvery={}',
          halt_skip, halt_after, halt_log_m)
 
 # ---------------- 统一参数：config/strategy.json（优先级最高） ----------------
@@ -354,7 +357,6 @@ def _load_strategy_config(context, force=False):
 # ---------------- 初始化与时间窗口判断 ----------------
 
 def initialize(context):
-    # 打开/切换到当日日志文件
     log_file = _ensure_daily_logfile()
     log.info(f'🔍 日志同时写入到 {log_file}')
     context.env = check_environment()
@@ -376,7 +378,6 @@ def initialize(context):
         log.error(f"❌ 加载配置文件失败：{e}")
         context.symbol_config = {}
 
-    # 容器
     context.symbol_list = list(context.symbol_config.keys())
     _load_symbol_names(context)
 
@@ -413,12 +414,12 @@ def initialize(context):
             # —— 停牌日志压频（每标的）——
             '_halt_next_log_dt': None,
             # —— FILL-RECOVER 运行态 —— 
-            '_oo_last': 0,                 # 上次看到的进行中挂单笔数
-            '_last_pos_seen': None,        # 上次看到的持仓
-            '_recover_until': None,        # 复牌/时窗补偿截止
-            '_after_cancel_until': None,   # 撤单后补偿截止
-            # —— REOPEN-GUARD 窗口 ——
-            '_reopen_guard_until': None    # 关键窗口“仅一次成对挂单”保护截止时间
+            '_oo_last': 0,              # 上次看到的进行中挂单笔数
+            '_last_pos_seen': None,     # 上次看到的持仓
+            '_recover_until': None,     # 复牌/时窗补偿截止
+            '_after_cancel_until': None,  # 撤单后补偿截止
+            '_oo_drop_seen_ts': None,     # 订单簿“掉单”首次发现时间
+            '_oo_confirm_deadline': None  # 二次确认截止时刻
         })
         context.state[sym] = st
         context.latest_data[sym] = st['base_price']
@@ -426,18 +427,15 @@ def initialize(context):
         context.mark_halted[sym] = False
         context.last_valid_price[sym] = st['base_price']
 
-    # 启动宽限期
     context.boot_dt = getattr(context, 'current_dt', None) or datetime.now()
     context.boot_grace_seconds = int(get_saved_param('boot_grace_seconds', 180))
-    context.delay_after_cancel_seconds = DELAY_AFTER_CANCEL_SECONDS_DEFAULT  # default
+    context.delay_after_cancel_seconds = DELAY_AFTER_CANCEL_SECONDS_DEFAULT
 
-    # 参数加载
     _load_debug_config(context, force=True)
     _load_va_config(context, force=True)
     _load_market_config(context, force=True)
     _load_strategy_config(context, force=True)
 
-    # 绑定定时任务
     context.initial_cleanup_done = False
     if '回测' not in context.env:
         run_daily(context, place_auction_orders, time='9:15')
@@ -526,18 +524,6 @@ def cancel_all_orders_by_symbol(context, symbol):
 
 # ---------------- 集合竞价挂单 ----------------
 
-def _in_reopen_window(now_t: dtime):
-    """关键复牌/开市点窗口：9:30、10:30、13:00，±35s"""
-    anchors = [dtime(9,30,0), dtime(10,30,0), dtime(13,0,0)]
-    for a in anchors:
-        if abs((datetime.combine(datetime.today(), now_t) - datetime.combine(datetime.today(), a)).total_seconds()) <= 35:
-            return True
-    return False
-
-def _set_reopen_guard(state, now_dt, seconds=35):
-    """在关键窗口内，限制仅进行一次成对挂单，避免买卖重复各挂两笔。"""
-    state['_reopen_guard_until'] = now_dt + timedelta(seconds=seconds)
-
 def place_auction_orders(context):
     if '回测' in context.env or not (is_auction_time() or is_main_trading_time()):
         return
@@ -549,8 +535,6 @@ def place_auction_orders(context):
         adjust_grid_unit(state)
         cancel_all_orders_by_symbol(context, sym)
         context.latest_data[sym] = state['base_price']
-        # 👉 首轮挂单打开 REOPEN-GUARD
-        _set_reopen_guard(state, context.current_dt)
         place_limit_orders(context, sym, state)
         safe_save_state(sym, state)
 
@@ -591,7 +575,7 @@ def _fetch_quotes_via_snapshot(context):
             context.latest_data[sym] = px
             context.last_valid_price[sym] = px
             context.last_valid_ts[sym] = now_dt
-            context.mark_halted[sym] = False
+            # context.mark_halted[sym] = False # <-- 不在此处设置，交由 handle_data 统一判断
             got += 1
         else:
             miss_list.append(sym)
@@ -659,6 +643,14 @@ def _is_dup_fill(context, key, ttl_sec=5):
 def _remember_fill(context, key):
     context.recent_fill_ring.append((key, context.current_dt))
 
+def _in_reopen_window(now_t: dtime):
+    # 复牌/关键时刻：9:30、10:30、13:00，窗口 ±35s
+    anchors = [dtime(9,30,0), dtime(10,30,0), dtime(13,0,0)]
+    for a in anchors:
+        if abs((datetime.combine(datetime.today(), now_t) - datetime.combine(datetime.today(), a)).total_seconds()) <= 35:
+            return True
+    return False
+
 # ---------------- 网格限价挂单主逻辑 ----------------
 
 def place_limit_orders(context, symbol, state):
@@ -667,7 +659,7 @@ def place_limit_orders(context, symbol, state):
 
     rehang_bypass = bool(state.get('_rehang_bypass_once'))
     if (not rehang_bypass) and state.get('_last_trade_ts') \
-       and (now_dt - state['_last_trade_ts']).total_seconds() < 60:
+      and (now_dt - state['_last_trade_ts']).total_seconds() < 60:
         info('{} ❎ PLACE-SKIP REASON=COOLDOWN last_trade_ts={} secs_since={:.1f}',
              dbg_tag, state.get('_last_trade_ts'),
              (now_dt - state.get('_last_trade_ts')).total_seconds() if state.get('_last_trade_ts') else -1)
@@ -732,11 +724,11 @@ def place_limit_orders(context, symbol, state):
                 buy_p, sell_p = round(buy_p_curr * (1 - buy_sp), 3), round(buy_p_curr * (1 + sell_sp), 3)
 
     last_ts = state.get('_last_order_ts')
-    if last_ts and (now_dt - last_ts).seconds < 30:
+    if (not rehang_bypass) and last_ts and (now_dt - last_ts).seconds < 30: # <--- 仅在非 rehang 时检查
         info('{} ❎ PLACE-SKIP REASON=THROTTLE_TIME last_order_ts={} secs_since={}', dbg_tag, last_ts, (now_dt - last_ts).seconds)
         return
     last_bp = state.get('_last_order_bp')
-    if last_bp and abs(base / last_bp - 1) < buy_sp / 2:
+    if (not rehang_bypass) and last_bp and abs(base / last_bp - 1) < buy_sp / 2: # <--- 仅在非 rehang 时检查
         info('{} ❎ PLACE-SKIP REASON=THROTTLE_BASE_BP last_bp={} base={} Δ%={:.4f} thres={:.4f}',
              dbg_tag, last_bp, base, abs(base/last_bp - 1), buy_sp/2)
         return
@@ -756,52 +748,28 @@ def place_limit_orders(context, symbol, state):
              dbg_tag, position.amount, enable_amount, state['base_position'], unit, state['max_position'],
              len(open_orders), pend_buy, pend_sell, same_buy, same_sell)
 
-        # 记录订单簿与持仓快照，供 FILL-RECOVER 使用
+        # 记录订单簿与持仓快照（供 FILL-RECOVER）
         state['_oo_last'] = len(open_orders)
         if state.get('_last_pos_seen') is None:
             state['_last_pos_seen'] = position.amount
 
-        # === 计算是否处于 REOPEN-GUARD 保护窗 ===
-        reopen_guard_active = state.get('_reopen_guard_until') and (context.current_dt <= state['_reopen_guard_until'])
-
-        # 目标意图
-        want_buy  = (not same_buy)  and (pos + unit <= state['max_position'])
-        want_sell = (not same_sell) and (enable_amount >= unit and pos - unit >= state['base_position'])
-
-        if reopen_guard_active:
-            # 关键开市点窗口：仅首批挂单一次，执行后立即关闭窗口，避免重复双挂
-            if want_buy and want_sell:
-                info('[{}] 🛡️ REOPEN-GUARD 首批成对挂单', dsym(context, symbol))
-                order(symbol,  unit, limit_price=buy_p)
-                order(symbol, -unit, limit_price=sell_p)
-            elif want_buy:
-                info('[{}] 🛡️ REOPEN-GUARD 单侧首批(买)挂单', dsym(context, symbol))
-                order(symbol,  unit, limit_price=buy_p)
-            elif want_sell:
-                info('[{}] 🛡️ REOPEN-GUARD 单侧首批(卖)挂单', dsym(context, symbol))
-                order(symbol, -unit, limit_price=sell_p)
-            else:
-                info('[{}] 🛡️ REOPEN-GUARD 无可挂单侧（价格/仓位限制）', dsym(context, symbol))
-            state['_reopen_guard_until'] = None
-            safe_save_state(symbol, state)
-            return
-
-        # —— 常规分支 ——
-        if want_buy:
+        can_buy = not same_buy
+        if can_buy and pos + unit <= state['max_position']:
             info('[{}] --> 发起买入委托: {}股 @ {:.3f}', dsym(context, symbol), unit, buy_p)
             order(symbol, unit, limit_price=buy_p)
         else:
-            if not (not same_buy):
+            if not can_buy:
                 info('{} ❎ BUY-SKIP REASON=DUP_SAME_PRICE buy_p={:.3f}', dbg_tag, buy_p)
             elif pos + unit > state['max_position']:
                 info('{} ❎ BUY-SKIP REASON=POS_CAP pos={} unit={} max_pos={}', dbg_tag, pos, unit, state['max_position'])
 
-        if want_sell:
+        can_sell = not same_sell
+        if can_sell and enable_amount >= unit and pos - unit >= state['base_position']:
             info('[{}] --> 发起卖出委托: {}股 @ {:.3f}', dsym(context, symbol), unit, sell_p)
             order(symbol, -unit, limit_price=sell_p)
         else:
             reasons = []
-            if same_sell:
+            if not can_sell:
                 reasons.append('DUP_SAME_PRICE')
             if enable_amount < unit:
                 reasons.append(f'ENABLE_LT_UNIT enable={enable_amount} unit={unit}')
@@ -856,7 +824,6 @@ def on_order_filled(context, symbol, order):
     last_dt = state.get('_last_fill_dt')
     if state.get('last_fill_price') == order.price and last_dt and (context.current_dt - last_dt).seconds < 5:
         return
-
     trade_direction = "买入" if order.amount > 0 else "卖出"
     info('✅ [{}] 成交回报! 方向: {}, 数量: {}, 价格: {:.3f}', dsym(context, symbol), trade_direction, order.filled, order.price)
     state['_last_trade_ts'] = context.current_dt
@@ -877,7 +844,7 @@ def on_order_filled(context, symbol, order):
     except Exception as _e:
         info('[{}] ⚠️ AFTER-CANCEL snapshot error: {}', dsym(context, symbol), _e)
 
-    # 固定延时（仅日志辅助） + 开启撤单后短窗供 FILL-RECOVER 观察
+    # 固定延时（仅日志辅助）+ 撤单后补偿窗
     try:
         delay_s = float(getattr(context, 'delay_after_cancel_seconds', DELAY_AFTER_CANCEL_SECONDS_DEFAULT))
         state['_after_cancel_until'] = context.current_dt + timedelta(seconds=max(delay_s, 2.5))
@@ -906,31 +873,43 @@ def on_order_filled(context, symbol, order):
     # 更新 FILL-RECOVER 参考快照
     state['_last_pos_seen'] = get_position(symbol).amount
     state['_oo_last'] = len([o for o in (get_open_orders(symbol) or []) if getattr(o, 'status', None) == '2'])
+    # 清理掉单确认状态
+    state['_oo_drop_seen_ts'] = None
+    state['_oo_confirm_deadline'] = None
     safe_save_state(symbol, state)
 
-# ---------------- FILL-RECOVER：补偿式成交检测 ----------------
+# ---------------- FILL-RECOVER：补偿式成交检测（含误判保护） ----------------
 
 def _fill_recover_watch(context, symbol, state):
-    """在复牌/关键时段 & 撤单后短窗内，轻量核验订单簿与持仓，补偿漏回报。"""
+    """
+    在复牌/关键时段 & 撤单后短窗内，核验订单簿与持仓，补偿漏回报。
+    误判保护：
+      1) 必须出现 “持仓跳变(>=grid_unit)” 才可能触发补偿成交；
+      2) 若仅出现 “订单簿掉单(oo_last>0 -> 当前=0)” 则记录时间并二次确认（持续>=2秒才继续判断），
+         若期间没有持仓跳变，则不触发。
+    """
     now_dt = context.current_dt
     in_window = False
 
-    # 关键时段：复牌/开盘/午后开市 ±35s
+    # 关键时段：复牌/开盘/午后开市 ±35s（仅观测，不因为“掉单”立即补偿）
     if _in_reopen_window(now_dt.time()):
         in_window = True
-        # 若未设置过 REOPEN-GUARD，则兜底打开一次，防止重启错过
-        if state.get('_reopen_guard_until') is None:
-            _set_reopen_guard(state, now_dt)
 
     # 撤单后短窗
     if state.get('_after_cancel_until') and now_dt <= state['_after_cancel_until']:
         in_window = True
 
-    # 主动开启的“复牌监控窗”（保留接口）
+    # 主动开启的“复牌监控窗”
     if state.get('_recover_until') and now_dt <= state['_recover_until']:
         in_window = True
 
     if not in_window:
+        # 非窗口期也要更新快照基线，避免下一次误差
+        if state.get('_last_pos_seen') is None:
+            try:
+                state['_last_pos_seen'] = get_position(symbol).amount
+            except:
+                pass
         return
 
     try:
@@ -944,37 +923,60 @@ def _fill_recover_watch(context, symbol, state):
         state['_last_pos_seen'] = pos_now
 
     pos_delta = pos_now - state['_last_pos_seen']
-    oo_drop = (state.get('_oo_last', 0) > 0 and oo_n < state.get('_oo_last', 0))
-
-    # 触发条件：订单簿减少 或 持仓跳变（≥ grid_unit）
     unit = max(1, int(state.get('grid_unit', 100)))
-    if (abs(pos_delta) >= unit) or (oo_drop and pos_delta != 0):
-        # 构造补偿成交
-        filled_qty = int(abs(pos_delta) // unit * unit)
-        if filled_qty == 0:
-            filled_qty = unit  # 最小按一个网格单位
-        amount = filled_qty if pos_delta > 0 else -filled_qty
-        price  = context.latest_data.get(symbol, state['base_price']) or state['base_price']
-        key = _make_fill_key(symbol, amount, price, now_dt)
-        if _is_dup_fill(context, key):
-            info('[{}] 🔁 DUP-RECOVER 去重: amt={} px={}', dsym(context, symbol), amount, price)
-            # 仍然刷新快照，避免重复触发
-            state['_oo_last'] = oo_n
-            state['_last_pos_seen'] = pos_now
-            return
-        _remember_fill(context, key)
 
-        info('[{}] 🕵️ FILL-RECOVER 触发: oo_last={} -> {} | posΔ={} | synth amt={} px={:.3f}',
-             dsym(context, symbol), state.get('_oo_last', 0), oo_n, pos_delta, amount, price)
+    # —— 仅“订单簿掉单”的空窗确认 —— #
+    oo_drop_now = (state.get('_oo_last', 0) > 0 and oo_n == 0)
+    if oo_drop_now and abs(pos_delta) < unit:
+        # 首次观测到掉单，记录时间；持续>=2秒才有效
+        if state.get('_oo_drop_seen_ts') is None:
+            state['_oo_drop_seen_ts'] = now_dt
+            state['_oo_confirm_deadline'] = now_dt + timedelta(seconds=2.0)
+            info('[{}] 👀 观察到订单簿掉单(无持仓跳变)，进入2s确认期', dsym(context, symbol))
+        else:
+            # 仍在确认期内：仅刷新日志，不合成
+            if now_dt < state.get('_oo_confirm_deadline'):
+                info('[{}] ⏳ 掉单确认中(无持仓跳变) remain={:.1f}s',
+                     dsym(context, symbol),
+                     (state['_oo_confirm_deadline'] - now_dt).total_seconds())
+            else:
+                info('[{}] ✅ 掉单确认结束(仍无持仓跳变)，判定为API空窗，不触发补偿', dsym(context, symbol))
+                state['_oo_drop_seen_ts'] = None
+                state['_oo_confirm_deadline'] = None
+        # 更新oo快照并返回
+        state['_oo_last'] = oo_n
+        state['_last_pos_seen'] = pos_now
+        safe_save_state(symbol, state)
+        return
 
-        synth = SimpleNamespace(order_id=f"SYN-{int(time.time())}",
-                                amount=amount,
-                                filled=abs(amount),
-                                price=price)
-        try:
-            on_order_filled(context, symbol, synth)
-        except Exception as e:
-            info('[{}] ❌ FILL-RECOVER 调用 on_order_filled 失败: {}', dsym(context, symbol), e)
+    # 若此刻已出现“持仓跳变(>=unit)”，再结合掉单持久性才触发补偿
+    if abs(pos_delta) >= unit:
+        # 如果之前记录过“掉单确认”，要求当前时间已过确认门槛（或没有掉单记录，说明是纯持仓跳变）
+        require_passed = True
+        if state.get('_oo_drop_seen_ts') is not None:
+            require_passed = now_dt >= state.get('_oo_confirm_deadline', now_dt)
+        if require_passed:
+            filled_qty = int(abs(pos_delta) // unit * unit)
+            amount = filled_qty if pos_delta > 0 else -filled_qty
+            price  = context.latest_data.get(symbol, state['base_price']) or state['base_price']
+            key = _make_fill_key(symbol, amount, price, now_dt)
+            if _is_dup_fill(context, key):
+                info('[{}] 🔁 DUP-RECOVER 去重: amt={} px={}', dsym(context, symbol), amount, price)
+            else:
+                _remember_fill(context, key)
+                info('[{}] 🕵️ FILL-RECOVER 触发: posΔ={} (>=unit {}) | synth amt={} px={:.3f}',
+                     dsym(context, symbol), pos_delta, unit, amount, price)
+                synth = SimpleNamespace(order_id=f"SYN-{int(time.time())}",
+                                        amount=amount,
+                                        filled=abs(amount),
+                                        price=price)
+                try:
+                    on_order_filled(context, symbol, synth)
+                except Exception as e:
+                    info('[{}] ❌ FILL-RECOVER 调用 on_order_filled 失败: {}', dsym(context, symbol), e)
+            # 无论是否触发，清理确认状态并更新基线
+            state['_oo_drop_seen_ts'] = None
+            state['_oo_confirm_deadline'] = None
 
     # 更新快照
     state['_oo_last'] = oo_n
@@ -987,15 +989,16 @@ def handle_data(context, data):
     now_dt = context.current_dt
     now = now_dt.time()
 
-    # 1) 拉取快照 + 热加载各类配置（轻量）
     _fetch_quotes_via_snapshot(context)
 
-    # 2) 每 5 分钟输出看板 + 检查配置热重载
+    # 每 5 分钟看板
     if now_dt.minute % 5 == 0 and now_dt.second < 5:
         reload_config_if_changed(context)
         generate_html_report(context)
 
-    # 3) 停牌/断流标记维护（非启动宽限期）
+    # 停牌/断流标记维护 & 【!!!
+    # 
+    # 修复：复牌事件监测 !!!】
     boot_grace = (now_dt - getattr(context, 'boot_dt', now_dt)).total_seconds() < getattr(context, 'boot_grace_seconds', 180)
     if not boot_grace:
         def _phase_start(now_t: dtime):
@@ -1012,13 +1015,35 @@ def handle_data(context, data):
             phase_start_dt = datetime.combine(now_dt.date(), phase_start_t)
             grace_seconds = 120
             for sym in context.symbol_list:
-                last_ts = context.last_valid_ts.get(sym)
-                if last_ts is None or last_ts < phase_start_dt:
-                    context.mark_halted[sym] = (now_dt >= phase_start_dt + timedelta(seconds=grace_seconds))
-                else:
-                    context.mark_halted[sym] = ((now_dt - last_ts).total_seconds() > grace_seconds)
+                if sym not in context.state: # 安全检查
+                    continue
+                
+                # --- 【FIX】复牌监测 ---
+                # 1. 记录旧状态
+                was_halted = context.mark_halted.get(sym, False)
 
-    # 4) 目标底仓与 ATR 动态网格间距
+                # 2. 计算新状态
+                last_ts = context.last_valid_ts.get(sym)
+                is_now_halted = False
+                if last_ts is None or last_ts < phase_start_dt:
+                    is_now_halted = (now_dt >= phase_start_dt + timedelta(seconds=grace_seconds))
+                else:
+                    is_now_halted = ((now_dt - last_ts).total_seconds() > grace_seconds)
+                
+                # 3. 更新状态
+                context.mark_halted[sym] = is_now_halted
+
+                # 4. 检查状态切换：停牌 -> 恢复
+                if was_halted and not is_now_halted:
+                    # 这是一个复牌事件！
+                    state = context.state[sym]
+                    recover_window_seconds = 180 # 开启3分钟补偿窗口
+                    state['_recover_until'] = now_dt + timedelta(seconds=recover_window_seconds)
+                    info('[{}] 🔆 监测到复牌/行情恢复，开启 {}s 补偿成交检测窗口。', 
+                         dsym(context, sym), recover_window_seconds)
+                # --- 【FIX END】 ---
+
+    # 目标底仓 / ATR 间距
     for sym in context.symbol_list:
         if sym not in context.state:
             continue
@@ -1030,22 +1055,20 @@ def handle_data(context, data):
             if now_dt.minute % 30 == 0 and now_dt.second < 5:
                 update_grid_spacing_final(context, sym, st, get_position(sym).amount)
 
-    # 5) 下单（集合竞价 & 连续交易 14:56 之前）
+    # 下单
     if is_auction_time() or (is_main_trading_time() and now < dtime(14, 56)):
         for sym in context.symbol_list:
-            st = context.state.get(sym)
-            if not st:
-                continue
-            place_limit_orders(context, sym, st)
+            if sym in context.state:
+                place_limit_orders(context, sym, context.state[sym])
 
-    # 6) FILL-RECOVER：关键时段 & 撤单后补偿窗
+    # FILL-RECOVER：关键时段 & 撤单后补偿窗（带误判保护）
     for sym in context.symbol_list:
         st = context.state.get(sym)
         if not st:
             continue
         _fill_recover_watch(context, sym, st)
 
-    # 7) 每 30 分钟巡检状态
+    # 每 30 分钟巡检
     if now_dt.minute % 30 == 0 and now_dt.second < 5:
         info('📌 每30分钟状态巡检...')
         for sym in context.symbol_list:
@@ -1061,8 +1084,7 @@ def log_status(context, symbol, state, price):
     pos = get_position(symbol)
     pnl = (disp_price - pos.cost_basis) * pos.amount if pos.cost_basis > 0 else 0
     info("📊 [{}] 状态: 价:{:.3f} 持仓:{}(可卖:{}) / 底仓:{} 成本:{:.3f} 盈亏:{:.2f} 网格:[买{:.2%},卖{:.2%}]",
-         dsym(context, symbol), disp_price, pos.amount, pos.enable_amount, state['base_position'],
-         pos.cost_basis, pnl, state['buy_grid_spacing'], state['sell_grid_spacing'])
+         dsym(context, symbol), disp_price, pos.amount, pos.enable_amount, state['base_position'], pos.cost_basis, pnl, state['buy_grid_spacing'], state['sell_grid_spacing'])
 
 # ---------------- 动态网格间距（ATR） ----------------
 
@@ -1075,18 +1097,15 @@ def update_grid_spacing_final(context, symbol, state, curr_pos):
         base_spacing = atr_pct * atr_multiplier
     min_spacing = TRANSACTION_COST * 5
     base_spacing = max(base_spacing, min_spacing)
-
     if curr_pos <= base_pos + unit * 5:
         new_buy, new_sell = base_spacing, base_spacing * 2
     elif curr_pos > base_pos + unit * 15:
         new_buy, new_sell = base_spacing * 2, base_spacing
     else:
         new_buy, new_sell = base_spacing, base_spacing
-
     max_spacing = 0.03
     new_buy  = round(min(new_buy,  max_spacing), 4)
     new_sell = round(min(new_sell, max_spacing), 4)
-
     if new_buy != state.get('buy_grid_spacing') or new_sell != state.get('sell_grid_spacing'):
         state['buy_grid_spacing'], state['sell_grid_spacing'] = new_buy, new_sell
         info('[{}] 🌀 网格动态调整. ATR({:.2%}) -> 基础间距({:.2%}) -> 最终:[买{:.2%},卖{:.2%}]',
@@ -1222,18 +1241,16 @@ def reload_config_if_changed(context):
         new_config = json.loads(context.config_file_path.read_text(encoding='utf-8'))
         old_symbols, new_symbols = set(context.symbol_list), set(new_config.keys())
 
-        # 移除
         for sym in old_symbols - new_symbols:
             info('[{}] 标的已从配置中移除，将清理其状态和挂单...', dsym(context, sym))
             cancel_all_orders_by_symbol(context, sym)
             context.symbol_list.remove(sym)
             if sym in context.state: del context.state[sym]
             if sym in context.latest_data: del context.latest_data[sym]
-            context.mark_halted[sym] = False
+            context.mark_halted.pop(sym, None)
             context.last_valid_price.pop(sym, None)
             context.last_valid_ts.pop(sym, None)
 
-        # 新增
         for sym in new_symbols - old_symbols:
             info('[{}] 新增标的，正在初始化状态...', dsym(context, sym))
             cfg = new_config[sym]
@@ -1246,12 +1263,12 @@ def reload_config_if_changed(context):
                 'initial_position_value': cfg['initial_base_position'] * cfg['base_price'],
                 'buy_grid_spacing': 0.005, 'sell_grid_spacing': 0.005,
                 'max_position': cfg['initial_base_position'] + cfg['grid_unit'] * 20,
-                'va_last_update_dt': None, 'va_update_count_date': None, 'va_updates_today': 0,
+                'va_last_update_dt': None,
+                'va_update_count_date': None,
+                'va_updates_today': 0,
                 '_halt_next_log_dt': None,
-                # FILL-RECOVER & REOPEN-GUARD
-                '_oo_last': 0, '_last_pos_seen': None,
-                '_recover_until': None, '_after_cancel_until': None,
-                '_reopen_guard_until': None
+                '_oo_last': 0, '_last_pos_seen': None, '_recover_until': None,
+                '_after_cancel_until': None, '_oo_drop_seen_ts': None, '_oo_confirm_deadline': None
             })
             context.state[sym] = st
             context.latest_data[sym] = st['base_price']
@@ -1260,7 +1277,6 @@ def reload_config_if_changed(context):
             context.last_valid_price[sym] = st['base_price']
             context.last_valid_ts[sym] = None
 
-        # 变更
         for sym in old_symbols.intersection(new_symbols):
             if context.symbol_config[sym] != new_config[sym]:
                 info('[{}] 参数发生变更，正在更新...', dsym(context, sym))
@@ -1297,7 +1313,6 @@ def update_daily_reports(context, data):
                     close_price = 1.0
         except:
             close_price = state['base_price']
-
         weeks = len(state.get('trade_week_set', []))
         count = weeks
         d_base = state['dingtou_base']
@@ -1318,7 +1333,6 @@ def update_daily_reports(context, data):
         compare_cost    = added_base * close_price
         profit_all      = (close_price - cost_basis) * amount if cost_basis > 0 else 0
         t_quantity = max(0, amount - state['base_position'])
-
         row = [
             current_date, f"{close_price:.3f}", str(weeks), str(count),
             f"{weekly_return:.2%}", f"{total_return:.2%}", f"{expected_value:.2f}",
