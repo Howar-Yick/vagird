@@ -1,17 +1,17 @@
 # event_driven_grid_strategy.py
-# 版本号：GEMINI-3.2.9-20251029-POS-COMPENSATE-FIX
-# 相对 3.2.8 的新增/修改要点：
-# - 【修复 棘轮失效BUG】
-#   修复 place_limit_orders 中 _pos_change 被立即 pop 导致的后续棘轮(ratchet)失效问题。
-# - 【优化 _pos_change 机制】
-#   _pos_change (持仓补偿) 现在会一直生效，直到 get_position() API 返回的值
-#   真正追上（匹配）补偿后的期望持仓时，该标志才会被清除。
-#   这确保了在 API 滞后期间，棘轮、节流等所有逻辑均使用正确的补偿后持仓。
+# 版本号：GEMINI-3.2.11-20251030-VA-FIX
+# 相对 3.2.10 的新增/修改要点：
+# - 【修复 VA 严重BUG】
+#   修复 get_target_base_position 函数中的致命错误。
+#   VA逻辑错误地使用了“总持仓(pos)”而非“底仓(base_position)”来计算当前市值，
+#   导致VA错误地对比(目标底仓市值)和(总持仓市值)，引发底仓被错误清零或调低。
+#   v3.2.11 已将VA计算逻辑修正为 *只* 依赖 state['base_position']。
+# - 【修复 PATROL BUG】(3.2.10已有)
+#   修复 patrol_and_correct_orders 中因错用 .get() 访问 Order 对象的BUG。
+# - 【优化 _pos_change 机制】(3.2.9已有)
+#   _pos_change (持仓补偿) 会持续生效，直到 get_position() API 追上。
 # - 【强化 FILL-RECOVER】(3.2.8已有)
-#   _fill_recover_watch 对“持仓跳变(pos_delta)”也增加 2s 确认窗口，
-#   防止 API 瞬时“鬼数据”触发错误的虚拟成交。
-# - 【新增 主动巡检】(3.2.8已有)
-#   patrol_and_correct_orders 函数在每 30 分钟巡检时主动修正错误挂单。
+#   _fill_recover_watch 对“持仓跳变”增加 2s 确认窗口，防止API瞬时错误。
 
 import json
 import logging
@@ -28,7 +28,7 @@ from types import SimpleNamespace
 LOG_FH = None
 LOG_DATE = None
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'GEMINI-3.2.9-20251029-POS-COMPENSATE-FIX'
+__version__ = 'GEMINI-3.2.11-20251030-VA-FIX'
 TRANSACTION_COST = 0.00005
 
 # ---- 调试默认（可被 config/debug.json / strategy.json 覆盖）----
@@ -505,7 +505,8 @@ def cancel_all_orders_by_symbol(context, symbol):
     cache = context.canceled_cache['orders']
 
     for o in all_orders:
-        api_sym = o.get('symbol') or o.get('stock_code')
+        # get_all_orders() 返回的是 dict 列表, .get() 方式是正确的
+        api_sym = o.get('symbol') or o.get('stock_code') 
         if convert_symbol_to_standard(api_sym) != symbol:
             continue
         status = str(o.get('status', ''))
@@ -599,18 +600,19 @@ def _fetch_quotes_via_snapshot(context):
             miss_preview = ','.join(miss_list[:preview_n]) + ('...' if len(miss_list) > preview_n else '')
             info('🧪 RT心跳 {} got:{}/{} miss:[{}]',
                  now_dt.strftime('%H:%M'), got, len(symbols), miss_preview)
-            try:
-                for ksym in symbols:
-                    lts = context.last_valid_ts.get(ksym)
-                    gap = (now_dt - lts).total_seconds() if lts else -1
-                    info('[{}] ⏱️ last_valid_ts={} gap_sec={:.1f}', dsym(context, ksym), lts, gap)
-            except Exception:
-                pass
+            # try:
+            #     for ksym in symbols:
+            #         lts = context.last_valid_ts.get(ksym)
+            #         gap = (now_dt - lts).total_seconds() if lts else -1
+            #         info('[{}] ⏱️ last_valid_ts={} gap_sec={:.1f}', dsym(context, ksym), lts, gap)
+            # except Exception:
+            #     pass
 
 # ---------------- 日志辅助：订单簿 dump ----------------
 
 def _dump_open_orders(context, symbol, tag='DUMP'):
     try:
+        # get_open_orders() 返回 Order 对象, 使用 getattr()
         oo = [o for o in (get_open_orders(symbol) or []) if getattr(o, 'status', None) == '2']
         if not oo:
             info('[{}] 🧾 OPEN-ORDERS {}: 空', dsym(context, symbol), tag)
@@ -706,19 +708,26 @@ def place_limit_orders(context, symbol, state):
     
     if pos_change != 0:
         # 检查API是否已追上
-        expected_pos = state.get('_last_pos_seen', position.amount) + pos_change
-        
-        if abs(position.amount - expected_pos) < 1: # API持仓 已经 匹配 期望持仓
-            info('{} ✅ API pos {} matches expected pos {}. Clearing _pos_change ({})',
-                 dbg_tag, position.amount, expected_pos, pos_change)
-            state.pop('_pos_change', None)
-            state.pop('_last_pos_seen', None)
-            pos = position.amount # 使用已更新的API持仓
+        # _last_pos_seen 必须存在才能进行补偿
+        if state.get('_last_pos_seen') is not None:
+            expected_pos = state.get('_last_pos_seen', position.amount) + pos_change
+            
+            if abs(position.amount - expected_pos) < 1: # API持仓 已经 匹配 期望持仓
+                info('{} ✅ API pos {} matches expected pos {}. Clearing _pos_change ({})',
+                     dbg_tag, position.amount, expected_pos, pos_change)
+                state['_pos_change'] = 0 # 清零
+                state['_last_pos_seen'] = None
+                pos = position.amount # 使用已更新的API持仓
+            else:
+                # API 仍然滞后，继续使用补偿值
+                pos = position.amount + pos_change 
+                # info('{} ⚠️ API pos {} lags expected pos {}. Using compensated pos {} (pos_change={})',
+                #      dbg_tag, position.amount, expected_pos, pos, pos_change)
         else:
-            # API 仍然滞后，继续使用补偿值
-            pos = position.amount + pos_change 
-            # info('{} ⚠️ API pos {} lags expected pos {}. Using compensated pos {} (pos_change={})',
-            #      dbg_tag, position.amount, expected_pos, pos, pos_change)
+            # 基线丢失，停止补偿，防止 runaway bug
+            info('{} ⚠️ _pos_change ({}) exists but _last_pos_seen is missing. Clearing compensation.', dbg_tag, pos_change)
+            state['_pos_change'] = 0 # 清零
+            pos = position.amount
     # --- 【!!! 修复结束 !!!】 ---
 
     price = context.latest_data.get(symbol)
@@ -758,10 +767,11 @@ def place_limit_orders(context, symbol, state):
     state['_last_order_ts'], state['_last_order_bp'] = now_dt, base
 
     try:
-        # _dump_open_orders(context, symbol, tag='PRE-PLACE')
-        open_orders = [o for o in (get_open_orders(symbol) or []) if o.status == '2']
-        same_buy  = any(o.amount > 0 and abs(o.price - buy_p)  < 1e-3 for o in open_orders)
-        same_sell = any(o.amount < 0 and abs(o.price - sell_p) < 1e-3 for o in open_orders)
+        # 【!! BUG FIX v3.2.10 !!】
+        # get_open_orders() 返回 Order 对象, 使用 getattr()
+        open_orders = [o for o in (get_open_orders(symbol) or []) if getattr(o, 'status', None) == '2']
+        same_buy  = any(o.amount > 0 and abs(getattr(o, 'price', 0) - buy_p)  < 1e-3 for o in open_orders)
+        same_sell = any(o.amount < 0 and abs(getattr(o, 'price', 0) - sell_p) < 1e-3 for o in open_orders)
 
         enable_amount = position.enable_amount
         
@@ -854,13 +864,22 @@ def on_order_filled(context, symbol, order):
     # --- 【!!! 关键修复：设置补偿基线 !!!】 ---
     # 1. 记录下当前（滞后的）API持仓
     try:
-        state['_last_pos_seen'] = get_position(symbol).amount
+        # 【!! v3.2.10 修正 !!】
+        # 如果 _pos_change 已经存在 (说明是连续成交，API极度滞后)
+        # 我们的基线应该是上一次的“期望持仓”，而不是再次读取滞后的API
+        if state.get('_pos_change', 0) != 0 and state.get('_last_pos_seen') is not None:
+             # 基线 = 上次API持仓 + 上次补偿
+             state['_last_pos_seen'] = state.get('_last_pos_seen') + state.get('_pos_change')
+        else:
+             # 正常情况：基线 = 当前API持仓
+             state['_last_pos_seen'] = get_position(symbol).amount
+            
     except Exception as e:
         info('[{}] ⚠️ on_order_filled 获取持仓失败: {}', dsym(context, symbol), e)
         state['_last_pos_seen'] = None # 不确定基线，后续补偿会暂停
     
-    # 2. 记录补偿值
-    state['_pos_change'] = order.amount
+    # 2. 记录补偿值 (如果是连续成交，则累加)
+    state['_pos_change'] = state.get('_pos_change', 0) + order.amount
     # --- 【!!! 修复结束 !!!】 ---
 
     state['_last_trade_ts'] = context.current_dt
@@ -872,10 +891,10 @@ def on_order_filled(context, symbol, order):
 
     # 撤单后快照（T+0s）
     try:
-        _oo = [o for o in (get_open_orders(symbol) or []) if o.status == '2']
+        _oo = [o for o in (get_open_orders(symbol) or []) if getattr(o, 'status', None) == '2']
         pend_buy  = sum(o.amount for o in _oo if o.amount > 0)
-        pend_sell = sum(-o.amount for o in _oo if o.amount < 0)
-        info('[{}] 📥 AFTER-CANCEL open_orders={} pend_buy={} pend_sell={}', dsym(context, symbol), len(_oo), pend_buy, pend_sell)
+        pend_sell = sum(o.amount for o in _oo if o.amount < 0) # 卖单 amount 是负数
+        info('[{}] 📥 AFTER-CANCEL open_orders={} pend_buy={} pend_sell={}', dsym(context, symbol), len(_oo), pend_buy, abs(pend_sell))
         # _dump_open_orders(context, symbol, tag='AFTER-CANCEL-T+0s')
     except Exception as _e:
         info('[{}] ⚠️ AFTER-CANCEL snapshot error: {}', dsym(context, symbol), _e)
@@ -909,8 +928,11 @@ def on_order_filled(context, symbol, order):
     
     # 更新 FILL-RECOVER 参考快照（使用补偿后的持仓）
     try:
-        compensated_pos = state.get('_last_pos_seen', 0) + state.get('_pos_change', 0)
-        state['_last_pos_seen'] = compensated_pos
+        if state.get('_last_pos_seen') is not None:
+            compensated_pos = state.get('_last_pos_seen', 0) + state.get('_pos_change', 0)
+            state['_last_pos_seen'] = compensated_pos
+        else:
+             state['_last_pos_seen'] = None
     except:
         state['_last_pos_seen'] = None # 获取失败则重置
         
@@ -1064,7 +1086,7 @@ def _fill_recover_watch(context, symbol, state):
     state['_last_pos_seen'] = pos_now
     safe_save_state(symbol, state)
 
-# ---------------- 【新增】主动巡检与修正 ----------------
+# ---------------- 【!! 修正 !!】主动巡检与修正 ----------------
 
 def patrol_and_correct_orders(context, symbol, state):
     """
@@ -1079,10 +1101,10 @@ def patrol_and_correct_orders(context, symbol, state):
     if not (is_main_trading_time() and now_dt.time() < dtime(14, 56)):
         return # 非主交易时间不巡检
     if context.mark_halted.get(symbol, False):
-        info('{} 🛡️ PATROL-SKIP REASON=HALT', dbg_tag)
+        # info('{} 🛡️ PATROL-SKIP REASON=HALT', dbg_tag)
         return # 停牌不巡检
     if not is_valid_price(context.latest_data.get(symbol)):
-        info('{} 🛡️ PATROL-SKIP REASON=INVALID_PRICE', dbg_tag)
+        # info('{} 🛡️ PATROL-SKIP REASON=INVALID_PRICE', dbg_tag)
         return # 价格失效不巡检
 
     try:
@@ -1093,16 +1115,22 @@ def patrol_and_correct_orders(context, symbol, state):
         
         if pos_change != 0:
              # (与 place_limit_orders 相同的逻辑)
-             expected_pos = state.get('_last_pos_seen', position.amount) + pos_change
-             if abs(position.amount - expected_pos) < 1: # API 追上
-                 state.pop('_pos_change', None)
-                 state.pop('_last_pos_seen', None)
+             if state.get('_last_pos_seen') is not None:
+                expected_pos = state.get('_last_pos_seen', position.amount) + pos_change
+                if abs(position.amount - expected_pos) < 1: # API 追上
+                     state['_pos_change'] = 0 # 清零
+                     state['_last_pos_seen'] = None
+                     pos = position.amount
+                else: # API 滞后
+                     pos = position.amount + pos_change
+             else:
+                 state['_pos_change'] = 0 # 基线丢失，清除补偿
                  pos = position.amount
-             else: # API 滞后
-                 pos = position.amount + pos_change
         
         enable_amount = position.enable_amount
-        open_orders = [o for o in (get_open_orders(symbol) or []) if o.status == '2']
+        # 【!! BUG FIX v3.2.10 !!】
+        # get_open_orders() 返回 Order 对象, 使用 getattr()
+        open_orders = [o for o in (get_open_orders(symbol) or []) if getattr(o, 'status', None) == '2']
 
         # 3. 获取期望状态
         base_pos = state['base_position']
@@ -1122,15 +1150,17 @@ def patrol_and_correct_orders(context, symbol, state):
         has_correct_sell_order = False
 
         for o in open_orders:
-            api_sym = o.get('symbol') or o.get('stock_code')
-            entrust_no = o.get('entrust_no')
+            # 【!! BUG FIX v3.2.10 !!】: 使用 getattr() 访问对象属性
+            api_sym = getattr(o, 'symbol', None) or getattr(o, 'stock_code', None)
+            entrust_no = getattr(o, 'entrust_no', None)
+            o_price = getattr(o, 'price', 0)
             if not entrust_no: continue
             
             is_wrong = False
             if o.amount > 0: # 这是一个买单
                 if not should_have_buy_order:
                     is_wrong = True # 仓位满了，不该有买单
-                elif abs(o.price - buy_p) >= 1e-3:
+                elif abs(o_price - buy_p) >= 1e-3:
                     is_wrong = True # 价格不对
                 else:
                     has_correct_buy_order = True # 找到了正确的买单
@@ -1138,13 +1168,13 @@ def patrol_and_correct_orders(context, symbol, state):
             elif o.amount < 0: # 这是一个卖单
                 if not should_have_sell_order:
                     is_wrong = True # 仓位到底了，不该有卖单
-                elif abs(o.price - sell_p) >= 1e-3:
+                elif abs(o_price - sell_p) >= 1e-3:
                     is_wrong = True # 价格不对
                 else:
                     has_correct_sell_order = True # 找到了正确的卖单
             
             if is_wrong:
-                orders_to_cancel.append((entrust_no, api_sym, o.price, o.amount))
+                orders_to_cancel.append((entrust_no, api_sym, o_price, o.amount))
 
         # 6. 执行撤单
         if orders_to_cancel:
@@ -1171,9 +1201,7 @@ def patrol_and_correct_orders(context, symbol, state):
             else:
                  info('{} 🛡️ PATROL: 发现缺失订单，准备补挂...', dbg_tag)
             
-            # 清理 _pos_change，防止 place_limit_orders 内部逻辑冲突
-            # (不需要，因为 place_limit_orders 内部已经有处理逻辑了)
-            # state.pop('_pos_change', None) 
+            # place_limit_orders 内部会处理 _pos_change
             place_limit_orders(context, symbol, state)
 
     except Exception as e:
@@ -1246,6 +1274,7 @@ def handle_data(context, data):
             get_target_base_position(context, sym, st, price, now_dt)
             adjust_grid_unit(st)
             if now_dt.minute % 30 == 0 and now_dt.second < 5:
+                # 传递 get_position() 的原始值，函数内部会处理补偿
                 update_grid_spacing_final(context, sym, st, get_position(sym).amount)
 
     # 下单
@@ -1284,13 +1313,17 @@ def log_status(context, symbol, state, price):
     pos = position.amount
     
     if pos_change != 0:
-         expected_pos = state.get('_last_pos_seen', position.amount) + pos_change
-         if abs(position.amount - expected_pos) < 1: # API 追上
-             state.pop('_pos_change', None)
-             state.pop('_last_pos_seen', None)
+         if state.get('_last_pos_seen') is not None:
+            expected_pos = state.get('_last_pos_seen', position.amount) + pos_change
+            if abs(position.amount - expected_pos) < 1: # API 追上
+                 state['_pos_change'] = 0 # 清零
+                 state['_last_pos_seen'] = None
+                 pos = position.amount
+            else: # API 滞后
+                 pos = position.amount + pos_change
+         else:
+             state['_pos_change'] = 0 # 基线丢失
              pos = position.amount
-         else: # API 滞后
-             pos = position.amount + pos_change
     
     pnl = (disp_price - position.cost_basis) * pos if position.cost_basis > 0 else 0
     info("📊 [{}] 状态: 价:{:.3f} 持仓:{}(可卖:{}) / 底仓:{} 成本:{:.3f} 盈亏:{:.2f} 网格:[买{:.2%},卖{:.2%}]",
@@ -1305,13 +1338,17 @@ def update_grid_spacing_final(context, symbol, state, curr_pos):
     pos = curr_pos # 默认
     pos_change = state.get('_pos_change', 0)
     if pos_change != 0:
-        expected_pos = state.get('_last_pos_seen', curr_pos) + pos_change
-        if abs(curr_pos - expected_pos) < 1:
-            state.pop('_pos_change', None)
-            state.pop('_last_pos_seen', None)
-            pos = curr_pos
+        if state.get('_last_pos_seen') is not None:
+            expected_pos = state.get('_last_pos_seen', curr_pos) + pos_change
+            if abs(curr_pos - expected_pos) < 1:
+                state['_pos_change'] = 0 # 清零
+                state['_last_pos_seen'] = None
+                pos = curr_pos
+            else:
+                pos = curr_pos + pos_change
         else:
-            pos = curr_pos + pos_change
+             state['_pos_change'] = 0 # 基线丢失
+             pos = curr_pos
 
     unit, base_pos = state['grid_unit'], state['base_position']
     atr_pct = calculate_atr(context, symbol)
@@ -1372,6 +1409,11 @@ def end_of_day(context):
 # ---------------- 价值平均（VA） ----------------
 
 def get_target_base_position(context, symbol, state, price, dt):
+    """
+    【!!! 关键修复 v3.2.11 !!!】
+    VA计算 *只* 关心 base_position (底仓)，
+    绝不能使用 pos (总持仓) 来计算 current_val。
+    """
     if not is_valid_price(price):
         info('[{}] ⚠️ 停牌/无有效价，跳过VA计算，底仓维持 {}', dsym(context, symbol), state['base_position'])
         return state['base_position']
@@ -1390,32 +1432,23 @@ def get_target_base_position(context, symbol, state, price, dt):
     min_int_min = int(getattr(context, 'va_min_update_interval_minutes', VA_MIN_UPDATE_INTERVAL_MIN_DEFAULT))
     max_daily = int(getattr(context, 'va_max_updates_per_day', VA_MAX_UPDATES_PER_DAY_DEFAULT))
 
-    # 【重要】VA计算使用补偿后的持仓
-    position = get_position(symbol)
-    pos_change = state.get('_pos_change', 0)
-    pos = position.amount # 默认
-    
-    if pos_change != 0:
-         expected_pos = state.get('_last_pos_seen', position.amount) + pos_change
-         if abs(position.amount - expected_pos) < 1: # API 追上
-             state.pop('_pos_change', None)
-             state.pop('_last_pos_seen', None)
-             pos = position.amount
-         else: # API 滞后
-             pos = position.amount + pos_change
-    
-    current_val = pos * price
+    # 【!!! 关键修复 v3.2.11 !!!】
+    # current_val 必须是 *当前底仓* 的市值, 而不是总持仓的市值
+    # 移除所有 _pos_change 补偿逻辑，VA只关心底仓
+    current_val = state['base_position'] * price 
     delta_val = target_val - current_val
+    # 【!!! 修复结束 !!!】
+    
     grid_value = state['grid_unit'] * price
 
     if abs(delta_val) < k * grid_value:
-        return state['base_position']
+        return state['base_position'] # 未达阈值
 
     last_dt = state.get('va_last_update_dt')
     if last_dt is not None and (dt - last_dt).total_seconds() < min_int_min * 60:
-        return state['base_position']
+        return state['base_position'] # 冷却中
     if state.get('va_updates_today', 0) >= max_daily:
-        return state['base_position']
+        return state['base_position'] # 今日达上限
 
     desired_shares = delta_val / price
     step = state['grid_unit']
@@ -1426,10 +1459,12 @@ def get_target_base_position(context, symbol, state, price, dt):
 
     min_base = round(state['initial_position_value'] / state['base_price'] / 100) * 100 if state['base_price'] > 0 else 0
     new_base_pos = max(min_base, state['base_position'] + adj_shares)
+    
     if new_base_pos == state['base_position']:
-        return state['base_position']
+        return state['base_position'] # 调整后未变
 
-    info('[{}] 价值平均(阈值/限频): 目标底仓从 {} 调整至 {} (Δ{}股, 单位:{}). 目标市值:{:.2f}, 当前市值(补偿后):{:.2f}, 缺口:{:.2f}',
+    # 【!! 修复 v3.2.11 !!】日志使用正确的 current_val
+    info('[{}] 价值平均(阈值/限频): 目标底仓从 {} 调整至 {} (Δ{}股, 单位:{}). 目标市值:{:.2f}, 当前*底仓*市值:{:.2f}, 缺口:{:.2f}',
          dsym(context, symbol),
          state['base_position'], new_base_pos, (new_base_pos - state['base_position']),
          state['grid_unit'], target_val, current_val, delta_val)
@@ -1552,13 +1587,17 @@ def update_daily_reports(context, data):
         amount = position.amount # 默认
         
         if pos_change != 0:
-             expected_pos = state.get('_last_pos_seen', position.amount) + pos_change
-             if abs(position.amount - expected_pos) < 1: # API 追上
-                 state.pop('_pos_change', None)
-                 state.pop('_last_pos_seen', None)
+             if state.get('_last_pos_seen') is not None:
+                expected_pos = state.get('_last_pos_seen', position.amount) + pos_change
+                if abs(position.amount - expected_pos) < 1: # API 追上
+                     state['_pos_change'] = 0 # 清零
+                     state['_last_pos_seen'] = None
+                     amount = position.amount
+                else: # API 滞后
+                     amount = position.amount + pos_change
+             else:
+                 state['_pos_change'] = 0 # 基线丢失
                  amount = position.amount
-             else: # API 滞后
-                 amount = position.amount + pos_change
         
         cost_basis = getattr(position, 'cost_basis', state['base_price'])
         close_price = context.last_valid_price.get(symbol, state['base_price'])
@@ -1655,13 +1694,17 @@ def generate_html_report(context):
         pos = position.amount # 默认
         
         if pos_change != 0:
-             expected_pos = state.get('_last_pos_seen', position.amount) + pos_change
-             if abs(position.amount - expected_pos) < 1: # API 追上
-                 state.pop('_pos_change', None)
-                 state.pop('_last_pos_seen', None)
+             if state.get('_last_pos_seen') is not None:
+                expected_pos = state.get('_last_pos_seen', position.amount) + pos_change
+                if abs(position.amount - expected_pos) < 1: # API 追上
+                     state['_pos_change'] = 0 # 清零
+                     state['_last_pos_seen'] = None
+                     pos = position.amount
+                else: # API 滞后
+                     pos = position.amount + pos_change
+             else:
+                 state['_pos_change'] = 0 # 基线丢失
                  pos = position.amount
-             else: # API 滞后
-                 pos = position.amount + pos_change
         
         price = context.last_valid_price.get(symbol, state['base_price'])
         halted = context.mark_halted.get(symbol, False)
