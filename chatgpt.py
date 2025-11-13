@@ -1,14 +1,15 @@
 # event_driven_grid_strategy.py
-# 版本号：GEMINI-3.2.13-POS-FIX
-# 相对 3.2.12 的新增/修改要点：
-# - 【修复 持仓计算BUG】
-#   您发现的严重BUG：_pos_change (持仓补偿) 机制在连续成交或重启时存在逻辑缺陷，
-#   导致其错误累积，使得日志和看板中的“持仓”数据远大于实际持仓。
-#   此版本彻底移除了 _pos_change 补偿机制，所有持仓计算 (日志/下单/看板/ATR)
-#   现在 100% 依赖 get_position().amount 返回的 API 实时持仓数据。
-# - 【清理 state】
-#   从 state 初始化中移除了 _pos_change, _last_pos_seen 等变量，防止重启时
-#   加载到旧的错误补偿值。
+# 版本号：GEMINI-3.2.14-PnL-FIX
+# 相对 3.2.13 的新增/修改要点：
+# - 【新增 PnL 看板】: 严格遵照用户要求，不修改任何核心交易逻辑。
+# - 【新增 PnL 归因】:
+#     - 1. (最小修改) log_trade_details 增加 entrust_no 列，用于数据连接。
+#     - 2. 新增 _load_pnl_metrics / _save_pnl_metrics，用于持久化收益数据。
+#     - 3. 新增 _update_realized_pnl_from_deliver，在 after_trading_end (收盘后)
+#          调用 get_deliver() 和 a_trade_details.csv (归因依据) 进行日终结算。
+# - 【升级 看板】:
+#     - 1. generate_html_report 完全重写，用于展示 PnL 指标。
+#     - 2. initialize 和 end_of_day 中增加了对 PnL 数据的加载/保存调用。
 
 import json
 import logging
@@ -25,7 +26,7 @@ from types import SimpleNamespace
 LOG_FH = None
 LOG_DATE = None
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'GEMINI-3.2.13-POS-FIX'
+__version__ = 'GEMINI-3.2.14-PnL-FIX' # <-- 版本号升级
 TRANSACTION_COST = 0.00005
 
 # ---- 调试默认（可被 config/debug.json / strategy.json 覆盖）----
@@ -449,6 +450,13 @@ def initialize(context):
         run_daily(context, place_auction_orders, time='9:15')
         run_daily(context, end_of_day, time='14:56')
         info('✅ 事件驱动模式就绪')
+
+    # --- 【新增 PnL v3.2.14】PnL 指标初始化 ---
+    context.pnl_metrics_path = research_path('state', 'pnl_metrics.json')
+    context.pnl_metrics = _load_pnl_metrics(context.pnl_metrics_path)
+    info('✅ PnL 收益指标已加载（共 {} 个标的）', len(context.pnl_metrics))
+    # --- PnL 初始化结束 ---
+    
     info('✅ 初始化完成，版本:{}', __version__)
 
 def is_main_trading_time():
@@ -809,7 +817,11 @@ def on_trade_response(context, trade_list):
             continue
         sym = convert_symbol_to_standard(tr['stock_code'])
         entrust_no = tr['entrust_no']
-        log_trade_details(context, sym, tr)
+        
+        # 【!!! PnL v3.2.14: 关键依赖 !!!】
+        # log_trade_details 必须在 PnL 归因之前调用，以记录 'base_position_at_trade'
+        log_trade_details(context, sym, tr) 
+        
         if sym not in context.state or entrust_no in context.state[sym]['filled_order_ids']:
             continue
 
@@ -1155,11 +1167,11 @@ def patrol_and_correct_orders(context, symbol, state):
            (should_have_sell_order and not has_correct_sell_order):
             
             if orders_to_cancel:
-                 info('{} 🛡️ PATROL: 撤单完成，准备补挂缺失订单...', dbg_tag)
-                 # 延迟一小下，等撤单生效
-                 time.sleep(float(getattr(context, 'delay_after_cancel_seconds', 1.0)))
+                info('{} 🛡️ PATROL: 撤单完成，准备补挂缺失订单...', dbg_tag)
+                # 延迟一小下，等撤单生效
+                time.sleep(float(getattr(context, 'delay_after_cancel_seconds', 1.0)))
             else:
-                 info('{} 🛡️ PATROL: 发现缺失订单，准备补挂...', dbg_tag)
+                info('{} 🛡️ PATROL: 发现缺失订单，准备补挂...', dbg_tag)
             
             # place_limit_orders 内部会处理 _pos_change
             place_limit_orders(context, symbol, state)
@@ -1338,6 +1350,11 @@ def end_of_day(context):
     info('✅ 日终处理开始(14:56)...')
     after_initialize_cleanup(context)
     generate_html_report(context)
+    
+    # --- 【新增 PnL v3.2.14】保存 PnL 指标 ---
+    _save_pnl_metrics(context) 
+    # --- PnL 保存结束 ---
+
     for sym in context.symbol_list:
         if sym in context.state:
             safe_save_state(sym, context.state[sym])
@@ -1434,12 +1451,161 @@ def adjust_grid_unit(state):
             state['max_position'] = base_pos + new_u * 20
             info('🔧 [{}] 底仓增加，网格单位放大: {}->{}', state.get('symbol',''), orig, new_u)
 
+# ---------------- 【新增 PnL v3.2.14】PnL 指标加载函数 ----------------
+def _load_pnl_metrics(path: Path):
+    """从 state/pnl_metrics.json 加载持久化的收益指标"""
+    if not path.exists():
+        info('⚠️ 未找到 PnL 配置文件，将创建新的: {}', path)
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding='utf-8'))
+        if not isinstance(data, dict):
+            raise ValueError("PnL 配置文件格式错误，应为 dict")
+        return data
+    except Exception as e:
+        info('❌ 加载 PnL 配置文件失败: {}（将使用空数据启动）', e)
+        return {}
+
+# ---------------- 【新增 PnL v3.2.14】PnL 指标保存函数 ----------------
+def _save_pnl_metrics(context):
+    """在日终保存 PnL 指标到 state/pnl_metrics.json"""
+    if hasattr(context, 'pnl_metrics_path') and hasattr(context, 'pnl_metrics'):
+        try:
+            context.pnl_metrics_path.write_text(
+                json.dumps(context.pnl_metrics, indent=2), 
+                encoding='utf-8'
+            )
+            # info('✅ PnL 收益指标已保存') # (日终日志太多，可选)
+        except Exception as e:
+            info('❌ 保存 PnL 收益指标失败: {}', e)
+
+# ---------------- 【新增 PnL v3.2.14】日终 PnL 归因计算 (使用 get_deliver) ----------------
+def _update_realized_pnl_from_deliver(context):
+    """
+    【!!! 核心收益计算 !!!】
+    使用 get_deliver() 和 a_trade_details.csv 进行日终收益归因。
+    """
+    info('PnL: 开始日终收益归因计算 (基于 get_deliver)...')
+    
+    # 1. 加载 PnL 指标库 (如果不存在则创建)
+    pnl_metrics = getattr(context, 'pnl_metrics', {})
+
+    # 2. 加载“归因依据”：a_trade_details.csv
+    #    我们需要 (entrust_no) -> (base_position_at_trade) 的映射
+    attribution_map = {}
+    trade_log_path = research_path('reports', 'a_trade_details.csv')
+    if not trade_log_path.exists():
+        info('PnL: ⚠️ 未找到 a_trade_details.csv，无法进行收益归因。')
+        return
+
+    try:
+        with open(trade_log_path, 'r', encoding='utf-8') as f:
+            f.readline() # 跳过表头
+            for line in f:
+                parts = line.strip().split(',')
+                if len(parts) >= 7: # 确保行中有 entrust_no
+                    try:
+                        entrust_no = parts[6].strip()
+                        base_pos_at_trade = int(parts[5].strip())
+                        if entrust_no and entrust_no != 'N/A':
+                            attribution_map[entrust_no] = base_pos_at_trade
+                    except:
+                        continue # 跳过格式错误的行
+        info('PnL: 成功加载 {} 条交易归因记录。', len(attribution_map))
+    except Exception as e:
+        info('PnL: ❌ 加载 a_trade_details.csv 失败: {}', e)
+        return
+
+    # 3. 加载 PTRADE 官方交割单 (get_deliver)
+    try:
+        # PTRADE API: get_deliver() 返回一个 DataFrame
+        # 我们只获取当天的交割单，防止重复计算
+        today_str = datetime.now().strftime('%Y%m%d')
+        deliver_df = get_deliver(start_date=today_str, end_date=today_str)
+        
+        if deliver_df is None or deliver_df.empty:
+            info('PnL: get_deliver() 未返回当日交割单。')
+            return
+            
+        info('PnL: get_deliver() 成功获取 {} 条当日交割记录。', len(deliver_df))
+
+    except Exception as e:
+        info('PnL: ❌ 调用 get_deliver() 失败: {}', e)
+        return
+
+    # 4. 遍历交割单，进行 PnL 归因
+    new_pnl_count = 0
+    for _, row in deliver_df.iterrows():
+        try:
+            entrust_no = str(row['entrust_no']).strip()
+            symbol_std = convert_symbol_to_standard(row['stock_code'])
+            
+            # (1) 初始化标的 PnL 库
+            if symbol_std not in pnl_metrics:
+                pnl_metrics[symbol_std] = {'realized_grid_pnl': 0, 'realized_base_pnl': 0, 'total_realized_pnl': 0, '_processed_entrust': []}
+            
+            pnl_data = pnl_metrics[symbol_std]
+            
+            # (2) 检查是否已处理过这笔交割
+            if entrust_no in pnl_data.get('_processed_entrust', []):
+                continue # 跳过已处理的
+
+            # (3) 查找归因依据
+            base_pos_at_trade = attribution_map.get(entrust_no)
+            if base_pos_at_trade is None:
+                # info('PnL: ⚠️ 委托号 {} 在 .csv 中未找到归因，跳过...', entrust_no)
+                continue # 找不到归因（可能是旧版日志），无法计算
+
+            # (4) 获取净结算金额 (关键!)
+            # settle_amount: 卖出为正(收入), 买入为负(支出)
+            settle_amount = row['settle_amount'] 
+            trade_type = row['trade_type'] # 'B' or 'S'
+            trade_qty = row['trade_amount'] # 始终为正
+            
+            # (5) PnL 归因 (基于 `a_trade_details.csv` 的记录)
+            pos_now = get_position(symbol_std).amount
+            
+            is_grid_trade = False
+            if trade_type == 'S':
+                # 卖出永远是网格交易 (因为策略不卖底仓)
+                is_grid_trade = True
+            elif trade_type == 'B':
+                # 买入时，如果持仓 > 底仓，是网格回补
+                # 我们用 (pos_now - trade_qty) 作为买入前的持仓近似
+                if (pos_now - trade_qty) > base_pos_at_trade:
+                    is_grid_trade = True
+                else:
+                    is_grid_trade = False # 否则是底仓(VA)买入
+            
+            if is_grid_trade:
+                pnl_data['realized_grid_pnl'] += settle_amount
+                # info('PnL: 归因 [网格] {} 净额: {:.2f}', symbol_std, settle_amount)
+            else:
+                pnl_data['realized_base_pnl'] += settle_amount
+                # info('PnL: 归因 [底仓] {} 净额: {:.2f}', symbol_std, settle_amount)
+
+            pnl_data['total_realized_pnl'] = pnl_data['realized_grid_pnl'] + pnl_data['realized_base_pnl']
+            pnl_data.setdefault('_processed_entrust', []).append(entrust_no)
+            new_pnl_count += 1
+
+        except Exception as e:
+            info('PnL: ❌ 归因计算失败 (EntrustNO: {}): {}', entrust_no, e)
+
+    info('PnL: ✅ 日终收益归因完成，新处理 {} 笔交割单。', new_pnl_count)
+    context.pnl_metrics = pnl_metrics
+    _save_pnl_metrics(context) # 保存计算结果
+            
 # ---------------- 交易结束回调（平台触发） ----------------
 
 def after_trading_end(context, data):
     if '回测' in context.env:
         return
     info('⏰ 系统调用交易结束处理')
+    
+    # --- 【新增 PnL v3.2.14】调用 PnL 日终结算 ---
+    _update_realized_pnl_from_deliver(context)
+    # --- PnL 计算结束 ---
+    
     update_daily_reports(context, data)
     info('✅ 交易结束处理完成')
 
@@ -1581,16 +1747,26 @@ def update_daily_reports(context, data):
             f.write(",".join(map(str, row)) + "\n")
         info('✅ [{}] 已更新每日CSV报表：{}', dsym(context, symbol), report_file)
 
-# ---------------- 成交明细日志 ----------------
+# ---------------- 【!!! 升级 v3.2.14 !!!】成交明细日志 ----------------
 
 def log_trade_details(context, symbol, trade):
+    """
+    【!!! 升级 v3.2.14 !!!】
+    为了支持 get_deliver 归因，必须增加 entrust_no 作为主键。
+    """
     try:
         trade_log_path = research_path('reports', 'a_trade_details.csv')
         is_new = not trade_log_path.exists()
+        
+        # 【新增】从 trade 字典中获取 entrust_no
+        entrust_no = trade.get('entrust_no', 'N/A') 
+        
         with open(trade_log_path, 'a', encoding='utf-8', newline='') as f:
             if is_new:
-                headers = ["time", "symbol", "direction", "quantity", "price", "base_position_at_trade"]
+                # 【新增】在表头增加 entrust_no
+                headers = ["time", "symbol", "direction", "quantity", "price", "base_position_at_trade", "entrust_no"]
                 f.write(",".join(headers) + "\n")
+                
             direction = "BUY" if trade['entrust_bs'] == '1' else "SELL"
             base_position = context.state[symbol].get('base_position', 0)
             row = [
@@ -1599,18 +1775,28 @@ def log_trade_details(context, symbol, trade):
                 direction,
                 str(trade['business_amount']),
                 f"{trade['business_price']:.3f}",
-                str(base_position)
+                str(base_position),
+                entrust_no # 【新增】在行尾增加 entrust_no
             ]
             f.write(",".join(row) + "\n")
     except Exception as e:
         info('❌ [{}] 记录交易日志失败: {}', dsym(context, symbol), e)
 
-# ---------------- HTML 看板 ----------------
+# ---------------- 【!!! 升级 v3.2.14 !!!】HTML 看板 ----------------
 
 def generate_html_report(context):
     all_metrics = []
     total_market_value = 0
     total_unrealized_pnl = 0
+    
+    # --- 【新增】PnL 指标汇总 ---
+    total_realized_grid_pnl = 0
+    total_realized_base_pnl = 0
+    total_realized_pnl = 0
+    # 【!!!】从 context.pnl_metrics (内存) 中读取，而不是在看板中计算
+    pnl_metrics = getattr(context, 'pnl_metrics', {})
+    # --- PnL 汇总结束 ---
+
     for symbol in context.symbol_list:
         if symbol not in context.state:
             continue
@@ -1634,9 +1820,26 @@ def generate_html_report(context):
         unrealized_pnl = (price - position.cost_basis) * pos if position.cost_basis > 0 else 0
         total_market_value += market_value
         total_unrealized_pnl += unrealized_pnl
+        
         atr_pct = calculate_atr(context, symbol)
         name_price = f"{price:.3f}" + (" (停牌)" if halted else "")
         disp_name = dsym(context, symbol, style='long')
+        
+        # --- 【新增】读取标的的 PnL 指标 ---
+        sym_pnl = pnl_metrics.get(symbol, {})
+        realized_grid_pnl = sym_pnl.get('realized_grid_pnl', 0)
+        realized_base_pnl = sym_pnl.get('realized_base_pnl', 0)
+        total_realized_sym_pnl = sym_pnl.get('total_realized_pnl', 0)
+        
+        # 计算总收益（已实现 + 未实现）
+        total_sym_pnl = total_realized_sym_pnl + unrealized_pnl
+        
+        # 累加到账户总和
+        total_realized_grid_pnl += realized_grid_pnl
+        total_realized_base_pnl += realized_base_pnl
+        total_realized_pnl += total_realized_sym_pnl
+        # --- PnL 读取结束 ---
+        
         all_metrics.append({
             "symbol": symbol,
             "symbol_disp": disp_name,
@@ -1644,41 +1847,51 @@ def generate_html_report(context):
             "cost_basis": f"{position.cost_basis:.3f}",
             "price": name_price,
             "market_value": f"{market_value:,.2f}",
+            # --- 【新增】收益指标 ---
             "unrealized_pnl": f"{unrealized_pnl:,.2f}",
+            "realized_grid_pnl": f"{realized_grid_pnl:,.2f}",
+            "realized_base_pnl": f"{realized_base_pnl:,.2f}",
+            "total_realized_pnl": f"{total_realized_sym_pnl:,.2f}",
+            "total_pnl": f"{total_sym_pnl:,.2f}",
+            # ---
             "pnl_ratio": f"{(unrealized_pnl / (position.cost_basis * pos) * 100) if position.cost_basis * pos != 0 else 0:.2f}%",
             "base_position": state['base_position'],
             "grid_unit": state['grid_unit'],
             "grid_spacing": f"{state['buy_grid_spacing']:.2%} / {state['sell_grid_spacing']:.2%}",
             "atr_str": f"{atr_pct:.2%}" if atr_pct is not None else "N/A"
         })
+        
+    # --- 【新增】计算账户总收益 ---
+    account_total_pnl = total_realized_pnl + total_unrealized_pnl
+    
     html_template = """
     <!DOCTYPE html>
     <html lang="zh-CN">
     <head>
         <meta charset="UTF-8">
-        <title>策略运行看板</title>
+        <title>策略运行看板 (v3.2.14-PnL-Deliver)</title>
         <style>
             body {{
                 font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
                 background-color: #121212;
                 color: #e0e0e0;
                 margin: 0;
-                padding: 20px;
+                padding: 16px;
             }}
-            .container {{ max-width: 1400px; margin: auto; }}
+            .container {{ max-width: 1600px; margin: auto; }}
             h1, h2 {{ text-align: center; color: #ffffff; border-bottom: 2px solid #333; padding-bottom: 10px; margin-top: 20px; }}
             h1 {{ margin-top: 0; }}
             .update-time {{ text-align: center; color: #888; margin-top: -10px; margin-bottom: 20px; }}
-            .summary-cards {{ display: flex; gap: 20px; justify-content: center; margin-bottom: 30px; }}
-            .card {{ background-color: #1e1e1e; padding: 20px; border-radius: 8px; text-align: center; border: 1px solid #333; min-width: 250px; }}
-            .card h3 {{ margin: 0 0 10px 0; color: #aaa; font-weight: normal; text-transform: uppercase; font-size: 1em; }}
-            .card .value {{ font-size: 2em; font-weight: bold; }}
-            .data-table {{ width: 100%; border-collapse: collapse; background-color: #1e1e1e; box-shadow: 0 2px 5px rgba(0,0,0,0.3); }}
-            .data-table th, .data-table td {{ border: 1px solid #333; padding: 12px 15px; text-align: right; }}
+            .summary-cards {{ display: flex; flex-wrap: wrap; gap: 16px; justify-content: center; margin-bottom: 30px; }}
+            .card {{ background-color: #1e1e1e; padding: 16px 20px; border-radius: 8px; text-align: center; border: 1px solid #333; min-width: 200px; }}
+            .card h3 {{ margin: 0 0 10px 0; color: #aaa; font-weight: normal; text-transform: uppercase; font-size: 0.9em; }}
+            .card .value {{ font-size: 1.8em; font-weight: bold; }}
+            .data-table {{ width: 100%; border-collapse: collapse; background-color: #1e1e1e; box-shadow: 0 2px 5px rgba(0,0,0,0.3); font-size: 0.9em; }}
+            .data-table th, .data-table td {{ border: 1px solid #333; padding: 10px 12px; text-align: right; }}
             .data-table th {{ background-color: #2a2a2a; color: #ffffff; font-weight: bold; }}
             .data-table tbody tr:nth-child(even) {{ background-color: #242424; }}
             .data-table tbody tr:hover {{ background-color: #383838; }}
-            .data-table td:first-child {{ text-align: left; font-weight: bold; }}
+            .data-table td:first-child {{ text-align: left; font-weight: bold; white-space: nowrap; }}
             .positive {{ color: #4caf50; }}
             .negative {{ color: #f44336; }}
             .footer {{ text-align: center; margin-top: 20px; color: #888; font-size: 12px; }}
@@ -1689,6 +1902,7 @@ def generate_html_report(context):
         <div class="container">
             <h1>策略运行看板</h1>
             <p class="update-time">最后更新时间: {update_time}</p>
+            
             <div class="summary-cards">
                 <div class="card">
                     <h3>总市值</h3>
@@ -1696,9 +1910,26 @@ def generate_html_report(context):
                 </div>
                 <div class="card">
                     <h3>总浮动盈亏</h3>
-                    <p class="value {pnl_class}">{total_unrealized_pnl}</p>
+                    <p class="value {unrealized_pnl_class}">{total_unrealized_pnl}</p>
+                </div>
+                <div class="card">
+                    <h3>总已实现盈亏</h3>
+                    <p class="value {realized_pnl_class}">{total_realized_pnl}</p>
+                </div>
+                <div class="card">
+                    <h3>账户总收益</h3>
+                    <p class="value {total_pnl_class}">{account_total_pnl}</p>
+                </div>
+                <div class="card">
+                    <h3>已实现(网格)</h3>
+                    <p class="value {grid_pnl_class}">{total_realized_grid_pnl}</p>
+                </div>
+                <div class="card">
+                    <h3>已实现(底仓)</h3>
+                    <p class="value {base_pnl_class}">{total_realized_base_pnl}</p>
                 </div>
             </div>
+            
             <table class="data-table">
                 <thead>
                     <tr>
@@ -1708,7 +1939,11 @@ def generate_html_report(context):
                         <th>市价</th>
                         <th>市值</th>
                         <th>浮动盈亏</th>
-                        <th>盈亏率</th>
+                        <th>浮动盈亏率</th>
+                        <th>已实现(网格)</th>
+                        <th>已实现(底仓)</th>
+                        <th>总已实现</th>
+                        <th>总收益</th>
                         <th>目标底仓</th>
                         <th>网格单位</th>
                         <th>买/卖间距</th>
@@ -1720,9 +1955,9 @@ def generate_html_report(context):
                 </tbody>
             </table>
 
-            <h2>业绩归因分析</h2>
+            <h2>业绩归因分析 (v3.2.14-PnL-Deliver)</h2>
             <div class="placeholder">
-                数据采集中... 未来版本将在此处展示详细的盈亏归因分析。
+                “资金回报率” (TWRR/MWRR) 需结合 `get_fundjour()` (历史资金流水) 进行计算，暂未实现。
             </div>
 
             <p class="footer">看板由策略每5分钟更新一次。请在PTRADE中手动刷新查看。</p>
@@ -1730,13 +1965,29 @@ def generate_html_report(context):
     </body>
     </html>
     """
+    
     table_rows = ""
     for m in all_metrics:
-        try:
-            pnl_val = float(m["unrealized_pnl"].replace(",", ""))
-        except Exception:
-            pnl_val = 0.0
+        try: pnl_val = float(m["unrealized_pnl"].replace(",", ""))
+        except Exception: pnl_val = 0.0
         pnl_class = "positive" if pnl_val >= 0 else "negative"
+        
+        try: total_pnl_val = float(m["total_pnl"].replace(",", ""))
+        except Exception: total_pnl_val = 0.0
+        total_pnl_class = "positive" if total_pnl_val >= 0 else "negative"
+        
+        try: grid_pnl_val = float(m["realized_grid_pnl"].replace(",", ""))
+        except Exception: grid_pnl_val = 0.0
+        grid_pnl_class = "positive" if grid_pnl_val > 0 else ("negative" if grid_pnl_val < 0 else "")
+
+        try: base_pnl_val = float(m["realized_base_pnl"].replace(",", ""))
+        except Exception: base_pnl_val = 0.0
+        base_pnl_class = "positive" if base_pnl_val > 0 else ("negative" if base_pnl_val < 0 else "")
+        
+        try: total_realized_val = float(m["total_realized_pnl"].replace(",", ""))
+        except Exception: total_realized_val = 0.0
+        total_realized_class = "positive" if total_realized_val > 0 else ("negative" if total_realized_val < 0 else "")
+
         table_rows += f"""
         <tr>
             <td>{m['symbol_disp']}</td>
@@ -1746,17 +1997,32 @@ def generate_html_report(context):
             <td>{m['market_value']}</td>
             <td class="{pnl_class}">{m['unrealized_pnl']}</td>
             <td class="{pnl_class}">{m['pnl_ratio']}</td>
+            <td class="{grid_pnl_class}">{m['realized_grid_pnl']}</td>
+            <td class="{base_pnl_class}">{m['realized_base_pnl']}</td>
+            <td class="{total_realized_class}">{m['total_realized_pnl']}</td>
+            <td class="{total_pnl_class}">{m['total_pnl']}</td>
             <td>{m['base_position']}</td>
             <td>{m['grid_unit']}</td>
             <td>{m['grid_spacing']}</td>
             <td>{m['atr_str']}</td>
         </tr>
         """
+        
     final_html = html_template.format(
         update_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         total_market_value=f"{total_market_value:,.2f}",
         total_unrealized_pnl=f"{total_unrealized_pnl:,.2f}",
-        pnl_class="positive" if total_unrealized_pnl >= 0 else "negative",
+        unrealized_pnl_class="positive" if total_unrealized_pnl >= 0 else "negative",
+        # --- 【新增】卡片数据 ---
+        total_realized_pnl=f"{total_realized_pnl:,.2f}",
+        realized_pnl_class="positive" if total_realized_pnl >= 0 else "negative",
+        account_total_pnl=f"{account_total_pnl:,.2f}",
+        total_pnl_class="positive" if account_total_pnl >= 0 else "negative",
+        total_realized_grid_pnl=f"{total_realized_grid_pnl:,.2f}",
+        grid_pnl_class="positive" if total_realized_grid_pnl > 0 else ("negative" if total_realized_grid_pnl < 0 else ""),
+        total_realized_base_pnl=f"{total_realized_base_pnl:,.2f}",
+        base_pnl_class="positive" if total_realized_base_pnl > 0 else ("negative" if total_realized_base_pnl < 0 else ""),
+        # ---
         table_rows=table_rows
     )
     try:
