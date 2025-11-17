@@ -1,12 +1,12 @@
 # event_driven_grid_strategy.py
-# 版本号：GEMINI-3.2.15-VA-FIX
-# 相对 3.2.14 的新增/修改要点：
-# - 【PnL 看板】: 严格遵照用户要求，不修改任何核心交易逻辑。
-# - 【PnL 归因】: (均保留)
-# - 【修复 VA 逻辑】:
-#     - 1. (来自 3.2.14) 保留“实时、双向、节流”的VA调仓逻辑。
-#     - 2. (核心修复 3.2.15) 将 VA 调仓步长从 grid_unit 修正为 100 股，
-#          解决了“超调”导致的“振荡锁死”问题。
+# 版本号：GEMINI-3.2.16-Deliver-FIX
+# 相对 3.2.15 的新增/修改要点：
+# - 【PnL 归因修复】:
+#     - 修复了 _update_realized_pnl_from_deliver 函数中的一个崩溃Bug。
+#     - Bug原因: 当 get_deliver() 返回空列表 '[]' (当天无交割) 时，
+#       代码尝试访问 .empty 属性 (DataFrame才有) 导致崩溃。
+#     - 修复方案: 增加对 'isinstance(deliver_df, list)' 的检查。
+# - 【VA 逻辑】: (保留 3.2.15 的 VA-FIX)
 
 import json
 import logging
@@ -23,7 +23,7 @@ from types import SimpleNamespace
 LOG_FH = None
 LOG_DATE = None
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'GEMINI-3.2.15-VA-FIX' # <-- 版本号升级
+__version__ = 'GEMINI-3.2.16-Deliver-FIX' # <-- 版本号升级
 TRANSACTION_COST = 0.00005
 
 # ---- 调试默认（可被 config/debug.json / strategy.json 覆盖）----
@@ -1499,7 +1499,7 @@ def _save_pnl_metrics(context):
         except Exception as e:
             info('❌ 保存 PnL 收益指标失败: {}', e)
 
-# ---------------- 【新增 PnL v3.2.14】日终 PnL 归因计算 (使用 get_deliver) ----------------
+# ---------------- 【!!! 修复 v3.2.16 !!!】日终 PnL 归因计算 ----------------
 def _update_realized_pnl_from_deliver(context):
     """
     【!!! 核心收益计算 !!!】
@@ -1543,17 +1543,36 @@ def _update_realized_pnl_from_deliver(context):
         today_str = datetime.now().strftime('%Y%m%d')
         deliver_df = get_deliver(start_date=today_str, end_date=today_str)
         
-        if deliver_df is None or deliver_df.empty:
-            info('PnL: get_deliver() 未返回当日交割单。')
+        # --- 【!!! 核心修复 v3.2.16 (Deliver-FIX) !!!】 ---
+        # PTRADE 的 get_deliver() 在没有数据时可能返回 list '[]' 而不是 DataFrame
+        # 必须同时检查 'is None', 'DataFrame.empty', 和 'isinstance(list) and not list'
+        
+        is_empty = False
+        if deliver_df is None:
+            is_empty = True
+        elif isinstance(deliver_df, list):
+            if not deliver_df: # Check if list is empty
+                is_empty = True
+        elif hasattr(deliver_df, 'empty'): # Check if it's a DataFrame
+            if deliver_df.empty:
+                is_empty = True
+        else:
+            # Handle other unexpected types, like an empty list that wasn't caught
+            if not deliver_df:
+                is_empty = True
+
+        if is_empty:
+            info('PnL: get_deliver() 未返回当日交割单 (返回了 None, empty list, or empty DataFrame)。')
             return
-            
+        # --- 【!!! 修复结束 !!!】 ---
+
         info('PnL: get_deliver() 成功获取 {} 条当日交割记录。', len(deliver_df))
 
     except Exception as e:
         info('PnL: ❌ 调用 get_deliver() 失败: {}', e)
         return
 
-    # 4. 遍历交割单，进行 PnL 归因
+    # 4. 遍历交割单 (此时 deliver_df 必为非空 DataFrame)，进行 PnL 归因
     new_pnl_count = 0
     for _, row in deliver_df.iterrows():
         try:
@@ -1889,7 +1908,7 @@ def generate_html_report(context):
     <html lang="zh-CN">
     <head>
         <meta charset="UTF-8">
-        <title>策略运行看板 (v3.2.15-VA-FIX)</title>
+        <title>策略运行看板 (v3.2.16-Deliver-FIX)</title>
         <style>
             body {{
                 font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
@@ -1920,7 +1939,7 @@ def generate_html_report(context):
     </head>
     <body>
         <div class="container">
-            <h1>策略运行看板 (VA-FIX)</h1>
+            <h1>策略运行看板 (Deliver-FIX)</h1>
             <p class="update-time">最后更新时间: {update_time}</p>
             
             <div class="summary-cards">
