@@ -1,10 +1,10 @@
 # event_driven_grid_strategy.py
-# 版本号：GEMINI-3.2.17-Deliver-Range
-# 相对 3.2.16 的新增/修改要点：
-# - 【PnL 归因修复】:
-#     - 将 get_deliver() 的查询范围扩大到过去 10 天，解决 T 日清算延迟导致当日查不到数据的问题。
-#     - 引入 _processed_entrust 防止重复计算。
-#     - 修正收益计算公式：仅在卖出时计算 (卖价-成本)*数量，不再直接累加 settle_amount。
+# 版本号：GEMINI-3.2.18-Deliver-List-Fix
+# 相对 3.2.17 的新增/修改要点：
+# - 【Crash Fix】:
+#     - 修复了 get_deliver() 返回 list 类型导致策略崩溃的问题。
+#     - 强制将接口返回的数据转换为 DataFrame 格式。
+#     - 为 after_trading_end 增加异常隔离，防止 PnL 计算失败阻断日报表生成。
 
 import json
 import logging
@@ -21,7 +21,7 @@ from types import SimpleNamespace
 LOG_FH = None
 LOG_DATE = None
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'GEMINI-3.2.17-Deliver-Range' # <-- 版本号升级
+__version__ = 'GEMINI-3.2.18-Deliver-List-Fix' # <-- 版本号升级
 TRANSACTION_COST = 0.00005
 
 # ---- 调试默认（可被 config/debug.json / strategy.json 覆盖）----
@@ -1315,12 +1315,12 @@ def _save_pnl_metrics(context):
         except Exception as e:
             info('❌ 保存 PnL 收益指标失败: {}', e)
 
-# ---------------- 【!!! 修复 v3.2.17 (Deliver-Range) !!!】日终 PnL 归因计算 ----------------
+# ---------------- 【!!! 修复 v3.2.18 (Deliver-List-Fix) !!!】日终 PnL 归因计算 ----------------
 def _update_realized_pnl_from_deliver(context):
     """
-    【!!! 核心收益计算 !!!】
-    使用 get_deliver() 和 a_trade_details.csv 进行日终收益归因。
-    修复：查询范围扩大至过去10天，以解决 T 日 15:30 尚未生成交割单的问题。
+    【!!! 核心收益计算 (Fix v3.2.18) !!!】
+    修复：兼容 get_deliver 返回 list 类型的情况，强制转换为 DataFrame，防止崩溃。
+    修复：兼容 v3.2.17 的回溯范围逻辑。
     """
     info('PnL: 开始日终收益归因计算 (基于 get_deliver)...')
     
@@ -1357,19 +1357,23 @@ def _update_realized_pnl_from_deliver(context):
         s_str = start_dt.strftime('%Y%m%d')
         e_str = end_dt.strftime('%Y%m%d')
         
-        deliver_df = get_deliver(start_date=s_str, end_date=e_str)
+        deliver_data = get_deliver(start_date=s_str, end_date=e_str)
         
-        is_empty = False
-        if deliver_df is None: is_empty = True
-        elif isinstance(deliver_df, list):
-            if not deliver_df: is_empty = True
-        elif hasattr(deliver_df, 'empty'): 
-            if deliver_df.empty: is_empty = True
-        else:
-            if not deliver_df: is_empty = True
+        import pandas as pd  # 引入 pandas
 
-        if is_empty:
-            info('PnL: get_deliver(start={}, end={}) 未返回数据 (可能是T日清算未完成，将在明日自动补录)。', s_str, e_str)
+        # --- 【修复核心 v3.2.18】数据标准化 ---
+        deliver_df = None
+        if deliver_data is None:
+            pass
+        elif isinstance(deliver_data, list):
+            if deliver_data: # 非空列表
+                deliver_df = pd.DataFrame(deliver_data)
+        elif hasattr(deliver_data, 'empty'): 
+            if not deliver_data.empty:
+                deliver_df = deliver_data
+        
+        if deliver_df is None or deliver_df.empty:
+            info('PnL: get_deliver(start={}, end={}) 未返回有效数据 (可能是T日清算未完成，将在明日自动补录)。', s_str, e_str)
             return
 
         info('PnL: get_deliver() 成功获取 {} 条交割记录 (范围: {}-{})。', len(deliver_df), s_str, e_str)
@@ -1381,10 +1385,16 @@ def _update_realized_pnl_from_deliver(context):
     new_pnl_count = 0
     skipped_count = 0
     
+    # 现在 deliver_df 必然是 DataFrame，iterrows() 安全了
     for _, row in deliver_df.iterrows():
+        entrust_no = "N/A"
         try:
-            entrust_no = str(row['entrust_no']).strip()
-            symbol_std = convert_symbol_to_standard(row['stock_code'])
+            # 兼容不同格式，确保取出 entrust_no
+            entrust_no = str(row.get('entrust_no', '')).strip()
+            stock_code = row.get('stock_code')
+            if not stock_code: continue
+
+            symbol_std = convert_symbol_to_standard(stock_code)
             
             if symbol_std not in pnl_metrics:
                 pnl_metrics[symbol_std] = {'realized_grid_pnl': 0, 'realized_base_pnl': 0, 'total_realized_pnl': 0, '_processed_entrust': []}
@@ -1399,21 +1409,20 @@ def _update_realized_pnl_from_deliver(context):
             if base_pos_at_trade is None:
                 continue 
 
-            trade_type = row['trade_type'] 
+            trade_type = row.get('trade_type') 
+            trade_amount = float(row.get('trade_amount', 0))
+            business_price = float(row.get('business_price', 0))
             
-            is_grid_trade = False
-            if trade_type == 'S':
-                is_grid_trade = True
-            elif trade_type == 'B':
-                is_grid_trade = True 
+            is_grid_trade = True # 默认为网格
             
             pnl_contribution = 0
+            # 仅卖出计算已实现收益
             if trade_type == 'S':
                 pos_obj = get_position(symbol_std)
                 cost = pos_obj.cost_basis
-                if cost <= 0: cost = row['business_price'] * 0.99 
+                if cost <= 0: cost = business_price * 0.99 
                 
-                profit = (row['business_price'] - cost) * row['trade_amount']
+                profit = (business_price - cost) * trade_amount
                 pnl_contribution = profit
                 
                 if is_grid_trade:
@@ -1426,7 +1435,7 @@ def _update_realized_pnl_from_deliver(context):
             new_pnl_count += 1
 
         except Exception as e:
-            info('PnL: ❌ 归因计算失败 (EntrustNO: {}): {}', entrust_no, e)
+            info('PnL: ❌ 归因计算单行失败 (EntrustNO: {}): {}', entrust_no, e)
 
     info('PnL: ✅ 日终收益归因完成，新处理 {} 笔交割单 (跳过 {} 笔旧单)。', new_pnl_count, skipped_count)
     context.pnl_metrics = pnl_metrics
@@ -1438,8 +1447,19 @@ def after_trading_end(context, data):
     if '回测' in context.env:
         return
     info('⏰ 系统调用交易结束处理')
-    _update_realized_pnl_from_deliver(context)
-    update_daily_reports(context, data)
+    
+    # 1. 尝试更新 PnL (带保护)
+    try:
+        _update_realized_pnl_from_deliver(context)
+    except Exception as e:
+        info('❌ PnL 更新流程发生未捕获异常: {} (不影响日报表生成)', e)
+    
+    # 2. 必须执行的日报表更新
+    try:
+        update_daily_reports(context, data)
+    except Exception as e:
+        info('❌ 日报表生成失败: {}', e)
+        
     info('✅ 交易结束处理完成')
 
 # ---------------- 配置热重载 ----------------
@@ -1670,7 +1690,7 @@ def generate_html_report(context):
     <html lang="zh-CN">
     <head>
         <meta charset="UTF-8">
-        <title>策略运行看板 (v3.2.17-Deliver-Range)</title>
+        <title>策略运行看板 (v3.2.18-Deliver-List-Fix)</title>
         <style>
             body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; background-color: #121212; color: #e0e0e0; margin: 0; padding: 16px; }}
             .container {{ max-width: 1600px; margin: auto; }}
