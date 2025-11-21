@@ -1,10 +1,10 @@
 # event_driven_grid_strategy.py
-# 版本号：GEMINI-3.2.18-Deliver-List-Fix
-# 相对 3.2.17 的新增/修改要点：
-# - 【Crash Fix】:
-#     - 修复了 get_deliver() 返回 list 类型导致策略崩溃的问题。
-#     - 强制将接口返回的数据转换为 DataFrame 格式。
-#     - 为 after_trading_end 增加异常隔离，防止 PnL 计算失败阻断日报表生成。
+# 版本号：GEMINI-3.2.19-Dup-Fix
+# 相对 3.2.18 的新增/修改要点：
+# - 【重复挂单修复】:
+#     - 废弃 state['_rehang_bypass_once'] 标志位，解决 handle_data 与 on_order_filled 的竞态冲突。
+#     - place_limit_orders 增加 ignore_cooldown 参数。
+#     - handle_data 默认为 False（避让冷却期），on_order_filled/patrol 显式传 True（强制挂单）。
 
 import json
 import logging
@@ -21,7 +21,7 @@ from types import SimpleNamespace
 LOG_FH = None
 LOG_DATE = None
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'GEMINI-3.2.18-Deliver-List-Fix' # <-- 版本号升级
+__version__ = 'GEMINI-3.2.19-Dup-Fix' # <-- 版本号升级
 TRANSACTION_COST = 0.00005
 
 # ---- 调试默认（可被 config/debug.json / strategy.json 覆盖）----
@@ -429,6 +429,9 @@ def initialize(context):
             st.pop('_pos_change')
         if '_last_pos_seen' in st:
             st.pop('_last_pos_seen')
+        # 【修复】清理废弃的 flag
+        if '_rehang_bypass_once' in st:
+            st.pop('_rehang_bypass_once')
 
     context.boot_dt = getattr(context, 'current_dt', None) or datetime.now()
     context.boot_grace_seconds = int(get_saved_param('boot_grace_seconds', 180))
@@ -548,7 +551,8 @@ def place_auction_orders(context):
         adjust_grid_unit(state)
         cancel_all_orders_by_symbol(context, sym)
         context.latest_data[sym] = state['base_price']
-        place_limit_orders(context, sym, state)
+        # 集合竞价强制挂单，忽略冷却
+        place_limit_orders(context, sym, state, ignore_cooldown=True)
         safe_save_state(sym, state)
 
 # ---------------- 实时价：快照获取 + 心跳日志 ----------------
@@ -655,12 +659,18 @@ def _in_reopen_window(now_t: dtime):
 
 # ---------------- 网格限价挂单主逻辑 ----------------
 
-def place_limit_orders(context, symbol, state):
+def place_limit_orders(context, symbol, state, ignore_cooldown=False):
+    """
+    执行限价挂单。
+    :param ignore_cooldown: 如果为 True，则忽略 60s 交易冷却期（用于成交后立即补单或巡检修正）。
+                            如果为 False（默认，如 handle_data 调用），则严格遵守冷却期。
+    """
     now_dt = context.current_dt
     dbg_tag = f"[{dsym(context, symbol)}]"
 
-    rehang_bypass = bool(state.get('_rehang_bypass_once'))
-    if (not rehang_bypass) and state.get('_last_trade_ts') \
+    # 【修复 v3.2.19】: 使用 ignore_cooldown 参数替代 state['_rehang_bypass_once']
+    # 确保 handle_data 不会意外消耗或响应此逻辑
+    if (not ignore_cooldown) and state.get('_last_trade_ts') \
       and (now_dt - state['_last_trade_ts']).total_seconds() < 60:
         return
 
@@ -717,12 +727,15 @@ def place_limit_orders(context, symbol, state):
                 cancel_all_orders_by_symbol(context, symbol)
                 buy_p, sell_p = round(buy_p_curr * (1 - buy_sp), 3), round(buy_p_curr * (1 + sell_sp), 3)
 
-    last_ts = state.get('_last_order_ts')
-    if (not rehang_bypass) and last_ts and (now_dt - last_ts).seconds < 30:
-        return
-    last_bp = state.get('_last_order_bp')
-    if (not rehang_bypass) and last_bp and abs(base / last_bp - 1) < buy_sp / 2:
-        return
+    # 节流逻辑：如果是强制补单(ignore_cooldown=True)，则跳过节流
+    if not ignore_cooldown:
+        last_ts = state.get('_last_order_ts')
+        if last_ts and (now_dt - last_ts).seconds < 30:
+            return
+        last_bp = state.get('_last_order_bp')
+        if last_bp and abs(base / last_bp - 1) < buy_sp / 2:
+            return
+    
     state['_last_order_ts'], state['_last_order_bp'] = now_dt, base
 
     try:
@@ -762,6 +775,7 @@ def place_limit_orders(context, symbol, state):
     except Exception as e:
         info('[{}] ⚠️ 限价挂单异常：{}', dsym(context, symbol), e)
     finally:
+        # 清理旧的flag，防止残留
         state.pop('_rehang_bypass_once', None)
         safe_save_state(symbol, state)
 
@@ -832,15 +846,17 @@ def on_order_filled(context, symbol, order):
     context.latest_data[symbol] = order.price
     context.last_valid_ts[symbol] = context.current_dt
 
-    state['_rehang_bypass_once'] = True
+    # 【修复 v3.2.19】: 废弃 _rehang_bypass_once，只做标记，不依赖它进行逻辑控制
+    # state['_rehang_bypass_once'] = True # 移除
     state.pop('_last_order_ts', None)
     state.pop('_last_order_bp', None)
 
     if is_order_blocking_period():
         info('[{}] 处于9:25-9:30挂单冻结期，成交后仅更新状态，推迟挂单至9:30后。', dsym(context, symbol))
     elif context.current_dt.time() < dtime(14, 56):
-        info('[{}] ▶ FILL->REHANG base_price={:.3f} rehang_bypass_once={} now={}', dsym(context, symbol), state['base_price'], state.get('_rehang_bypass_once'), context.current_dt.time())
-        place_limit_orders(context, symbol, state)
+        info('[{}] ▶ FILL->REHANG base_price={:.3f} (ignore_cooldown=True) now={}', dsym(context, symbol), state['base_price'], context.current_dt.time())
+        # 【修复 v3.2.19】: 显式传递 ignore_cooldown=True
+        place_limit_orders(context, symbol, state, ignore_cooldown=True)
 
     context.should_place_order_map[symbol] = True
     
@@ -970,6 +986,7 @@ def patrol_and_correct_orders(context, symbol, state):
     now_dt = context.current_dt
     dbg_tag = f"[{dsym(context, symbol)}]"
 
+    # 巡检也应回避成交冷静期，避免冲突
     if state.get('_last_trade_ts') and (now_dt - state['_last_trade_ts']).total_seconds() < 58:
         return
 
@@ -1036,18 +1053,19 @@ def patrol_and_correct_orders(context, symbol, state):
                     info('{} ⚠️ PATROL 撤单 #{] 失败: {}', dbg_tag, entrust_no, e)
             state.pop('_last_order_ts', None)
             state.pop('_last_order_bp', None)
-            state['_rehang_bypass_once'] = True 
+            # 【修复 v3.2.19】: 巡检修正时强制挂单，传递 ignore_cooldown=True
+            place_limit_orders(context, symbol, state, ignore_cooldown=True)
+            return # 已处理
 
         if (should_have_buy_order and not has_correct_buy_order) or \
            (should_have_sell_order and not has_correct_sell_order):
             
             if orders_to_cancel:
-                info('{} 🕵️ PATROL: 撤单完成，准备补挂缺失订单...', dbg_tag)
-                time.sleep(float(getattr(context, 'delay_after_cancel_seconds', 1.0)))
+                pass # 上面已经处理过
             else:
                 info('{} 🕵️ PATROL: 发现缺失订单，准备补挂...', dbg_tag)
-            
-            place_limit_orders(context, symbol, state)
+                # 【修复 v3.2.19】: 补挂缺失订单时强制执行
+                place_limit_orders(context, symbol, state, ignore_cooldown=True)
 
     except Exception as e:
         info('{} ⚠️ PATROL 巡检失败: {}', dbg_tag, e)
@@ -1110,7 +1128,9 @@ def handle_data(context, data):
     if is_auction_time() or (is_main_trading_time() and now < dtime(14, 56)):
         for sym in context.symbol_list:
             if sym in context.state:
-                place_limit_orders(context, sym, context.state[sym])
+                # 【修复 v3.2.19】: 默认调用 ignore_cooldown=False
+                # 这样如果 handle_data 在成交后 60s 内运行，它会自己避让，不会重复挂单
+                place_limit_orders(context, sym, context.state[sym], ignore_cooldown=False)
 
     for sym in context.symbol_list:
         st = context.state.get(sym)
@@ -1690,7 +1710,7 @@ def generate_html_report(context):
     <html lang="zh-CN">
     <head>
         <meta charset="UTF-8">
-        <title>策略运行看板 (v3.2.18-Deliver-List-Fix)</title>
+        <title>策略运行看板 (v3.2.19-Dup-Fix)</title>
         <style>
             body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; background-color: #121212; color: #e0e0e0; margin: 0; padding: 16px; }}
             .container {{ max-width: 1600px; margin: auto; }}
