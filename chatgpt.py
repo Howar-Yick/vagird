@@ -1,9 +1,10 @@
 # event_driven_grid_strategy.py
-# 版本号：GEMINI-3.2.26-Dup-Patrol-Fix
-# 相对 3.2.25 的新增/修改要点：
-# - 【重复下单修复】:
-#     - 修复了在每 30 分钟巡检时刻，常规挂单逻辑与巡检逻辑同时触发导致的双重下单问题。
-#     - 逻辑变更：当 is_patrol_time 为真时，handle_data 不再执行常规 place_limit_orders，完全由巡检逻辑接管。
+# 版本号：GEMINI-3.2.28-PnL-Calc-Fix
+# 相对 3.2.27 的新增/修改要点：
+# - 【PnL 核心修复】:
+#     - 增加“价格反推”逻辑：如果交割单没有 price 字段，使用 business_balance / business_amount 计算。
+#     - 优化 DEBUG 日志：不再打印首行（可能是货币基金），而是打印第一条匹配策略标的（如 ETF）的数据，以便精准排查字段。
+#     - 增强字段兼容：增加对 business_balance, money 等金额字段的识别。
 
 import json
 import logging
@@ -16,11 +17,13 @@ from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
+import pandas as pd  # 显式导入 pandas 以防万一
+
 # ---------------- 全局句柄与常量 ----------------
 LOG_FH = None
 LOG_DATE = None
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'GEMINI-3.2.26-Dup-Patrol-Fix' # <-- 版本号升级
+__version__ = 'GEMINI-3.2.28-PnL-Calc-Fix' # <-- 版本号升级
 TRANSACTION_COST = 0.00005
 
 # ---- 调试默认（可被 config/debug.json / strategy.json 覆盖）----
@@ -63,7 +66,7 @@ def _ensure_daily_logfile():
         LOG_FH = open(log_path, 'a', encoding='utf-8')
         LOG_DATE = today_str
         try:
-            log.info(f'🔍 日志切换到 {log_path}')
+            log.info(f'📝 日志切换到 {log_path}')
         except:
             pass
         return log_path
@@ -206,10 +209,10 @@ def _load_debug_config(context, force=False):
     context.debug_cfg_mtime = mtime
     context.last_rt_log_ts = None
     if enable:
-        info('🔧 调试配置生效: enable={} window={}s preview={} delay_after_cancel={}s',
+        info('🐞 调试配置生效: enable={} window={}s preview={} delay_after_cancel={}s',
              enable, winsec, preview, delay_after_cancel)
     else:
-        info('🔧 调试配置生效: enable=False（关闭心跳日志）')
+        info('🐞 调试配置生效: enable=False（关闭心跳日志）')
 
 # ---------------- VA 参数：config/va.json ----------------
 
@@ -347,14 +350,14 @@ def _load_strategy_config(context, force=False):
             except: pass
 
     context.strategy_cfg_mtime = mtime
-    info('🔧 统一参数生效：读取 strategy.json 并覆盖子配置（delay_after_cancel={}s）',
+    info('🛠️ 统一参数生效：读取 strategy.json 并覆盖子配置（delay_after_cancel={}s）',
          getattr(context, 'delay_after_cancel_seconds', DELAY_AFTER_CANCEL_SECONDS_DEFAULT))
 
 # ---------------- 初始化与时间窗口判断 ----------------
 
 def initialize(context):
     log_file = _ensure_daily_logfile()
-    log.info(f'🔍 日志同时写入到 {log_file}')
+    log.info(f'📝 日志同时写入到 {log_file}')
     context.env = check_environment()
     info("当前环境：{}", context.env)
     context.run_cycle = get_saved_param('run_cycle_seconds', 60)
@@ -403,19 +406,16 @@ def initialize(context):
             'buy_grid_spacing': 0.005,
             'sell_grid_spacing': 0.005,
             'max_position': saved.get('max_position', saved.get('base_position', cfg['initial_base_position']) + saved.get('grid_unit', cfg['grid_unit']) * 20),
-            # —— VA 限频状态 —— 
             'va_last_update_dt': None,
             'va_update_count_date': None,
             'va_updates_today': 0,
-            # —— 停牌日志压频（每标的）——
             '_halt_next_log_dt': None,
-            # —— FILL-RECOVER 运行态 —— 
-            '_oo_last': 0,             # 上次看到的进行中挂单笔数
-            '_recover_until': None,    # 复牌/时窗补偿截止
-            '_after_cancel_until': None, # 撤单后补偿截止
-            '_oo_drop_seen_ts': None,    # 订单簿“掉单”首次发现时间
-            '_pos_jump_seen_ts': None,   # 持仓“跳变”首次发现时间
-            '_pos_confirm_deadline': None # 二次确认截止时刻
+            '_oo_last': 0,
+            '_recover_until': None,
+            '_after_cancel_until': None,
+            '_oo_drop_seen_ts': None,
+            '_pos_jump_seen_ts': None,
+            '_pos_confirm_deadline': None
         })
         context.state[sym] = st
         context.latest_data[sym] = st['base_price']
@@ -445,7 +445,7 @@ def initialize(context):
     # --- 【PnL 指标初始化】 ---
     context.pnl_metrics_path = research_path('state', 'pnl_metrics.json')
     context.pnl_metrics = _load_pnl_metrics(context.pnl_metrics_path)
-            
+    
     info('✅ PnL 收益指标已加载（共 {} 个标的）', len(context.pnl_metrics))
     # --- PnL 初始化结束 ---
     
@@ -474,7 +474,7 @@ def before_trading_start(context, data):
         context.pnl_metrics = {} 
         
         try:
-            # 2. 调用补算，指定 lookback_days=45，覆盖本月和上月
+            # 2. 调用补算，指定 lookback_days=45
             _update_realized_pnl_from_deliver(context, lookback_days=45)
         except Exception as e:
             info('⚠️ PnL 补算遇到轻微错误: {} (后续会重试)', e)
@@ -484,7 +484,7 @@ def before_trading_start(context, data):
 
     if context.initial_cleanup_done:
         return
-    info('🔁 before_trading_start：清理遗留挂单')
+    info('🧹 before_trading_start：清理遗留挂单')
     after_initialize_cleanup(context)
     current_time = context.current_dt.time()
     if dtime(9, 15) <= current_time < dtime(9, 30):
@@ -497,7 +497,7 @@ def before_trading_start(context, data):
 def after_initialize_cleanup(context):
     if '回测' in context.env or not hasattr(context, 'symbol_list'):
         return
-    info('🧼 按品种清理所有遗留挂单')
+    info('🧹 按品种清理所有遗留挂单')
     for sym in context.symbol_list:
         cancel_all_orders_by_symbol(context, sym)
         if sym in context.state:
@@ -541,7 +541,7 @@ def cancel_all_orders_by_symbol(context, symbol):
             continue
         cache.add(entrust_no)
         total += 1
-        info('[{}] 👉 发现并尝试撤销遗留挂单 entrust_no={}', dsym(context, symbol), entrust_no)
+        info('[{}] 🧹 发现并尝试撤销遗留挂单 entrust_no={}', dsym(context, symbol), entrust_no)
         try:
             cancel_order_ex({'entrust_no': entrust_no, 'symbol': api_sym})
         except Exception as e:
@@ -554,7 +554,7 @@ def cancel_all_orders_by_symbol(context, symbol):
 def place_auction_orders(context):
     if '回测' in context.env or not (is_auction_time() or is_main_trading_time()):
         return
-    info('🆕 清空防抖缓存，开始集合竞价挂单（按 base_price 补挂）')
+    info('📅 清空防抖缓存，开始集合竞价挂单（按 base_price 补挂）')
     for st in context.state.values():
         st.pop('_last_order_bp', None); st.pop('_last_order_ts', None)
     for sym in context.symbol_list:
@@ -627,12 +627,12 @@ def _dump_open_orders(context, symbol, tag='DUMP'):
     try:
         oo = [o for o in (get_open_orders(symbol) or []) if getattr(o, 'status', None) == '2']
         if not oo:
-            info('[{}]   OPEN-ORDERS {}: 空', dsym(context, symbol), tag)
+            info('[{}]    OPEN-ORDERS {}: 空', dsym(context, symbol), tag)
             return
         lines = []
         for o in oo:
             lines.append(f"#{getattr(o,'entrust_no',None)} side={'B' if o.amount>0 else 'S'} px={getattr(o,'price',None)} amt={o.amount} status={getattr(o,'status',None)}")
-        info('[{}]   OPEN-ORDERS {}: {} 笔 -> {}', dsym(context, symbol), tag, len(oo), ' | '.join(lines))
+        info('[{}]    OPEN-ORDERS {}: {} 笔 -> {}', dsym(context, symbol), tag, len(oo), ' | '.join(lines))
     except Exception as e:
         info('[{}] ⚠️ OPEN-ORDERS {} 读取失败: {}', dsym(context, symbol), tag, e)
 
@@ -809,7 +809,7 @@ def on_trade_response(context, trade_list):
         price  = tr['business_price']
         key = _make_fill_key(sym, amount, price, context.current_dt)
         if _is_dup_fill(context, key):
-            info('[{}]   DUP-TRADE 回报去重: amt={} px={}', dsym(context, sym), amount, price)
+            info('[{}]    DUP-TRADE 回报去重: amt={} px={}', dsym(context, sym), amount, price)
             continue
         _remember_fill(context, key)
 
@@ -927,14 +927,14 @@ def _fill_recover_watch(context, symbol, state):
         if state.get('_oo_drop_seen_ts') is None:
             state['_oo_drop_seen_ts'] = now_dt
             state['_pos_confirm_deadline'] = now_dt + timedelta(seconds=2.0)
-            info('[{}]   观察到订单簿掉单(无持仓跳变)，进入2s确认期', dsym(context, symbol))
+            info('[{}]    观察到订单簿掉单(无持仓跳变)，进入2s确认期', dsym(context, symbol))
         state['_pos_jump_seen_ts'] = None 
     
     elif pos_jump_now and not oo_drop_now:
         if state.get('_pos_jump_seen_ts') is None:
             state['_pos_jump_seen_ts'] = now_dt
             state['_pos_confirm_deadline'] = now_dt + timedelta(seconds=2.0)
-            info('[{}]   观察到持仓跳变 posΔ={}(无掉单)，进入2s确认期 (防鬼数据)', dsym(context, symbol), pos_delta)
+            info('[{}]    观察到持仓跳变 posΔ={}(无掉单)，进入2s确认期 (防鬼数据)', dsym(context, symbol), pos_delta)
         state['_oo_drop_seen_ts'] = None
 
     elif oo_drop_now and pos_jump_now:
@@ -942,7 +942,7 @@ def _fill_recover_watch(context, symbol, state):
              state['_oo_drop_seen_ts'] = now_dt
              state['_pos_jump_seen_ts'] = now_dt
              state['_pos_confirm_deadline'] = now_dt + timedelta(seconds=2.0)
-             info('[{}]   观察到掉单+持仓跳变 posΔ={}，进入2s确认期', dsym(context, symbol), pos_delta)
+             info('[{}]    观察到掉单+持仓跳变 posΔ={}，进入2s确认期', dsym(context, symbol), pos_delta)
     
     else:
         if state.get('_oo_drop_seen_ts') or state.get('_pos_jump_seen_ts'):
@@ -967,10 +967,10 @@ def _fill_recover_watch(context, symbol, state):
         key = _make_fill_key(symbol, amount, price, now_dt)
         
         if _is_dup_fill(context, key):
-            info('[{}]   DUP-RECOVER 去重: amt={} px={}', dsym(context, symbol), amount, price)
+            info('[{}]    DUP-RECOVER 去重: amt={} px={}', dsym(context, symbol), amount, price)
         else:
             _remember_fill(context, key)
-            info('[{}] 🛟 FILL-RECOVER 触发: posΔ={} (>=unit {}) | synth amt={} px={:.3f}',
+            info('[{}] 🔍 FILL-RECOVER 触发: posΔ={} (>=unit {}) | synth amt={} px={:.3f}',
                  dsym(context, symbol), pos_delta, unit, amount, price)
             synth = SimpleNamespace(order_id=f"SYN-{int(time.time())}",
                                     amount=amount,
@@ -1122,7 +1122,7 @@ def handle_data(context, data):
                     state = context.state[sym]
                     recover_window_seconds = 180 
                     state['_recover_until'] = now_dt + timedelta(seconds=recover_window_seconds)
-                    info('[{}]   监测到复牌/行情恢复，开启 {}s 补偿成交检测窗口。', 
+                    info('[{}]    监测到复牌/行情恢复，开启 {}s 补偿成交检测窗口。', 
                          dsym(context, sym), recover_window_seconds)
 
     for sym in context.symbol_list:
@@ -1151,7 +1151,7 @@ def handle_data(context, data):
         _fill_recover_watch(context, sym, st)
 
     if is_patrol_time:
-        info('📌 每30分钟状态巡检...')
+        info('🩺 每30分钟状态巡检...')
         for sym in context.symbol_list:
             if sym in context.state:
                 patrol_and_correct_orders(context, sym, context.state[sym])
@@ -1196,7 +1196,7 @@ def update_grid_spacing_final(context, symbol, state, curr_pos):
     new_sell = round(min(new_sell, max_spacing), 4)
     if new_buy != state.get('buy_grid_spacing') or new_sell != state.get('sell_grid_spacing'):
         state['buy_grid_spacing'], state['sell_grid_spacing'] = new_buy, new_sell
-        info('[{}]   网格动态调整. (pos={}) ATR({:.2%}) -> 基础间距({:.2%}) -> 最终:[买{:.2%},卖{:.2%}]',
+        info('[{}]    网格动态调整. (pos={}) ATR({:.2%}) -> 基础间距({:.2%}) -> 最终:[买{:.2%},卖{:.2%}]',
              dsym(context, symbol), pos, (atr_pct or 0.0), base_spacing, new_buy, new_sell)
 
 def calculate_atr(context, symbol, atr_period=14):
@@ -1348,13 +1348,13 @@ def _save_pnl_metrics(context):
         except Exception as e:
             info('❌ 保存 PnL 收益指标失败: {}', e)
 
-# ---------------- 【!!! 修复 v3.2.25 (PnL-Debug-Fix) !!!】日终 PnL 归因计算 ----------------
+# ---------------- 【!!! 修复 v3.2.28 (PnL-Calc-Fix) !!!】日终 PnL 归因计算 ----------------
 def _update_realized_pnl_from_deliver(context, lookback_days=10):
     """
-    【!!! 核心收益计算 (Fix v3.2.25) !!!】
-    修复：trade_type 兼容 '2', 'S', 'Sell', '证券卖出'。
-    修复：字段名兼容 trade_amount/business_amount, business_price/trade_price。
-    增加：DEBUG 打印首行数据。
+    【!!! 核心收益计算 (Fix v3.2.28) !!!】
+    1. 增加价格计算逻辑：如果 business_price 缺失，用 business_balance / business_amount 计算。
+    2. DEBUG日志：现在会打印第一条【匹配策略标的】的数据，避免被货币基金数据误导。
+    3. 字段增强：增加对 business_balance, money, occur_amount 等字段的读取。
     """
     info('PnL: 开始日终收益归因计算 (基于 get_deliver, scope={}days)...', lookback_days)
     
@@ -1368,7 +1368,7 @@ def _update_realized_pnl_from_deliver(context, lookback_days=10):
 
     try:
         with open(trade_log_path, 'r', encoding='utf-8') as f:
-            f.readline() 
+            f.readline() # Skip header
             for line in f:
                 parts = line.strip().split(',')
                 if len(parts) >= 7: 
@@ -1393,8 +1393,7 @@ def _update_realized_pnl_from_deliver(context, lookback_days=10):
         
         deliver_data = get_deliver(start_date=s_str, end_date=e_str)
         
-        import pandas as pd 
-        
+        # 处理 get_deliver 返回结构
         deliver_df = None
         if deliver_data is None:
             pass
@@ -1420,13 +1419,8 @@ def _update_realized_pnl_from_deliver(context, lookback_days=10):
     match_success = 0
     match_fail = 0
     
-    # --- DEBUG: 打印第一行数据结构 (仅一次) ---
-    try:
-        first_row = deliver_df.iloc[0].to_dict()
-        info("🔍 [DEBUG] get_deliver 首行数据示例: {}", first_row)
-    except:
-        pass
-    # ----------------------------------------
+    # 标记 debug 打印状态
+    debug_printed = False
 
     for _, row in deliver_df.iterrows():
         entrust_no = "N/A"
@@ -1437,6 +1431,12 @@ def _update_realized_pnl_from_deliver(context, lookback_days=10):
 
             symbol_std = convert_symbol_to_standard(stock_code)
             
+            # --- DEBUG 优化：只打印策略关注的标的 ---
+            if not debug_printed and symbol_std in context.symbol_list:
+                info("🔍 [DEBUG] 目标标的({}) 交割数据示例: {}", symbol_std, row.to_dict())
+                debug_printed = True
+            # ------------------------------------
+
             if symbol_std not in pnl_metrics:
                 pnl_metrics[symbol_std] = {'realized_grid_pnl': 0, 'realized_base_pnl': 0, 'total_realized_pnl': 0, '_processed_entrust': []}
             
@@ -1453,14 +1453,21 @@ def _update_realized_pnl_from_deliver(context, lookback_days=10):
             else:
                 match_fail += 1
             
-            # --- 核心计算修复 v3.2.25 ---
             # 1. 兼容不同的 trade_type 值
             raw_type = str(row.get('trade_type', '')).strip()
             is_sell = raw_type in ['2', 'S', 'Sell', '证券卖出']
             
-            # 2. 兼容不同的字段名
-            trade_amount = float(row.get('trade_amount') or row.get('business_amount') or 0)
-            business_price = float(row.get('business_price') or row.get('trade_price') or 0)
+            # 2. 字段获取增强
+            # 尝试获取 成交数量
+            trade_amount = float(row.get('business_amount') or row.get('trade_amount') or row.get('occur_amount') or 0)
+            # 尝试获取 成交金额 (有些券商 deliver 只有金额和数量，没有价格)
+            trade_balance = float(row.get('business_balance') or row.get('money') or row.get('occur_balance') or 0)
+            # 尝试获取 成交价格
+            business_price = float(row.get('business_price') or row.get('trade_price') or row.get('price') or 0)
+            
+            # 3. 价格补救逻辑：如果价格为0，但有金额和数量，手动算出价格
+            if business_price == 0 and abs(trade_amount) > 0 and abs(trade_balance) > 0:
+                business_price = abs(trade_balance / trade_amount)
             
             is_grid_trade = True # 默认为网格
             
@@ -1471,7 +1478,8 @@ def _update_realized_pnl_from_deliver(context, lookback_days=10):
                 cost = pos_obj.cost_basis
                 if cost <= 0: cost = business_price * 0.99 
                 
-                profit = (business_price - cost) * abs(trade_amount) # 确保数量为正
+                # 利润 = (卖出价 - 成本) * 数量
+                profit = (business_price - cost) * abs(trade_amount) 
                 pnl_contribution = profit
                 
                 if is_grid_trade:
@@ -1519,7 +1527,7 @@ def reload_config_if_changed(context):
         current_mod_time = context.config_file_path.stat().st_mtime
         if current_mod_time == context.last_config_mod_time:
             return
-        info('🔄 检测到配置文件发生变更，开始热重载...')
+        info('♻️ 检测到配置文件发生变更，开始热重载...')
         context.last_config_mod_time = current_mod_time
         new_config = json.loads(context.config_file_path.read_text(encoding='utf-8'))
         old_symbols, new_symbols = set(context.symbol_list), set(new_config.keys())
@@ -1740,7 +1748,7 @@ def generate_html_report(context):
     <html lang="zh-CN">
     <head>
         <meta charset="UTF-8">
-        <title>策略运行看板 (v3.2.26-Dup-Patrol-Fix)</title>
+        <title>策略运行看板 (v3.2.28-PnL-Calc-Fix)</title>
         <style>
             body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; background-color: #121212; color: #e0e0e0; margin: 0; padding: 16px; }}
             .container {{ max-width: 1600px; margin: auto; }}
@@ -1765,7 +1773,7 @@ def generate_html_report(context):
     </head>
     <body>
         <div class="container">
-            <h1>策略运行看板 (Deliver-FIX)</h1>
+            <h1>策略运行看板 (Deliver-Calc-FIX)</h1>
             <p class="update-time">最后更新时间: {update_time}</p>
             
             <div class="summary-cards">
@@ -1830,6 +1838,7 @@ def generate_html_report(context):
     </body>
     </html>
     """
+
     table_rows = ""
     for m in all_metrics:
         try: pnl_val = float(m["unrealized_pnl"].replace(",", ""))
