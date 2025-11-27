@@ -1,10 +1,11 @@
 # event_driven_grid_strategy.py
-# 版本号：GEMINI-3.2.28-PnL-Calc-Fix
-# 相对 3.2.27 的新增/修改要点：
-# - 【PnL 核心修复】:
-#     - 增加“价格反推”逻辑：如果交割单没有 price 字段，使用 business_balance / business_amount 计算。
-#     - 优化 DEBUG 日志：不再打印首行（可能是货币基金），而是打印第一条匹配策略标的（如 ETF）的数据，以便精准排查字段。
-#     - 增强字段兼容：增加对 business_balance, money 等金额字段的识别。
+# 版本号：GEMINI-3.2.31-Timing-Optimization
+# 相对 3.2.30 的新增/修改要点：
+# - 【性能/时序优化】:
+#     - end_of_day (14:56): 剔除所有 PnL 计算和报表生成逻辑。只执行“撤单”和“保存状态”，确保交易收尾的流畅性。
+#     - after_trading_end (>15:00): 承接所有计算任务（PnL归因、HTML看板、CSV日报），利用盘后空闲资源。
+# - 【撤单增强】:
+#     - 在 end_of_day 中增加 3 次撤单重试循环，每次间隔 1 秒，确保清空订单簿。
 
 import json
 import logging
@@ -23,7 +24,7 @@ import pandas as pd  # 显式导入 pandas 以防万一
 LOG_FH = None
 LOG_DATE = None
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'GEMINI-3.2.28-PnL-Calc-Fix' # <-- 版本号升级
+__version__ = 'GEMINI-3.2.31-Timing-Optimization' # <-- 版本号升级
 TRANSACTION_COST = 0.00005
 
 # ---- 调试默认（可被 config/debug.json / strategy.json 覆盖）----
@@ -209,10 +210,10 @@ def _load_debug_config(context, force=False):
     context.debug_cfg_mtime = mtime
     context.last_rt_log_ts = None
     if enable:
-        info('🐞 调试配置生效: enable={} window={}s preview={} delay_after_cancel={}s',
+        info('🐛 调试配置生效: enable={} window={}s preview={} delay_after_cancel={}s',
              enable, winsec, preview, delay_after_cancel)
     else:
-        info('🐞 调试配置生效: enable=False（关闭心跳日志）')
+        info('🐛 调试配置生效: enable=False（关闭心跳日志）')
 
 # ---------------- VA 参数：config/va.json ----------------
 
@@ -497,7 +498,7 @@ def before_trading_start(context, data):
 def after_initialize_cleanup(context):
     if '回测' in context.env or not hasattr(context, 'symbol_list'):
         return
-    info('🧹 按品种清理所有遗留挂单')
+    info('🗑️ 按品种清理所有遗留挂单')
     for sym in context.symbol_list:
         cancel_all_orders_by_symbol(context, sym)
         if sym in context.state:
@@ -554,7 +555,7 @@ def cancel_all_orders_by_symbol(context, symbol):
 def place_auction_orders(context):
     if '回测' in context.env or not (is_auction_time() or is_main_trading_time()):
         return
-    info('📅 清空防抖缓存，开始集合竞价挂单（按 base_price 补挂）')
+    info('🕒 清空防抖缓存，开始集合竞价挂单（按 base_price 补挂）')
     for st in context.state.values():
         st.pop('_last_order_bp', None); st.pop('_last_order_ts', None)
     for sym in context.symbol_list:
@@ -627,12 +628,12 @@ def _dump_open_orders(context, symbol, tag='DUMP'):
     try:
         oo = [o for o in (get_open_orders(symbol) or []) if getattr(o, 'status', None) == '2']
         if not oo:
-            info('[{}]    OPEN-ORDERS {}: 空', dsym(context, symbol), tag)
+            info('[{}]     OPEN-ORDERS {}: 空', dsym(context, symbol), tag)
             return
         lines = []
         for o in oo:
             lines.append(f"#{getattr(o,'entrust_no',None)} side={'B' if o.amount>0 else 'S'} px={getattr(o,'price',None)} amt={o.amount} status={getattr(o,'status',None)}")
-        info('[{}]    OPEN-ORDERS {}: {} 笔 -> {}', dsym(context, symbol), tag, len(oo), ' | '.join(lines))
+        info('[{}]     OPEN-ORDERS {}: {} 笔 -> {}', dsym(context, symbol), tag, len(oo), ' | '.join(lines))
     except Exception as e:
         info('[{}] ⚠️ OPEN-ORDERS {} 读取失败: {}', dsym(context, symbol), tag, e)
 
@@ -728,12 +729,12 @@ def place_limit_orders(context, symbol, state, ignore_cooldown=False):
             ratchet_down = is_in_high_pos_range and price <= buy_p_curr
             
             if ratchet_up:
-                info('[{}] 棘轮上移(pos={}): 触及卖价，基准抬至 {:.3f}', dsym(context, symbol), pos, sell_p_curr)
+                info('[{}] 🕯️ 棘轮上移(pos={}): 触及卖价，基准抬至 {:.3f}', dsym(context, symbol), pos, sell_p_curr)
                 state['base_price'] = sell_p_curr
                 cancel_all_orders_by_symbol(context, symbol)
                 buy_p, sell_p = round(sell_p_curr * (1 - buy_sp), 3), round(sell_p_curr * (1 + sell_sp), 3)
             elif ratchet_down:
-                info('[{}] 棘轮下移(pos={}): 触及买价，基准降至 {:.3f}', dsym(context, symbol), pos, buy_p_curr)
+                info('[{}] 🕯️ 棘轮下移(pos={}): 触及买价，基准降至 {:.3f}', dsym(context, symbol), pos, buy_p_curr)
                 state['base_price'] = buy_p_curr
                 cancel_all_orders_by_symbol(context, symbol)
                 buy_p, sell_p = round(buy_p_curr * (1 - buy_sp), 3), round(buy_p_curr * (1 + sell_sp), 3)
@@ -809,7 +810,7 @@ def on_trade_response(context, trade_list):
         price  = tr['business_price']
         key = _make_fill_key(sym, amount, price, context.current_dt)
         if _is_dup_fill(context, key):
-            info('[{}]    DUP-TRADE 回报去重: amt={} px={}', dsym(context, sym), amount, price)
+            info('[{}]     DUP-TRADE 回报去重: amt={} px={}', dsym(context, sym), amount, price)
             continue
         _remember_fill(context, key)
 
@@ -927,14 +928,14 @@ def _fill_recover_watch(context, symbol, state):
         if state.get('_oo_drop_seen_ts') is None:
             state['_oo_drop_seen_ts'] = now_dt
             state['_pos_confirm_deadline'] = now_dt + timedelta(seconds=2.0)
-            info('[{}]    观察到订单簿掉单(无持仓跳变)，进入2s确认期', dsym(context, symbol))
+            info('[{}]     观察到订单簿掉单(无持仓跳变)，进入2s确认期', dsym(context, symbol))
         state['_pos_jump_seen_ts'] = None 
     
     elif pos_jump_now and not oo_drop_now:
         if state.get('_pos_jump_seen_ts') is None:
             state['_pos_jump_seen_ts'] = now_dt
             state['_pos_confirm_deadline'] = now_dt + timedelta(seconds=2.0)
-            info('[{}]    观察到持仓跳变 posΔ={}(无掉单)，进入2s确认期 (防鬼数据)', dsym(context, symbol), pos_delta)
+            info('[{}]     观察到持仓跳变 posΔ={}(无掉单)，进入2s确认期 (防鬼数据)', dsym(context, symbol), pos_delta)
         state['_oo_drop_seen_ts'] = None
 
     elif oo_drop_now and pos_jump_now:
@@ -942,7 +943,7 @@ def _fill_recover_watch(context, symbol, state):
              state['_oo_drop_seen_ts'] = now_dt
              state['_pos_jump_seen_ts'] = now_dt
              state['_pos_confirm_deadline'] = now_dt + timedelta(seconds=2.0)
-             info('[{}]    观察到掉单+持仓跳变 posΔ={}，进入2s确认期', dsym(context, symbol), pos_delta)
+             info('[{}]     观察到掉单+持仓跳变 posΔ={}，进入2s确认期', dsym(context, symbol), pos_delta)
     
     else:
         if state.get('_oo_drop_seen_ts') or state.get('_pos_jump_seen_ts'):
@@ -967,10 +968,10 @@ def _fill_recover_watch(context, symbol, state):
         key = _make_fill_key(symbol, amount, price, now_dt)
         
         if _is_dup_fill(context, key):
-            info('[{}]    DUP-RECOVER 去重: amt={} px={}', dsym(context, symbol), amount, price)
+            info('[{}]     DUP-RECOVER 去重: amt={} px={}', dsym(context, symbol), amount, price)
         else:
             _remember_fill(context, key)
-            info('[{}] 🔍 FILL-RECOVER 触发: posΔ={} (>=unit {}) | synth amt={} px={:.3f}',
+            info('[{}] 🩹 FILL-RECOVER 触发: posΔ={} (>=unit {}) | synth amt={} px={:.3f}',
                  dsym(context, symbol), pos_delta, unit, amount, price)
             synth = SimpleNamespace(order_id=f"SYN-{int(time.time())}",
                                     amount=amount,
@@ -1055,7 +1056,7 @@ def patrol_and_correct_orders(context, symbol, state):
                 orders_to_cancel.append((entrust_no, api_sym, o_price, o.amount))
 
         if orders_to_cancel:
-            info('{} 🕵️ PATROL: 发现 {} 笔错误/陈旧挂单，正在撤销...', dbg_tag, len(orders_to_cancel))
+            info('{} 🛡️ PATROL: 发现 {} 笔错误/陈旧挂单，正在撤销...', dbg_tag, len(orders_to_cancel))
             for entrust_no, api_sym, price, amount in orders_to_cancel:
                 try:
                     info('{} ... 正在撤销 #{}: {} @ {:.3f}', dbg_tag, entrust_no, amount, price)
@@ -1074,7 +1075,7 @@ def patrol_and_correct_orders(context, symbol, state):
             if orders_to_cancel:
                 pass # 上面已经处理过
             else:
-                info('{} 🕵️ PATROL: 发现缺失订单，准备补挂...', dbg_tag)
+                info('{} 🛡️ PATROL: 发现缺失订单，准备补挂...', dbg_tag)
                 # 【修复 v3.2.19】: 补挂缺失订单时强制执行
                 place_limit_orders(context, symbol, state, ignore_cooldown=True)
 
@@ -1091,7 +1092,8 @@ def handle_data(context, data):
 
     if now_dt.minute % 5 == 0 and now_dt.second < 5:
         reload_config_if_changed(context)
-        generate_html_report(context)
+        # 移出HTML生成，减少盘中IO，改到盘后统一生成
+        # generate_html_report(context)
 
     boot_grace = (now_dt - getattr(context, 'boot_dt', now_dt)).total_seconds() < getattr(context, 'boot_grace_seconds', 180)
     if not boot_grace:
@@ -1122,7 +1124,7 @@ def handle_data(context, data):
                     state = context.state[sym]
                     recover_window_seconds = 180 
                     state['_recover_until'] = now_dt + timedelta(seconds=recover_window_seconds)
-                    info('[{}]    监测到复牌/行情恢复，开启 {}s 补偿成交检测窗口。', 
+                    info('[{}]     监测到复牌/行情恢复，开启 {}s 补偿成交检测窗口。', 
                          dsym(context, sym), recover_window_seconds)
 
     for sym in context.symbol_list:
@@ -1151,7 +1153,7 @@ def handle_data(context, data):
         _fill_recover_watch(context, sym, st)
 
     if is_patrol_time:
-        info('🩺 每30分钟状态巡检...')
+        info('🧐 每30分钟状态巡检...')
         for sym in context.symbol_list:
             if sym in context.state:
                 patrol_and_correct_orders(context, sym, context.state[sym])
@@ -1196,7 +1198,7 @@ def update_grid_spacing_final(context, symbol, state, curr_pos):
     new_sell = round(min(new_sell, max_spacing), 4)
     if new_buy != state.get('buy_grid_spacing') or new_sell != state.get('sell_grid_spacing'):
         state['buy_grid_spacing'], state['sell_grid_spacing'] = new_buy, new_sell
-        info('[{}]    网格动态调整. (pos={}) ATR({:.2%}) -> 基础间距({:.2%}) -> 最终:[买{:.2%},卖{:.2%}]',
+        info('[{}]     网格动态调整. (pos={}) ATR({:.2%}) -> 基础间距({:.2%}) -> 最终:[买{:.2%},卖{:.2%}]',
              dsym(context, symbol), pos, (atr_pct or 0.0), base_spacing, new_buy, new_sell)
 
 def calculate_atr(context, symbol, atr_period=14):
@@ -1221,19 +1223,23 @@ def calculate_atr(context, symbol, atr_period=14):
 # ---------------- 日终动作（14:56） ----------------
 
 def end_of_day(context):
-    info('✅ 日终处理开始(14:56)...')
-    after_initialize_cleanup(context)
-    generate_html_report(context)
+    info('✅ 日终处理开始(14:56)... [TIMING OPTIMIZATION]')
     
-    # --- 【新增 PnL v3.2.14】保存 PnL 指标 ---
-    _save_pnl_metrics(context) 
-    # --- PnL 保存结束 ---
+    # 【修复 v3.2.31】: 极简模式，全力撤单。
+    # 连续执行 3 次撤单，每次间隔 1 秒，确保在网络抖动下也能清空
+    for i in range(3):
+        if i > 0: 
+            info('🧹 [Cleanup Retry {}/3] 重新扫描遗留挂单...', i+1)
+            time.sleep(1)
+        after_initialize_cleanup(context)
 
+    # 仅保存状态，不进行任何IO计算
     for sym in context.symbol_list:
         if sym in context.state:
             safe_save_state(sym, context.state[sym])
             context.should_place_order_map[sym] = True
-    info('✅ 日终保存状态完成')
+            
+    info('✅ 日终撤单与状态保存完成 (PnL计算已推迟至盘后)')
 
 # ---------------- 价值平均（VA） ----------------
 
@@ -1289,7 +1295,7 @@ def get_target_base_position(context, symbol, state, price, dt):
     if new_base_pos == state['base_position']:
         return state['base_position'] 
 
-    info('[{}] 价值平均(VA-FIX): 目标底仓从 {} 调整至 {} (Δ{}股, 单位:100). [目标市值:{:.2f}, 当前底仓市值:{:.2f}, 缺口:{:.2f}]',
+    info('[{}] ⚖️ 价值平均(VA-FIX): 目标底仓从 {} 调整至 {} (Δ{}股, 单位:100). [目标市值:{:.2f}, 当前底仓市值:{:.2f}, 缺口:{:.2f}]',
          dsym(context, symbol),
          state['base_position'], new_base_pos, (new_base_pos - state['base_position']),
          target_val, current_val, delta_val)
@@ -1348,24 +1354,31 @@ def _save_pnl_metrics(context):
         except Exception as e:
             info('❌ 保存 PnL 收益指标失败: {}', e)
 
-# ---------------- 【!!! 修复 v3.2.28 (PnL-Calc-Fix) !!!】日终 PnL 归因计算 ----------------
+# ---------------- 【!!! 修复 v3.2.30 (Fuzzy-Match) !!!】日终 PnL 归因计算 ----------------
 def _update_realized_pnl_from_deliver(context, lookback_days=10):
     """
-    【!!! 核心收益计算 (Fix v3.2.28) !!!】
-    1. 增加价格计算逻辑：如果 business_price 缺失，用 business_balance / business_amount 计算。
-    2. DEBUG日志：现在会打印第一条【匹配策略标的】的数据，避免被货币基金数据误导。
-    3. 字段增强：增加对 business_balance, money, occur_amount 等字段的读取。
+    【!!! 核心收益计算修复 (Fix v3.2.30) !!!】
+    引入“模糊匹配”机制，解决券商 entrust_no 混乱导致无法归因的问题。
     """
     info('PnL: 开始日终收益归因计算 (基于 get_deliver, scope={}days)...', lookback_days)
     
     pnl_metrics = getattr(context, 'pnl_metrics', {})
-    attribution_map = {}
+    attribution_map = {} # 严格ID匹配表
+    trade_history_list = [] # 模糊匹配表：存储所有历史交易记录详情
+    
     trade_log_path = research_path('reports', 'a_trade_details.csv')
     
+    # 1. 建立短代码映射表
+    short_code_map = {}
+    for sym in context.symbol_list:
+        short_code = sym.split('.')[0]
+        short_code_map[short_code] = sym
+
     if not trade_log_path.exists():
         info('PnL: ⚠️ 未找到 a_trade_details.csv，无法进行收益归因。')
         return
 
+    # 2. 加载交易日志到内存
     try:
         with open(trade_log_path, 'r', encoding='utf-8') as f:
             f.readline() # Skip header
@@ -1373,42 +1386,55 @@ def _update_realized_pnl_from_deliver(context, lookback_days=10):
                 parts = line.strip().split(',')
                 if len(parts) >= 7: 
                     try:
-                        entrust_no = str(parts[6]).strip()
-                        base_pos_at_trade = int(parts[5].strip())
-                        if entrust_no and entrust_no != 'N/A':
-                            attribution_map[entrust_no] = base_pos_at_trade
+                        t_time = parts[0].strip()
+                        t_sym = parts[1].strip()
+                        t_dir = parts[2].strip()
+                        t_qty = float(parts[3].strip())
+                        t_price = float(parts[4].strip())
+                        t_base_pos = int(parts[5].strip())
+                        t_entrust = str(parts[6]).strip()
+                        
+                        # 构建严格映射
+                        if t_entrust and t_entrust != 'N/A':
+                            attribution_map[t_entrust] = t_base_pos
+                        
+                        # 构建模糊搜索列表
+                        trade_history_list.append({
+                            'entrust_no': t_entrust,
+                            'symbol': t_sym,
+                            'direction': t_dir,
+                            'quantity': t_qty,
+                            'price': t_price,
+                            'base_pos': t_base_pos,
+                            'time': t_time
+                        })
                     except:
                         continue 
-        info('PnL: 成功加载 {} 条交易归因记录。', len(attribution_map))
+        info('PnL: 成功加载 {} 条交易历史记录。', len(trade_history_list))
     except Exception as e:
         info('PnL: ❌ 加载 a_trade_details.csv 失败: {}', e)
         return
 
+    # 3. 获取交割单
     try:
         end_dt = context.current_dt
         start_dt = end_dt - timedelta(days=lookback_days) 
-        
         s_str = start_dt.strftime('%Y%m%d')
         e_str = end_dt.strftime('%Y%m%d')
-        
         deliver_data = get_deliver(start_date=s_str, end_date=e_str)
         
-        # 处理 get_deliver 返回结构
         deliver_df = None
-        if deliver_data is None:
-            pass
+        if deliver_data is None: pass
         elif isinstance(deliver_data, list):
-            if deliver_data: 
-                deliver_df = pd.DataFrame(deliver_data)
+            if deliver_data: deliver_df = pd.DataFrame(deliver_data)
         elif hasattr(deliver_data, 'empty'): 
-            if not deliver_data.empty:
-                deliver_df = deliver_data
+            if not deliver_data.empty: deliver_df = deliver_data
         
         if deliver_df is None or deliver_df.empty:
-            info('PnL: get_deliver(start={}, end={}) 未返回有效数据 (可能是T日清算未完成)。', s_str, e_str)
+            info('PnL: get_deliver(start={}, end={}) 未返回有效数据。', s_str, e_str)
             return
 
-        info('PnL: get_deliver() 成功获取 {} 条交割记录 (范围: {}-{})。', len(deliver_df), s_str, e_str)
+        info('PnL: get_deliver() 成功获取 {} 条交割记录。', len(deliver_df))
 
     except Exception as e:
         info('PnL: ❌ 调用 get_deliver() 失败: {}', e)
@@ -1416,65 +1442,97 @@ def _update_realized_pnl_from_deliver(context, lookback_days=10):
 
     new_pnl_count = 0
     skipped_count = 0
-    match_success = 0
+    match_success_exact = 0
+    match_success_fuzzy = 0
     match_fail = 0
-    
-    # 标记 debug 打印状态
-    debug_printed = False
+    debug_logs_printed = 0
 
+    # 4. 遍历交割单进行归因
     for _, row in deliver_df.iterrows():
         entrust_no = "N/A"
         try:
             entrust_no = str(row.get('entrust_no', '')).strip()
-            stock_code = row.get('stock_code')
-            if not stock_code: continue
+            raw_stock_code = str(row.get('stock_code', '')).strip()
+            if not raw_stock_code: continue
 
-            symbol_std = convert_symbol_to_standard(stock_code)
+            # --- 标的匹配 ---
+            target_symbol = None
+            standard_sym = convert_symbol_to_standard(raw_stock_code)
+            if standard_sym in context.symbol_list:
+                target_symbol = standard_sym
+            if not target_symbol and raw_stock_code in short_code_map:
+                target_symbol = short_code_map[raw_stock_code]
             
-            # --- DEBUG 优化：只打印策略关注的标的 ---
-            if not debug_printed and symbol_std in context.symbol_list:
-                info("🔍 [DEBUG] 目标标的({}) 交割数据示例: {}", symbol_std, row.to_dict())
-                debug_printed = True
-            # ------------------------------------
+            if not target_symbol:
+                if debug_logs_printed < 1 and raw_stock_code not in ['761047119006']:
+                    info("PnL [DEBUG] 忽略非策略标的: {} (不在配置列表中)", raw_stock_code)
+                    debug_logs_printed += 1
+                continue
 
-            if symbol_std not in pnl_metrics:
-                pnl_metrics[symbol_std] = {'realized_grid_pnl': 0, 'realized_base_pnl': 0, 'total_realized_pnl': 0, '_processed_entrust': []}
+            # --- 数据准备 ---
+            if target_symbol not in pnl_metrics:
+                pnl_metrics[target_symbol] = {'realized_grid_pnl': 0, 'realized_base_pnl': 0, 'total_realized_pnl': 0, '_processed_entrust': []}
+            pnl_data = pnl_metrics[target_symbol]
             
-            pnl_data = pnl_metrics[symbol_std]
-            
-            if entrust_no in pnl_data.get('_processed_entrust', []):
+            # 去重：如果该交割单ID已经处理过，跳过
+            # 注意：如果ID是空或0，可能会导致所有0号单只能处理一次。
+            # 改进：如果ID无效，我们依赖“模糊匹配”并暂时不记录ID去重（或者记录一个虚拟Hash，这里简化处理，仅记录非空ID）
+            if entrust_no and entrust_no != '0' and entrust_no in pnl_data.get('_processed_entrust', []):
                 skipped_count += 1
                 continue 
 
-            base_pos_at_trade = attribution_map.get(entrust_no)
-            
-            if base_pos_at_trade is not None:
-                match_success += 1
-            else:
-                match_fail += 1
-            
-            # 1. 兼容不同的 trade_type 值
+            # --- 获取交易核心数据 ---
+            # 兼容交易类型: '2', 'S', 'Sell', '证券卖出', 'ETF卖出'
             raw_type = str(row.get('trade_type', '')).strip()
-            is_sell = raw_type in ['2', 'S', 'Sell', '证券卖出']
+            is_sell = raw_type in ['2', 'S', 'Sell', '证券卖出', 'ETF卖出'] or '卖' in raw_type
             
-            # 2. 字段获取增强
-            # 尝试获取 成交数量
             trade_amount = float(row.get('business_amount') or row.get('trade_amount') or row.get('occur_amount') or 0)
-            # 尝试获取 成交金额 (有些券商 deliver 只有金额和数量，没有价格)
             trade_balance = float(row.get('business_balance') or row.get('money') or row.get('occur_balance') or 0)
-            # 尝试获取 成交价格
             business_price = float(row.get('business_price') or row.get('trade_price') or row.get('price') or 0)
             
-            # 3. 价格补救逻辑：如果价格为0，但有金额和数量，手动算出价格
             if business_price == 0 and abs(trade_amount) > 0 and abs(trade_balance) > 0:
                 business_price = abs(trade_balance / trade_amount)
             
-            is_grid_trade = True # 默认为网格
+            # --- 匹配底仓 (Attribution) ---
+            base_pos_at_trade = None
             
+            # 方式A: 精确匹配
+            if entrust_no in attribution_map:
+                base_pos_at_trade = attribution_map[entrust_no]
+                match_success_exact += 1
+            
+            # 方式B: 模糊匹配 (当精确匹配失败时)
+            if base_pos_at_trade is None:
+                # 寻找: 相同标的 + 相同方向 + 数量一致 + 价格接近 的最近记录
+                # deliver 的 trade_amount 这里的正负号可能不明确，通常 sell 也是正数，需结合 is_sell 判断
+                # CSV 中的 quantity: BUY是正, SELL是负
+                
+                target_qty = -abs(trade_amount) if is_sell else abs(trade_amount)
+                
+                candidates = []
+                for rec in trade_history_list:
+                    if rec['symbol'] == target_symbol:
+                        # 数量误差容忍 1股 (防止部分成交拆单)
+                        if abs(rec['quantity'] - target_qty) < 1.0:
+                             # 价格误差容忍 1%
+                             if abs(rec['price'] - business_price) / (business_price + 0.0001) < 0.01:
+                                 candidates.append(rec)
+                
+                if candidates:
+                    # 取最后一个匹配项 (假设最近的交易)
+                    best_match = candidates[-1]
+                    base_pos_at_trade = best_match['base_pos']
+                    match_success_fuzzy += 1
+                    # info("PnL: 🔎 模糊匹配成功: 交割[{}] -> 记录[{}]", entrust_no, best_match['entrust_no'])
+                else:
+                    match_fail += 1
+
+            # --- 计算盈亏 ---
+            is_grid_trade = True 
             pnl_contribution = 0
-            # 仅卖出计算已实现收益
-            if is_sell:
-                pos_obj = get_position(symbol_std)
+
+            if is_sell and business_price > 0:
+                pos_obj = get_position(target_symbol)
                 cost = pos_obj.cost_basis
                 if cost <= 0: cost = business_price * 0.99 
                 
@@ -1482,20 +1540,27 @@ def _update_realized_pnl_from_deliver(context, lookback_days=10):
                 profit = (business_price - cost) * abs(trade_amount) 
                 pnl_contribution = profit
                 
+                info("PnL: 💰 归因[{}] 卖出 {:.0f}股 @ {:.3f} (成本{:.3f}) -> 盈利 {:.2f} (匹配:{})", 
+                     target_symbol, abs(trade_amount), business_price, cost, profit, 
+                     "精确" if entrust_no in attribution_map else ("模糊" if base_pos_at_trade else "无"))
+
                 if is_grid_trade:
                     pnl_data['realized_grid_pnl'] += pnl_contribution
                 else:
                     pnl_data['realized_base_pnl'] += pnl_contribution
             
             pnl_data['total_realized_pnl'] = pnl_data['realized_grid_pnl'] + pnl_data['realized_base_pnl']
-            pnl_data.setdefault('_processed_entrust', []).append(entrust_no)
+            
+            if entrust_no and entrust_no != '0':
+                pnl_data.setdefault('_processed_entrust', []).append(entrust_no)
+            
             new_pnl_count += 1
 
         except Exception as e:
             info('PnL: ❌ 归因计算单行失败 (EntrustNO: {}): {}', entrust_no, e)
 
-    info('PnL: ✅ 日终收益归因完成，新处理 {} 笔 (跳过 {} 笔旧单)。ID匹配: 成功={} / 失败={} (失败将默认为网格)', 
-         new_pnl_count, skipped_count, match_success, match_fail)
+    info('PnL: ✅ 日终收益归因完成，处理 {} 笔。匹配情况: 精确={} / 模糊={} / 失败={} (失败则默认归因)', 
+         new_pnl_count, match_success_exact, match_success_fuzzy, match_fail)
     
     context.pnl_metrics = pnl_metrics
     _save_pnl_metrics(context)
@@ -1505,18 +1570,32 @@ def _update_realized_pnl_from_deliver(context, lookback_days=10):
 def after_trading_end(context, data):
     if '回测' in context.env:
         return
-    info('⏰ 系统调用交易结束处理')
+    info('⏰ 系统调用交易结束处理(Post-Market)...')
     
+    # 【修复 v3.2.31】: 所有重型计算移至此处
     try:
-        # 日常收盘只查 10 天
+        # 1. PnL 归因 (日频，查10天)
         _update_realized_pnl_from_deliver(context, lookback_days=10)
     except Exception as e:
-        info('❌ PnL 更新流程发生未捕获异常: {} (不影响日报表生成)', e)
+        info('❌ PnL 更新流程发生未捕获异常: {}', e)
     
     try:
+        # 2. 生成 CSV 日报
         update_daily_reports(context, data)
     except Exception as e:
-        info('❌ 日报表生成失败: {}', e)
+        info('❌ CSV日报表生成失败: {}', e)
+
+    try:
+        # 3. 生成 HTML 看板
+        generate_html_report(context)
+    except Exception as e:
+        info('❌ HTML看板生成失败: {}', e)
+
+    try:
+        # 4. 保存 PnL 数据
+        _save_pnl_metrics(context)
+    except Exception as e:
+         info('❌ PnL保存失败: {}', e)
         
     info('✅ 交易结束处理完成')
 
@@ -1748,7 +1827,7 @@ def generate_html_report(context):
     <html lang="zh-CN">
     <head>
         <meta charset="UTF-8">
-        <title>策略运行看板 (v3.2.28-PnL-Calc-Fix)</title>
+        <title>策略运行看板 (v3.2.31-Timing-Fix)</title>
         <style>
             body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; background-color: #121212; color: #e0e0e0; margin: 0; padding: 16px; }}
             .container {{ max-width: 1600px; margin: auto; }}
@@ -1773,7 +1852,7 @@ def generate_html_report(context):
     </head>
     <body>
         <div class="container">
-            <h1>策略运行看板 (Deliver-Calc-FIX)</h1>
+            <h1>策略运行看板 (Timing-FIX)</h1>
             <p class="update-time">最后更新时间: {update_time}</p>
             
             <div class="summary-cards">
