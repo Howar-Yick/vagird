@@ -1,10 +1,9 @@
 # event_driven_grid_strategy.py
-# 版本号：GEMINI-3.2.25-PnL-Debug-Fix
-# 相对 3.2.24 的新增/修改要点：
-# - 【PnL 计算兼容性修复】:
-#     - trade_type 判断增加 ['2', 'S', 'Sell', '证券卖出']，防止因 '2'!= 'S' 导致漏算。
-#     - 字段读取增加容错：同时尝试 trade_amount/business_amount。
-#     - 增加 DEBUG 日志：打印首条交割单的完整内容，以便确诊字段名。
+# 版本号：GEMINI-3.2.26-Dup-Patrol-Fix
+# 相对 3.2.25 的新增/修改要点：
+# - 【重复下单修复】:
+#     - 修复了在每 30 分钟巡检时刻，常规挂单逻辑与巡检逻辑同时触发导致的双重下单问题。
+#     - 逻辑变更：当 is_patrol_time 为真时，handle_data 不再执行常规 place_limit_orders，完全由巡检逻辑接管。
 
 import json
 import logging
@@ -21,7 +20,7 @@ from types import SimpleNamespace
 LOG_FH = None
 LOG_DATE = None
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'GEMINI-3.2.25-PnL-Debug-Fix' # <-- 版本号升级
+__version__ = 'GEMINI-3.2.26-Dup-Patrol-Fix' # <-- 版本号升级
 TRANSACTION_COST = 0.00005
 
 # ---- 调试默认（可被 config/debug.json / strategy.json 覆盖）----
@@ -404,16 +403,19 @@ def initialize(context):
             'buy_grid_spacing': 0.005,
             'sell_grid_spacing': 0.005,
             'max_position': saved.get('max_position', saved.get('base_position', cfg['initial_base_position']) + saved.get('grid_unit', cfg['grid_unit']) * 20),
+            # —— VA 限频状态 —— 
             'va_last_update_dt': None,
             'va_update_count_date': None,
             'va_updates_today': 0,
+            # —— 停牌日志压频（每标的）——
             '_halt_next_log_dt': None,
-            '_oo_last': 0,             
-            '_recover_until': None,    
-            '_after_cancel_until': None, 
-            '_oo_drop_seen_ts': None,    
-            '_pos_jump_seen_ts': None,   
-            '_pos_confirm_deadline': None 
+            # —— FILL-RECOVER 运行态 —— 
+            '_oo_last': 0,             # 上次看到的进行中挂单笔数
+            '_recover_until': None,    # 复牌/时窗补偿截止
+            '_after_cancel_until': None, # 撤单后补偿截止
+            '_oo_drop_seen_ts': None,    # 订单簿“掉单”首次发现时间
+            '_pos_jump_seen_ts': None,   # 持仓“跳变”首次发现时间
+            '_pos_confirm_deadline': None # 二次确认截止时刻
         })
         context.state[sym] = st
         context.latest_data[sym] = st['base_price']
@@ -1134,11 +1136,13 @@ def handle_data(context, data):
             if now_dt.minute % 30 == 0 and now_dt.second < 5:
                 update_grid_spacing_final(context, sym, st, get_position(sym).amount)
 
-    if is_auction_time() or (is_main_trading_time() and now < dtime(14, 56)):
+    # 【修复 v3.2.26】: 判定是否为巡检时刻
+    is_patrol_time = (now_dt.minute % 30 == 0 and now_dt.second < 5)
+    
+    # 【修复 v3.2.26】: 仅在非巡检时刻执行常规挂单
+    if not is_patrol_time and (is_auction_time() or (is_main_trading_time() and now < dtime(14, 56))):
         for sym in context.symbol_list:
             if sym in context.state:
-                # 【修复 v3.2.19】: 默认调用 ignore_cooldown=False
-                # 这样如果 handle_data 在成交后 60s 内运行，它会自己避让，不会重复挂单
                 place_limit_orders(context, sym, context.state[sym], ignore_cooldown=False)
 
     for sym in context.symbol_list:
@@ -1146,7 +1150,7 @@ def handle_data(context, data):
         if not st: continue
         _fill_recover_watch(context, sym, st)
 
-    if now_dt.minute % 30 == 0 and now_dt.second < 5:
+    if is_patrol_time:
         info('📌 每30分钟状态巡检...')
         for sym in context.symbol_list:
             if sym in context.state:
@@ -1736,7 +1740,7 @@ def generate_html_report(context):
     <html lang="zh-CN">
     <head>
         <meta charset="UTF-8">
-        <title>策略运行看板 (v3.2.25-PnL-Debug-Fix)</title>
+        <title>策略运行看板 (v3.2.26-Dup-Patrol-Fix)</title>
         <style>
             body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; background-color: #121212; color: #e0e0e0; margin: 0; padding: 16px; }}
             .container {{ max-width: 1600px; margin: auto; }}
