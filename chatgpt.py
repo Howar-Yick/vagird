@@ -1,11 +1,12 @@
 # event_driven_grid_strategy.py
-# 版本号：GEMINI-3.2.31-Timing-Optimization
-# 相对 3.2.30 的新增/修改要点：
-# - 【性能/时序优化】:
-#     - end_of_day (14:56): 剔除所有 PnL 计算和报表生成逻辑。只执行“撤单”和“保存状态”，确保交易收尾的流畅性。
-#     - after_trading_end (>15:00): 承接所有计算任务（PnL归因、HTML看板、CSV日报），利用盘后空闲资源。
-# - 【撤单增强】:
-#     - 在 end_of_day 中增加 3 次撤单重试循环，每次间隔 1 秒，确保清空订单簿。
+# 版本号：GEMINI-3.2.33-PnL-Attribution-Pro-Full
+# 相对 3.2.31 的重大升级：
+# - 【PnL 核心重构】:
+#     - 引入 FIFO 库存队列机制，精准区分 Grid(网格) 和 Base(底仓) 交易。
+#     - 彻底修复“底仓收益全是0”的问题，不再依赖 get_deliver 接口。
+# - 【完整性修复】:
+#     - 恢复了此前因展示缩略而省略的所有风控逻辑（如 _fill_recover_watch, patrol_and_correct_orders）。
+#     - 确保所有配置加载、心跳检测、ATR计算逻辑完整无缺。
 
 import json
 import logging
@@ -24,7 +25,7 @@ import pandas as pd  # 显式导入 pandas 以防万一
 LOG_FH = None
 LOG_DATE = None
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'GEMINI-3.2.31-Timing-Optimization' # <-- 版本号升级
+__version__ = 'GEMINI-3.2.33-PnL-Attribution-Pro-Full'
 TRANSACTION_COST = 0.00005
 
 # ---- 调试默认（可被 config/debug.json / strategy.json 覆盖）----
@@ -476,7 +477,7 @@ def before_trading_start(context, data):
         
         try:
             # 2. 调用补算，指定 lookback_days=45
-            _update_realized_pnl_from_deliver(context, lookback_days=45)
+            _calculate_local_pnl_fifo(context) # 使用本地计算引擎
         except Exception as e:
             info('⚠️ PnL 补算遇到轻微错误: {} (后续会重试)', e)
             
@@ -1092,8 +1093,7 @@ def handle_data(context, data):
 
     if now_dt.minute % 5 == 0 and now_dt.second < 5:
         reload_config_if_changed(context)
-        # 移出HTML生成，减少盘中IO，改到盘后统一生成
-        # generate_html_report(context)
+        # generate_html_report(context) # 移至盘后
 
     boot_grace = (now_dt - getattr(context, 'boot_dt', now_dt)).total_seconds() < getattr(context, 'boot_grace_seconds', 180)
     if not boot_grace:
@@ -1354,250 +1354,148 @@ def _save_pnl_metrics(context):
         except Exception as e:
             info('❌ 保存 PnL 收益指标失败: {}', e)
 
-# ---------------- 【!!! 修复 v3.2.30 (Fuzzy-Match) !!!】日终 PnL 归因计算 ----------------
-def _update_realized_pnl_from_deliver(context, lookback_days=10):
+# ---------------- 【!!! 核心重构 v3.2.33 !!!】本地 PnL 引擎 (Pro版) ----------------
+
+def _calculate_local_pnl_fifo(context):
     """
-    【!!! 核心收益计算修复 (Fix v3.2.30) !!!】
-    引入“模糊匹配”机制，解决券商 entrust_no 混乱导致无法归因的问题。
+    【FIFO 归因引擎】
+    通过模拟“带标签的库存队列”，区分 Base 和 Grid 交易的收益。
     """
-    info('PnL: 开始日终收益归因计算 (基于 get_deliver, scope={}days)...', lookback_days)
-    
-    pnl_metrics = getattr(context, 'pnl_metrics', {})
-    attribution_map = {} # 严格ID匹配表
-    trade_history_list = [] # 模糊匹配表：存储所有历史交易记录详情
+    info('🧮 启动本地 PnL 引擎 (FIFO Attribution Mode)...')
     
     trade_log_path = research_path('reports', 'a_trade_details.csv')
-    
-    # 1. 建立短代码映射表
-    short_code_map = {}
-    for sym in context.symbol_list:
-        short_code = sym.split('.')[0]
-        short_code_map[short_code] = sym
-
     if not trade_log_path.exists():
-        info('PnL: ⚠️ 未找到 a_trade_details.csv，无法进行收益归因。')
+        info('⚠️ 无交易记录文件，跳过计算。')
         return
 
-    # 2. 加载交易日志到内存
+    # 1. 读取并解析 CSV
+    trades = []
     try:
         with open(trade_log_path, 'r', encoding='utf-8') as f:
-            f.readline() # Skip header
+            headers = f.readline().strip().split(',')
             for line in f:
                 parts = line.strip().split(',')
-                if len(parts) >= 7: 
-                    try:
-                        t_time = parts[0].strip()
-                        t_sym = parts[1].strip()
-                        t_dir = parts[2].strip()
-                        t_qty = float(parts[3].strip())
-                        t_price = float(parts[4].strip())
-                        t_base_pos = int(parts[5].strip())
-                        t_entrust = str(parts[6]).strip()
-                        
-                        # 构建严格映射
-                        if t_entrust and t_entrust != 'N/A':
-                            attribution_map[t_entrust] = t_base_pos
-                        
-                        # 构建模糊搜索列表
-                        trade_history_list.append({
-                            'entrust_no': t_entrust,
-                            'symbol': t_sym,
-                            'direction': t_dir,
-                            'quantity': t_qty,
-                            'price': t_price,
-                            'base_pos': t_base_pos,
-                            'time': t_time
-                        })
-                    except:
-                        continue 
-        info('PnL: 成功加载 {} 条交易历史记录。', len(trade_history_list))
+                if len(parts) < 6: continue
+                # 兼容旧格式和新格式 (带base_pos_at_trade)
+                base_pos_at_trade = 0
+                try: base_pos_at_trade = int(parts[5]) 
+                except: pass
+                
+                trades.append({
+                    'time': parts[0],
+                    'symbol': parts[1],
+                    'direction': parts[2],
+                    'qty': float(parts[3]), # Sell is negative
+                    'price': float(parts[4]),
+                    'base_pos_at_trade': base_pos_at_trade
+                })
     except Exception as e:
-        info('PnL: ❌ 加载 a_trade_details.csv 失败: {}', e)
+        info('❌ CSV 读取失败: {}', e)
         return
 
-    # 3. 获取交割单
-    try:
-        end_dt = context.current_dt
-        start_dt = end_dt - timedelta(days=lookback_days) 
-        s_str = start_dt.strftime('%Y%m%d')
-        e_str = end_dt.strftime('%Y%m%d')
-        deliver_data = get_deliver(start_date=s_str, end_date=e_str)
-        
-        deliver_df = None
-        if deliver_data is None: pass
-        elif isinstance(deliver_data, list):
-            if deliver_data: deliver_df = pd.DataFrame(deliver_data)
-        elif hasattr(deliver_data, 'empty'): 
-            if not deliver_data.empty: deliver_df = deliver_data
-        
-        if deliver_df is None or deliver_df.empty:
-            info('PnL: get_deliver(start={}, end={}) 未返回有效数据。', s_str, e_str)
-            return
+    # 2. 按时间排序
+    trades.sort(key=lambda x: x['time'])
 
-        info('PnL: get_deliver() 成功获取 {} 条交割记录。', len(deliver_df))
-
-    except Exception as e:
-        info('PnL: ❌ 调用 get_deliver() 失败: {}', e)
-        return
-
-    new_pnl_count = 0
-    skipped_count = 0
-    match_success_exact = 0
-    match_success_fuzzy = 0
-    match_fail = 0
-    debug_logs_printed = 0
-
-    # 4. 遍历交割单进行归因
-    for _, row in deliver_df.iterrows():
-        entrust_no = "N/A"
-        try:
-            entrust_no = str(row.get('entrust_no', '')).strip()
-            raw_stock_code = str(row.get('stock_code', '')).strip()
-            if not raw_stock_code: continue
-
-            # --- 标的匹配 ---
-            target_symbol = None
-            standard_sym = convert_symbol_to_standard(raw_stock_code)
-            if standard_sym in context.symbol_list:
-                target_symbol = standard_sym
-            if not target_symbol and raw_stock_code in short_code_map:
-                target_symbol = short_code_map[raw_stock_code]
-            
-            if not target_symbol:
-                if debug_logs_printed < 1 and raw_stock_code not in ['761047119006']:
-                    info("PnL [DEBUG] 忽略非策略标的: {} (不在配置列表中)", raw_stock_code)
-                    debug_logs_printed += 1
-                continue
-
-            # --- 数据准备 ---
-            if target_symbol not in pnl_metrics:
-                pnl_metrics[target_symbol] = {'realized_grid_pnl': 0, 'realized_base_pnl': 0, 'total_realized_pnl': 0, '_processed_entrust': []}
-            pnl_data = pnl_metrics[target_symbol]
-            
-            # 去重：如果该交割单ID已经处理过，跳过
-            # 注意：如果ID是空或0，可能会导致所有0号单只能处理一次。
-            # 改进：如果ID无效，我们依赖“模糊匹配”并暂时不记录ID去重（或者记录一个虚拟Hash，这里简化处理，仅记录非空ID）
-            if entrust_no and entrust_no != '0' and entrust_no in pnl_data.get('_processed_entrust', []):
-                skipped_count += 1
-                continue 
-
-            # --- 获取交易核心数据 ---
-            # 兼容交易类型: '2', 'S', 'Sell', '证券卖出', 'ETF卖出'
-            raw_type = str(row.get('trade_type', '')).strip()
-            is_sell = raw_type in ['2', 'S', 'Sell', '证券卖出', 'ETF卖出'] or '卖' in raw_type
-            
-            trade_amount = float(row.get('business_amount') or row.get('trade_amount') or row.get('occur_amount') or 0)
-            trade_balance = float(row.get('business_balance') or row.get('money') or row.get('occur_balance') or 0)
-            business_price = float(row.get('business_price') or row.get('trade_price') or row.get('price') or 0)
-            
-            if business_price == 0 and abs(trade_amount) > 0 and abs(trade_balance) > 0:
-                business_price = abs(trade_balance / trade_amount)
-            
-            # --- 匹配底仓 (Attribution) ---
-            base_pos_at_trade = None
-            
-            # 方式A: 精确匹配
-            if entrust_no in attribution_map:
-                base_pos_at_trade = attribution_map[entrust_no]
-                match_success_exact += 1
-            
-            # 方式B: 模糊匹配 (当精确匹配失败时)
-            if base_pos_at_trade is None:
-                # 寻找: 相同标的 + 相同方向 + 数量一致 + 价格接近 的最近记录
-                # deliver 的 trade_amount 这里的正负号可能不明确，通常 sell 也是正数，需结合 is_sell 判断
-                # CSV 中的 quantity: BUY是正, SELL是负
-                
-                target_qty = -abs(trade_amount) if is_sell else abs(trade_amount)
-                
-                candidates = []
-                for rec in trade_history_list:
-                    if rec['symbol'] == target_symbol:
-                        # 数量误差容忍 1股 (防止部分成交拆单)
-                        if abs(rec['quantity'] - target_qty) < 1.0:
-                             # 价格误差容忍 1%
-                             if abs(rec['price'] - business_price) / (business_price + 0.0001) < 0.01:
-                                 candidates.append(rec)
-                
-                if candidates:
-                    # 取最后一个匹配项 (假设最近的交易)
-                    best_match = candidates[-1]
-                    base_pos_at_trade = best_match['base_pos']
-                    match_success_fuzzy += 1
-                    # info("PnL: 🔎 模糊匹配成功: 交割[{}] -> 记录[{}]", entrust_no, best_match['entrust_no'])
-                else:
-                    match_fail += 1
-
-            # --- 计算盈亏 ---
-            is_grid_trade = True 
-            pnl_contribution = 0
-
-            if is_sell and business_price > 0:
-                pos_obj = get_position(target_symbol)
-                cost = pos_obj.cost_basis
-                if cost <= 0: cost = business_price * 0.99 
-                
-                # 利润 = (卖出价 - 成本) * 数量
-                profit = (business_price - cost) * abs(trade_amount) 
-                pnl_contribution = profit
-                
-                info("PnL: 💰 归因[{}] 卖出 {:.0f}股 @ {:.3f} (成本{:.3f}) -> 盈利 {:.2f} (匹配:{})", 
-                     target_symbol, abs(trade_amount), business_price, cost, profit, 
-                     "精确" if entrust_no in attribution_map else ("模糊" if base_pos_at_trade else "无"))
-
-                if is_grid_trade:
-                    pnl_data['realized_grid_pnl'] += pnl_contribution
-                else:
-                    pnl_data['realized_base_pnl'] += pnl_contribution
-            
-            pnl_data['total_realized_pnl'] = pnl_data['realized_grid_pnl'] + pnl_data['realized_base_pnl']
-            
-            if entrust_no and entrust_no != '0':
-                pnl_data.setdefault('_processed_entrust', []).append(entrust_no)
-            
-            new_pnl_count += 1
-
-        except Exception as e:
-            info('PnL: ❌ 归因计算单行失败 (EntrustNO: {}): {}', entrust_no, e)
-
-    info('PnL: ✅ 日终收益归因完成，处理 {} 笔。匹配情况: 精确={} / 模糊={} / 失败={} (失败则默认归因)', 
-         new_pnl_count, match_success_exact, match_success_fuzzy, match_fail)
+    # 3. 逐标的模拟
+    pnl_metrics = getattr(context, 'pnl_metrics', {})
     
+    for sym in context.symbol_list:
+        if sym not in context.state: continue
+        state = context.state[sym]
+        
+        # 初始化库存：假设初始底仓是 'base' 类型的
+        initial_pos = state.get('initial_base_position', 0)
+        initial_cost = state.get('base_price', 0)
+        
+        # 库存队列: [qty, price, tag]
+        inventory = deque()
+        if initial_pos > 0:
+            inventory.append([initial_pos, initial_cost, 'base'])
+            
+        current_holding = initial_pos
+        
+        grid_pnl = 0.0
+        base_pnl = 0.0
+        
+        sym_trades = [t for t in trades if t['symbol'] == sym]
+        
+        for t in sym_trades:
+            qty = t['qty']
+            price = t['price']
+            # 使用 CSV 里的 base_pos 快照，如果没有则用当前的作为近似
+            target_base = t['base_pos_at_trade'] if t['base_pos_at_trade'] > 0 else state.get('base_position', 0)
+            
+            if qty > 0: # 买入
+                # 逻辑：如果当前持仓 < 目标底仓，买入是为了补底仓 -> 'base'
+                # 否则，买入是网格囤货 -> 'grid'
+                remaining_buy = qty
+                
+                # 优先补底仓
+                if current_holding < target_base:
+                    needed = target_base - current_holding
+                    fill_amt = min(remaining_buy, needed)
+                    inventory.append([fill_amt, price, 'base'])
+                    current_holding += fill_amt
+                    remaining_buy -= fill_amt
+                
+                # 剩下的归为网格
+                if remaining_buy > 0:
+                    inventory.append([remaining_buy, price, 'grid'])
+                    current_holding += remaining_buy
+                    
+            elif qty < 0: # 卖出
+                sell_qty = abs(qty)
+                current_holding -= sell_qty
+                
+                # FIFO 消耗库存
+                while sell_qty > 0.001 and inventory:
+                    lot = inventory[0] # 取队首
+                    lot_qty, lot_price, lot_tag = lot[0], lot[1], lot[2]
+                    
+                    matched = min(sell_qty, lot_qty)
+                    profit = (price - lot_price) * matched
+                    
+                    if lot_tag == 'base':
+                        base_pnl += profit
+                    else:
+                        grid_pnl += profit
+                        
+                    sell_qty -= matched
+                    lot[0] -= matched # 更新库存
+                    
+                    if lot[0] <= 0.001:
+                        inventory.popleft()
+        
+        # 保存计算结果
+        if sym not in pnl_metrics: pnl_metrics[sym] = {}
+        pnl_metrics[sym]['realized_grid_pnl'] = grid_pnl
+        pnl_metrics[sym]['realized_base_pnl'] = base_pnl
+        pnl_metrics[sym]['total_realized_pnl'] = grid_pnl + base_pnl
+        
+        if (grid_pnl + base_pnl) != 0:
+            info('💰 [{}] 归因完成: 网格盈亏={:.2f}, 底仓盈亏={:.2f}', sym, grid_pnl, base_pnl)
+
     context.pnl_metrics = pnl_metrics
     _save_pnl_metrics(context)
 
-# ---------------- 交易结束回调（平台触发） ----------------
+# ---------------- 盘后处理 ----------------
 
 def after_trading_end(context, data):
-    if '回测' in context.env:
-        return
-    info('⏰ 系统调用交易结束处理(Post-Market)...')
+    if '回测' in context.env: return
+    info('🌙 盘后作业开始...')
     
-    # 【修复 v3.2.31】: 所有重型计算移至此处
     try:
-        # 1. PnL 归因 (日频，查10天)
-        _update_realized_pnl_from_deliver(context, lookback_days=10)
+        _calculate_local_pnl_fifo(context)
     except Exception as e:
-        info('❌ PnL 更新流程发生未捕获异常: {}', e)
-    
+        info('❌ PnL 计算失败: {}', e)
+        
     try:
-        # 2. 生成 CSV 日报
         update_daily_reports(context, data)
-    except Exception as e:
-        info('❌ CSV日报表生成失败: {}', e)
-
-    try:
-        # 3. 生成 HTML 看板
         generate_html_report(context)
     except Exception as e:
-        info('❌ HTML看板生成失败: {}', e)
-
-    try:
-        # 4. 保存 PnL 数据
-        _save_pnl_metrics(context)
-    except Exception as e:
-         info('❌ PnL保存失败: {}', e)
+        info('❌ 报表生成失败: {}', e)
         
-    info('✅ 交易结束处理完成')
+    info('✅ 盘后作业结束')
 
 # ---------------- 配置热重载 ----------------
 
@@ -1758,7 +1656,7 @@ def log_trade_details(context, symbol, trade):
     except Exception as e:
         info('❌ [{}] 记录交易日志失败: {}', dsym(context, symbol), e)
 
-# ---------------- 【!!! 升级 v3.2.14 !!!】HTML 看板 ----------------
+# ---------------- 【!!! 补全 !!!】HTML 看板生成完整逻辑 ----------------
 
 def generate_html_report(context):
     all_metrics = []
@@ -1777,10 +1675,11 @@ def generate_html_report(context):
         pos = position.amount 
         price = context.last_valid_price.get(symbol, state['base_price'])
         halted = context.mark_halted.get(symbol, False)
+        
+        # 价格兜底
         if not is_valid_price(price):
             price = position.cost_basis if position.cost_basis > 0 else state['base_price']
-            if not is_valid_price(price):
-                price = 1.0
+            if not is_valid_price(price): price = 1.0
                 
         market_value = pos * price
         unrealized_pnl = (price - position.cost_basis) * pos if position.cost_basis > 0 else 0
@@ -1791,6 +1690,7 @@ def generate_html_report(context):
         name_price = f"{price:.3f}" + (" (停牌)" if halted else "")
         disp_name = dsym(context, symbol, style='long')
         
+        # 读取 PnL 指标
         sym_pnl = pnl_metrics.get(symbol, {})
         realized_grid_pnl = sym_pnl.get('realized_grid_pnl', 0)
         realized_base_pnl = sym_pnl.get('realized_base_pnl', 0)
@@ -1827,7 +1727,7 @@ def generate_html_report(context):
     <html lang="zh-CN">
     <head>
         <meta charset="UTF-8">
-        <title>策略运行看板 (v3.2.31-Timing-Fix)</title>
+        <title>策略运行看板 (v3.2.33-Pro)</title>
         <style>
             body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; background-color: #121212; color: #e0e0e0; margin: 0; padding: 16px; }}
             .container {{ max-width: 1600px; margin: auto; }}
@@ -1852,7 +1752,7 @@ def generate_html_report(context):
     </head>
     <body>
         <div class="container">
-            <h1>策略运行看板 (Timing-FIX)</h1>
+            <h1>策略运行看板 (FIFO-Attribution-Pro)</h1>
             <p class="update-time">最后更新时间: {update_time}</p>
             
             <div class="summary-cards">
@@ -1907,9 +1807,12 @@ def generate_html_report(context):
                 </tbody>
             </table>
 
-            <h2>业绩归因分析 (v3.2.14-PnL-Deliver)</h2>
+            <h2>业绩归因说明 (FIFO-Pro)</h2>
             <div class="placeholder">
-                “资金回报率” (TWRR/MWRR) 需结合 `get_fundjour()` (历史资金流水) 进行计算，暂未实现。
+                采用本地 FIFO 库存算法：<br>
+                1. <b>Base归因</b>：卖出的筹码是当持仓低于底仓线时买入的。<br>
+                2. <b>Grid归因</b>：卖出的筹码是当持仓高于底仓线时买入的。<br>
+                * 数据完全基于本地交易日志 (a_trade_details.csv) 回溯计算。
             </div>
 
             <p class="footer">看板由策略每5分钟更新一次。请在PTRADE中手动刷新查看。</p>
@@ -1923,15 +1826,19 @@ def generate_html_report(context):
         try: pnl_val = float(m["unrealized_pnl"].replace(",", ""))
         except Exception: pnl_val = 0.0
         pnl_class = "positive" if pnl_val >= 0 else "negative"
+        
         try: total_pnl_val = float(m["total_pnl"].replace(",", ""))
         except Exception: total_pnl_val = 0.0
         total_pnl_class = "positive" if total_pnl_val >= 0 else "negative"
+        
         try: grid_pnl_val = float(m["realized_grid_pnl"].replace(",", ""))
         except Exception: grid_pnl_val = 0.0
         grid_pnl_class = "positive" if grid_pnl_val > 0 else ("negative" if grid_pnl_val < 0 else "")
+        
         try: base_pnl_val = float(m["realized_base_pnl"].replace(",", ""))
         except Exception: base_pnl_val = 0.0
         base_pnl_class = "positive" if base_pnl_val > 0 else ("negative" if base_pnl_val < 0 else "")
+        
         try: total_realized_val = float(m["total_realized_pnl"].replace(",", ""))
         except Exception: total_realized_val = 0.0
         total_realized_class = "positive" if total_realized_val > 0 else ("negative" if total_realized_val < 0 else "")
@@ -1971,6 +1878,7 @@ def generate_html_report(context):
         base_pnl_class="positive" if total_realized_base_pnl > 0 else ("negative" if total_realized_base_pnl < 0 else ""),
         table_rows=table_rows
     )
+
     try:
         report_path = research_path('reports', 'strategy_dashboard.html')
         report_path.write_text(final_html, encoding='utf-8')
