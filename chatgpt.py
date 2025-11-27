@@ -1,10 +1,10 @@
 # event_driven_grid_strategy.py
-# 版本号：GEMINI-3.2.19-Dup-Fix
-# 相对 3.2.18 的新增/修改要点：
-# - 【重复挂单修复】:
-#     - 废弃 state['_rehang_bypass_once'] 标志位，解决 handle_data 与 on_order_filled 的竞态冲突。
-#     - place_limit_orders 增加 ignore_cooldown 参数。
-#     - handle_data 默认为 False（避让冷却期），on_order_filled/patrol 显式传 True（强制挂单）。
+# 版本号：GEMINI-3.2.25-PnL-Debug-Fix
+# 相对 3.2.24 的新增/修改要点：
+# - 【PnL 计算兼容性修复】:
+#     - trade_type 判断增加 ['2', 'S', 'Sell', '证券卖出']，防止因 '2'!= 'S' 导致漏算。
+#     - 字段读取增加容错：同时尝试 trade_amount/business_amount。
+#     - 增加 DEBUG 日志：打印首条交割单的完整内容，以便确诊字段名。
 
 import json
 import logging
@@ -21,7 +21,7 @@ from types import SimpleNamespace
 LOG_FH = None
 LOG_DATE = None
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'GEMINI-3.2.19-Dup-Fix' # <-- 版本号升级
+__version__ = 'GEMINI-3.2.25-PnL-Debug-Fix' # <-- 版本号升级
 TRANSACTION_COST = 0.00005
 
 # ---- 调试默认（可被 config/debug.json / strategy.json 覆盖）----
@@ -404,19 +404,16 @@ def initialize(context):
             'buy_grid_spacing': 0.005,
             'sell_grid_spacing': 0.005,
             'max_position': saved.get('max_position', saved.get('base_position', cfg['initial_base_position']) + saved.get('grid_unit', cfg['grid_unit']) * 20),
-            # —— VA 限频状态 —— 
             'va_last_update_dt': None,
             'va_update_count_date': None,
             'va_updates_today': 0,
-            # —— 停牌日志压频（每标的）——
             '_halt_next_log_dt': None,
-            # —— FILL-RECOVER 运行态 —— 
-            '_oo_last': 0,             # 上次看到的进行中挂单笔数
-            '_recover_until': None,    # 复牌/时窗补偿截止
-            '_after_cancel_until': None, # 撤单后补偿截止
-            '_oo_drop_seen_ts': None,    # 订单簿“掉单”首次发现时间
-            '_pos_jump_seen_ts': None,   # 持仓“跳变”首次发现时间
-            '_pos_confirm_deadline': None # 二次确认截止时刻
+            '_oo_last': 0,             
+            '_recover_until': None,    
+            '_after_cancel_until': None, 
+            '_oo_drop_seen_ts': None,    
+            '_pos_jump_seen_ts': None,   
+            '_pos_confirm_deadline': None 
         })
         context.state[sym] = st
         context.latest_data[sym] = st['base_price']
@@ -424,14 +421,9 @@ def initialize(context):
         context.mark_halted[sym] = False
         context.last_valid_price[sym] = st['base_price']
         
-        # 启动时强行清空错误的补偿值
-        if '_pos_change' in st:
-            st.pop('_pos_change')
-        if '_last_pos_seen' in st:
-            st.pop('_last_pos_seen')
-        # 【修复】清理废弃的 flag
-        if '_rehang_bypass_once' in st:
-            st.pop('_rehang_bypass_once')
+        if '_pos_change' in st: st.pop('_pos_change')
+        if '_last_pos_seen' in st: st.pop('_last_pos_seen')
+        if '_rehang_bypass_once' in st: st.pop('_rehang_bypass_once')
 
     context.boot_dt = getattr(context, 'current_dt', None) or datetime.now()
     context.boot_grace_seconds = int(get_saved_param('boot_grace_seconds', 180))
@@ -448,9 +440,10 @@ def initialize(context):
         run_daily(context, end_of_day, time='14:56')
         info('✅ 事件驱动模式就绪')
 
-    # --- 【PnL v3.2.17】PnL 指标初始化 ---
+    # --- 【PnL 指标初始化】 ---
     context.pnl_metrics_path = research_path('state', 'pnl_metrics.json')
     context.pnl_metrics = _load_pnl_metrics(context.pnl_metrics_path)
+            
     info('✅ PnL 收益指标已加载（共 {} 个标的）', len(context.pnl_metrics))
     # --- PnL 初始化结束 ---
     
@@ -471,6 +464,22 @@ def is_order_blocking_period():
 # ---------------- 启动后清理与收敛 ----------------
 
 def before_trading_start(context, data):
+    # 【PnL 修复 v3.2.24】：启动时强制重置，且大幅扩大回溯范围
+    if '回测' not in context.env:
+        info('🚀 [PnL Reset] 强制重置 PnL 状态并回溯补算 (Scope: 45 days)...')
+        
+        # 1. 强制清空内存中的指标
+        context.pnl_metrics = {} 
+        
+        try:
+            # 2. 调用补算，指定 lookback_days=45，覆盖本月和上月
+            _update_realized_pnl_from_deliver(context, lookback_days=45)
+        except Exception as e:
+            info('⚠️ PnL 补算遇到轻微错误: {} (后续会重试)', e)
+            
+        # 3. 立即刷新看板
+        generate_html_report(context)
+
     if context.initial_cleanup_done:
         return
     info('🔁 before_trading_start：清理遗留挂单')
@@ -1335,14 +1344,15 @@ def _save_pnl_metrics(context):
         except Exception as e:
             info('❌ 保存 PnL 收益指标失败: {}', e)
 
-# ---------------- 【!!! 修复 v3.2.18 (Deliver-List-Fix) !!!】日终 PnL 归因计算 ----------------
-def _update_realized_pnl_from_deliver(context):
+# ---------------- 【!!! 修复 v3.2.25 (PnL-Debug-Fix) !!!】日终 PnL 归因计算 ----------------
+def _update_realized_pnl_from_deliver(context, lookback_days=10):
     """
-    【!!! 核心收益计算 (Fix v3.2.18) !!!】
-    修复：兼容 get_deliver 返回 list 类型的情况，强制转换为 DataFrame，防止崩溃。
-    修复：兼容 v3.2.17 的回溯范围逻辑。
+    【!!! 核心收益计算 (Fix v3.2.25) !!!】
+    修复：trade_type 兼容 '2', 'S', 'Sell', '证券卖出'。
+    修复：字段名兼容 trade_amount/business_amount, business_price/trade_price。
+    增加：DEBUG 打印首行数据。
     """
-    info('PnL: 开始日终收益归因计算 (基于 get_deliver)...')
+    info('PnL: 开始日终收益归因计算 (基于 get_deliver, scope={}days)...', lookback_days)
     
     pnl_metrics = getattr(context, 'pnl_metrics', {})
     attribution_map = {}
@@ -1359,7 +1369,7 @@ def _update_realized_pnl_from_deliver(context):
                 parts = line.strip().split(',')
                 if len(parts) >= 7: 
                     try:
-                        entrust_no = parts[6].strip()
+                        entrust_no = str(parts[6]).strip()
                         base_pos_at_trade = int(parts[5].strip())
                         if entrust_no and entrust_no != 'N/A':
                             attribution_map[entrust_no] = base_pos_at_trade
@@ -1372,28 +1382,27 @@ def _update_realized_pnl_from_deliver(context):
 
     try:
         end_dt = context.current_dt
-        start_dt = end_dt - timedelta(days=10) 
+        start_dt = end_dt - timedelta(days=lookback_days) 
         
         s_str = start_dt.strftime('%Y%m%d')
         e_str = end_dt.strftime('%Y%m%d')
         
         deliver_data = get_deliver(start_date=s_str, end_date=e_str)
         
-        import pandas as pd  # 引入 pandas
-
-        # --- 【修复核心 v3.2.18】数据标准化 ---
+        import pandas as pd 
+        
         deliver_df = None
         if deliver_data is None:
             pass
         elif isinstance(deliver_data, list):
-            if deliver_data: # 非空列表
+            if deliver_data: 
                 deliver_df = pd.DataFrame(deliver_data)
         elif hasattr(deliver_data, 'empty'): 
             if not deliver_data.empty:
                 deliver_df = deliver_data
         
         if deliver_df is None or deliver_df.empty:
-            info('PnL: get_deliver(start={}, end={}) 未返回有效数据 (可能是T日清算未完成，将在明日自动补录)。', s_str, e_str)
+            info('PnL: get_deliver(start={}, end={}) 未返回有效数据 (可能是T日清算未完成)。', s_str, e_str)
             return
 
         info('PnL: get_deliver() 成功获取 {} 条交割记录 (范围: {}-{})。', len(deliver_df), s_str, e_str)
@@ -1404,12 +1413,20 @@ def _update_realized_pnl_from_deliver(context):
 
     new_pnl_count = 0
     skipped_count = 0
+    match_success = 0
+    match_fail = 0
     
-    # 现在 deliver_df 必然是 DataFrame，iterrows() 安全了
+    # --- DEBUG: 打印第一行数据结构 (仅一次) ---
+    try:
+        first_row = deliver_df.iloc[0].to_dict()
+        info("🔍 [DEBUG] get_deliver 首行数据示例: {}", first_row)
+    except:
+        pass
+    # ----------------------------------------
+
     for _, row in deliver_df.iterrows():
         entrust_no = "N/A"
         try:
-            # 兼容不同格式，确保取出 entrust_no
             entrust_no = str(row.get('entrust_no', '')).strip()
             stock_code = row.get('stock_code')
             if not stock_code: continue
@@ -1426,23 +1443,31 @@ def _update_realized_pnl_from_deliver(context):
                 continue 
 
             base_pos_at_trade = attribution_map.get(entrust_no)
-            if base_pos_at_trade is None:
-                continue 
-
-            trade_type = row.get('trade_type') 
-            trade_amount = float(row.get('trade_amount', 0))
-            business_price = float(row.get('business_price', 0))
+            
+            if base_pos_at_trade is not None:
+                match_success += 1
+            else:
+                match_fail += 1
+            
+            # --- 核心计算修复 v3.2.25 ---
+            # 1. 兼容不同的 trade_type 值
+            raw_type = str(row.get('trade_type', '')).strip()
+            is_sell = raw_type in ['2', 'S', 'Sell', '证券卖出']
+            
+            # 2. 兼容不同的字段名
+            trade_amount = float(row.get('trade_amount') or row.get('business_amount') or 0)
+            business_price = float(row.get('business_price') or row.get('trade_price') or 0)
             
             is_grid_trade = True # 默认为网格
             
             pnl_contribution = 0
             # 仅卖出计算已实现收益
-            if trade_type == 'S':
+            if is_sell:
                 pos_obj = get_position(symbol_std)
                 cost = pos_obj.cost_basis
                 if cost <= 0: cost = business_price * 0.99 
                 
-                profit = (business_price - cost) * trade_amount
+                profit = (business_price - cost) * abs(trade_amount) # 确保数量为正
                 pnl_contribution = profit
                 
                 if is_grid_trade:
@@ -1457,7 +1482,9 @@ def _update_realized_pnl_from_deliver(context):
         except Exception as e:
             info('PnL: ❌ 归因计算单行失败 (EntrustNO: {}): {}', entrust_no, e)
 
-    info('PnL: ✅ 日终收益归因完成，新处理 {} 笔交割单 (跳过 {} 笔旧单)。', new_pnl_count, skipped_count)
+    info('PnL: ✅ 日终收益归因完成，新处理 {} 笔 (跳过 {} 笔旧单)。ID匹配: 成功={} / 失败={} (失败将默认为网格)', 
+         new_pnl_count, skipped_count, match_success, match_fail)
+    
     context.pnl_metrics = pnl_metrics
     _save_pnl_metrics(context)
 
@@ -1468,13 +1495,12 @@ def after_trading_end(context, data):
         return
     info('⏰ 系统调用交易结束处理')
     
-    # 1. 尝试更新 PnL (带保护)
     try:
-        _update_realized_pnl_from_deliver(context)
+        # 日常收盘只查 10 天
+        _update_realized_pnl_from_deliver(context, lookback_days=10)
     except Exception as e:
         info('❌ PnL 更新流程发生未捕获异常: {} (不影响日报表生成)', e)
     
-    # 2. 必须执行的日报表更新
     try:
         update_daily_reports(context, data)
     except Exception as e:
@@ -1710,7 +1736,7 @@ def generate_html_report(context):
     <html lang="zh-CN">
     <head>
         <meta charset="UTF-8">
-        <title>策略运行看板 (v3.2.19-Dup-Fix)</title>
+        <title>策略运行看板 (v3.2.25-PnL-Debug-Fix)</title>
         <style>
             body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; background-color: #121212; color: #e0e0e0; margin: 0; padding: 16px; }}
             .container {{ max-width: 1600px; margin: auto; }}
