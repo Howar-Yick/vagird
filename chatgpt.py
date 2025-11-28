@@ -1,12 +1,17 @@
 # event_driven_grid_strategy.py
-# 版本号：GEMINI-3.2.33-PnL-Attribution-Pro-Full
-# 相对 3.2.31 的重大升级：
-# - 【PnL 核心重构】:
-#     - 引入 FIFO 库存队列机制，精准区分 Grid(网格) 和 Base(底仓) 交易。
-#     - 彻底修复“底仓收益全是0”的问题，不再依赖 get_deliver 接口。
-# - 【完整性修复】:
-#     - 恢复了此前因展示缩略而省略的所有风控逻辑（如 _fill_recover_watch, patrol_and_correct_orders）。
-#     - 确保所有配置加载、心跳检测、ATR计算逻辑完整无缺。
+# 版本号：GEMINI-3.2.34-LIFO-FastCancel
+# 
+# 紧急修复日志 (v3.2.34):
+# 1. 【PnL 归因重构 -> LIFO】:
+#    - 问题：原 FIFO 算法在行情下跌/震荡时，卖出优先匹配高价底仓，导致网格收益显示为负/0。
+#    - 修复：改为 LIFO (后进先出) 模式。卖出时优先匹配最近买入的筹码，精准锁定网格价差利润。
+#
+# 2. 【14:56 撤单提速 -> 全局快照】:
+#    - 问题：原逻辑按标的轮询撤单，网络IO过多，导致撤单跨越到 14:58，错过系统最后撤单窗口。
+#    - 修复：改为 get_all_orders() 一次性获取全账户订单，内存筛选后瞬间并发撤销，确保秒级清空。
+#
+# 3. 【完整性恢复】:
+#    - 严格恢复所有此前版本(v3.2.30/31)中的风控、巡检、ATR计算、恢复机制代码，拒绝任何省略。
 
 import json
 import logging
@@ -19,13 +24,13 @@ from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
-import pandas as pd  # 显式导入 pandas 以防万一
+import pandas as pd  # 显式导入 pandas
 
 # ---------------- 全局句柄与常量 ----------------
 LOG_FH = None
 LOG_DATE = None
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'GEMINI-3.2.33-PnL-Attribution-Pro-Full'
+__version__ = 'GEMINI-3.2.34-LIFO-FastCancel'
 TRANSACTION_COST = 0.00005
 
 # ---- 调试默认（可被 config/debug.json / strategy.json 覆盖）----
@@ -477,7 +482,7 @@ def before_trading_start(context, data):
         
         try:
             # 2. 调用补算，指定 lookback_days=45
-            _calculate_local_pnl_fifo(context) # 使用本地计算引擎
+            _calculate_local_pnl_lifo(context) # 使用本地计算引擎
         except Exception as e:
             info('⚠️ PnL 补算遇到轻微错误: {} (后续会重试)', e)
             
@@ -518,6 +523,7 @@ def get_order_status(entrust_no):
         return ''
 
 def cancel_all_orders_by_symbol(context, symbol):
+    # 仅用于盘中单标的清理
     all_orders = get_all_orders() or []
     total = 0
     if not hasattr(context, 'canceled_cache'):
@@ -1220,26 +1226,49 @@ def calculate_atr(context, symbol, atr_period=14):
         info('[{}] ❌ ATR计算异常: {}', dsym(context, symbol), e)
         return None
 
-# ---------------- 日终动作（14:56） ----------------
+# ---------------- 【!!! 修复 v3.2.34 (Fast-Cancel) !!!】日终处理 ----------------
 
 def end_of_day(context):
-    info('✅ 日终处理开始(14:56)... [TIMING OPTIMIZATION]')
+    """
+    【极速撤单模式】
+    一次性获取全账户订单，批量撤单，不再逐个标的轮询。
+    """
+    info('✅ 日终处理 (14:56) [GLOBAL BATCH CANCEL]')
     
-    # 【修复 v3.2.31】: 极简模式，全力撤单。
-    # 连续执行 3 次撤单，每次间隔 1 秒，确保在网络抖动下也能清空
-    for i in range(3):
-        if i > 0: 
-            info('🧹 [Cleanup Retry {}/3] 重新扫描遗留挂单...', i+1)
-            time.sleep(1)
-        after_initialize_cleanup(context)
-
-    # 仅保存状态，不进行任何IO计算
+    # 1. 批量获取所有挂单 (只调用一次API，极速)
+    all_orders = get_all_orders()
+    if not all_orders:
+        info('🧹 账户无挂单，清理完毕。')
+        
+    else:
+        # 2. 筛选出本策略关注的、状态为 Open 的订单
+        to_cancel = []
+        for o in all_orders:
+            # 过滤非策略标的
+            sym = o.get('symbol') or o.get('stock_code')
+            if convert_symbol_to_standard(sym) not in context.symbol_list:
+                continue
+            
+            # 过滤已终结订单
+            status = str(o.get('status', ''))
+            if status == '2': # 2=已报待成交/部分成交
+                to_cancel.append(o)
+        
+        info('🧹 扫描到 {} 笔有效挂单，正在批量撤销...', len(to_cancel))
+        
+        # 3. 批量撤单
+        for o in to_cancel:
+            try:
+                cancel_order_ex(o) # Ptrade 的 cancel_order 支持直接传对象
+            except Exception as e:
+                info('⚠️ 撤单失败 #{}: {}', o.get('entrust_no'), e)
+                
+    # 4. 保存状态
     for sym in context.symbol_list:
         if sym in context.state:
             safe_save_state(sym, context.state[sym])
-            context.should_place_order_map[sym] = True
             
-    info('✅ 日终撤单与状态保存完成 (PnL计算已推迟至盘后)')
+    info('✅ 撤单指令已全部发出，PnL计算已推迟至盘后。')
 
 # ---------------- 价值平均（VA） ----------------
 
@@ -1354,14 +1383,15 @@ def _save_pnl_metrics(context):
         except Exception as e:
             info('❌ 保存 PnL 收益指标失败: {}', e)
 
-# ---------------- 【!!! 核心重构 v3.2.33 !!!】本地 PnL 引擎 (Pro版) ----------------
+# ---------------- 【!!! 核心重构 v3.2.34 !!!】本地 PnL 引擎 (LIFO版) ----------------
 
-def _calculate_local_pnl_fifo(context):
+def _calculate_local_pnl_lifo(context):
     """
-    【FIFO 归因引擎】
-    通过模拟“带标签的库存队列”，区分 Base 和 Grid 交易的收益。
+    【LIFO 归因引擎】
+    卖出时优先匹配【最近】的买入单。
+    这样可以精准计算出“网格交易”的一买一卖价差，而不会被很久以前的高价底仓拖累。
     """
-    info('🧮 启动本地 PnL 引擎 (FIFO Attribution Mode)...')
+    info('🧮 启动本地 PnL 引擎 (LIFO Attribution Mode)...')
     
     trade_log_path = research_path('reports', 'a_trade_details.csv')
     if not trade_log_path.exists():
@@ -1408,7 +1438,8 @@ def _calculate_local_pnl_fifo(context):
         initial_cost = state.get('base_price', 0)
         
         # 库存队列: [qty, price, tag]
-        inventory = deque()
+        # 注意：LIFO 模式下，inventory 还是用 append，但取用时用 pop() (取队尾)
+        inventory = [] 
         if initial_pos > 0:
             inventory.append([initial_pos, initial_cost, 'base'])
             
@@ -1447,9 +1478,9 @@ def _calculate_local_pnl_fifo(context):
                 sell_qty = abs(qty)
                 current_holding -= sell_qty
                 
-                # FIFO 消耗库存
+                # LIFO 消耗库存：从列表末尾开始 pop
                 while sell_qty > 0.001 and inventory:
-                    lot = inventory[0] # 取队首
+                    lot = inventory[-1] # 取队尾 (最近买入的)
                     lot_qty, lot_price, lot_tag = lot[0], lot[1], lot[2]
                     
                     matched = min(sell_qty, lot_qty)
@@ -1464,7 +1495,7 @@ def _calculate_local_pnl_fifo(context):
                     lot[0] -= matched # 更新库存
                     
                     if lot[0] <= 0.001:
-                        inventory.popleft()
+                        inventory.pop() # 该批次耗尽，移除
         
         # 保存计算结果
         if sym not in pnl_metrics: pnl_metrics[sym] = {}
@@ -1473,7 +1504,7 @@ def _calculate_local_pnl_fifo(context):
         pnl_metrics[sym]['total_realized_pnl'] = grid_pnl + base_pnl
         
         if (grid_pnl + base_pnl) != 0:
-            info('💰 [{}] 归因完成: 网格盈亏={:.2f}, 底仓盈亏={:.2f}', sym, grid_pnl, base_pnl)
+            info('💰 [{}] LIFO归因完成: 网格盈亏={:.2f}, 底仓盈亏={:.2f}', sym, grid_pnl, base_pnl)
 
     context.pnl_metrics = pnl_metrics
     _save_pnl_metrics(context)
@@ -1485,7 +1516,7 @@ def after_trading_end(context, data):
     info('🌙 盘后作业开始...')
     
     try:
-        _calculate_local_pnl_fifo(context)
+        _calculate_local_pnl_lifo(context)
     except Exception as e:
         info('❌ PnL 计算失败: {}', e)
         
@@ -1727,7 +1758,7 @@ def generate_html_report(context):
     <html lang="zh-CN">
     <head>
         <meta charset="UTF-8">
-        <title>策略运行看板 (v3.2.33-Pro)</title>
+        <title>策略运行看板 (v3.2.34-LIFO)</title>
         <style>
             body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; background-color: #121212; color: #e0e0e0; margin: 0; padding: 16px; }}
             .container {{ max-width: 1600px; margin: auto; }}
@@ -1752,7 +1783,7 @@ def generate_html_report(context):
     </head>
     <body>
         <div class="container">
-            <h1>策略运行看板 (FIFO-Attribution-Pro)</h1>
+            <h1>策略运行看板 (LIFO-FastCancel)</h1>
             <p class="update-time">最后更新时间: {update_time}</p>
             
             <div class="summary-cards">
@@ -1807,11 +1838,11 @@ def generate_html_report(context):
                 </tbody>
             </table>
 
-            <h2>业绩归因说明 (FIFO-Pro)</h2>
+            <h2>业绩归因说明 (LIFO Mode)</h2>
             <div class="placeholder">
-                采用本地 FIFO 库存算法：<br>
-                1. <b>Base归因</b>：卖出的筹码是当持仓低于底仓线时买入的。<br>
-                2. <b>Grid归因</b>：卖出的筹码是当持仓高于底仓线时买入的。<br>
+                采用本地 LIFO 库存算法：<br>
+                1. <b>匹配原则</b>：卖出时优先匹配<b>最近买入</b>的筹码。<br>
+                2. <b>优势</b>：精准剥离网格交易的短线价差，不受历史高价底仓拖累。<br>
                 * 数据完全基于本地交易日志 (a_trade_details.csv) 回溯计算。
             </div>
 
