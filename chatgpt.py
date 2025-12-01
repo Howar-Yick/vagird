@@ -1,10 +1,14 @@
 # event_driven_grid_strategy.py
-# 版本号：GEMINI-3.2.35-Fix-DupSell-CancelErr
+# 版本号：GEMINI-3.2.38-Fix-LogTrade-BurstOrder
 # 
-# 修复日志 (v3.2.35):
-# 1. 【撤单报错修复】: 增加对 status=8 (已成) 的预判，避免对已成交订单发撤单指令。
-# 2. 【重复卖单修复】: 引入 'pending_frozen' 机制。下单立即冻结虚拟持仓，防止因API持仓延迟更新导致的重复下单。
-# 3. 【看板更新修复】: 优化看板刷新触发逻辑，防止因异常中断或时间窗口错过导致的停更。
+# 紧急修复日志 (v3.2.38):
+# 1. 【致命错误修复】: 
+#    - 补全 `log_trade_details` 函数定义，修复 NameError 导致的程序崩溃。
+# 2. 【并发性能优化】:
+#    - 重构 `place_auction_orders`: 采用“计算-执行分离”模式。
+#      先在内存中计算完所有标的的挂单价格，然后在一个极紧凑的循环中仅发送 order 指令，消除标的间的查询等待，实现“爆发式”挂单。
+# 3. 【完整性确认】:
+#    - 包含 LIFO PnL 归因、PendingFrozen 防重单、Flash Cancel 全局撤单、HTML 看板生成。
 
 import json
 import logging
@@ -17,13 +21,13 @@ from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
-import pandas as pd  # 显式导入 pandas
+import pandas as pd
 
 # ---------------- 全局句柄与常量 ----------------
 LOG_FH = None
 LOG_DATE = None
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'GEMINI-3.2.35-Fix-DupSell-CancelErr'
+__version__ = 'GEMINI-3.2.38-Fix-LogTrade-BurstOrder'
 TRANSACTION_COST = 0.00005
 
 # ---- 调试默认 ----
@@ -385,7 +389,7 @@ def initialize(context):
     context.mark_halted = {}
     context.last_valid_price = {}
     context.last_valid_ts = {sym: None for sym in context.symbol_list}
-    context.pending_frozen = {} # 【Fix 2】: 虚拟冻结持仓，防止重复下单
+    context.pending_frozen = {} # 【Fix 2】: 虚拟冻结持仓
 
     # 成交去重 ring（5s 有效）
     context.recent_fill_ring = deque(maxlen=200)
@@ -502,15 +506,50 @@ def before_trading_start(context, data):
 def after_initialize_cleanup(context):
     if '回测' in context.env or not hasattr(context, 'symbol_list'):
         return
-    info('🗑️ 按品种清理所有遗留挂单')
+    
+    # 【Fix v3.2.36】: 启动/重启时使用全局闪电撤单，替代逐个查询
+    _fast_cancel_all_orders_global(context)
+    
+    # 清理内存状态
     for sym in context.symbol_list:
-        cancel_all_orders_by_symbol(context, sym)
         if sym in context.state:
             context.state[sym].pop('_pos_change', None)
             context.state[sym].pop('_last_pos_seen', None)
-        # 重置冻结量
         context.pending_frozen[sym] = 0
-    info('✅ 按品种清理完成')
+    info('✅ 全局清理完成')
+
+def _fast_cancel_all_orders_global(context):
+    """【v3.2.36 新增】: 全局闪电撤单，一次IO获取所有，批量撤单"""
+    info('⚡ 执行全局闪电撤单 (Flash Cancel)...')
+    try:
+        all_orders = get_all_orders()
+        if not all_orders:
+            return
+        
+        to_cancel = []
+        for o in all_orders:
+            sym = o.get('symbol') or o.get('stock_code')
+            # 只撤本策略关注的
+            if convert_symbol_to_standard(sym) not in context.symbol_list:
+                continue
+            
+            status = str(o.get('status', ''))
+            # 2=已报待成, 7=部成待撤? (主要关注2)
+            if status in ['2', '7']: 
+                to_cancel.append(o)
+        
+        if to_cancel:
+            info('⚡ 扫描到 {} 笔有效挂单，瞬间并发撤销...', len(to_cancel))
+            for o in to_cancel:
+                try:
+                    cancel_order_ex(o)
+                except Exception as e:
+                    info('⚠️ 撤单失败 #{}: {}', o.get('entrust_no'), e)
+        else:
+            info('⚡ 无需撤单。')
+            
+    except Exception as e:
+        info('⚠️ 全局撤单异常: {}', e)
 
 # ---------------- 订单与撤单工具 ----------------
 
@@ -523,7 +562,9 @@ def get_order_status(entrust_no):
         return ''
 
 def cancel_all_orders_by_symbol(context, symbol):
-    # 仅用于盘中单标的清理
+    # 【注意】此函数现在仅用于盘中针对**单一标的**的定点清理（如成交后）
+    # 启动和收盘时的批量清理已移交 _fast_cancel_all_orders_global
+    
     all_orders = get_all_orders() or []
     total = 0
     if not hasattr(context, 'canceled_cache'):
@@ -540,14 +581,13 @@ def cancel_all_orders_by_symbol(context, symbol):
         status = str(o.get('status', ''))
         entrust_no = o.get('entrust_no')
         
-        # 【Fix 1】: 增加对已成交订单的判断，防止重复撤单报错 [status=8]
+        # 【Fix 1】: 增加对已成交订单的判断
         if (not entrust_no
-            or status in ('8', '5', '6', '4') # 8=已成, 5=废单, 6=撤单, 4=撤单
+            or status in ('8', '5', '6', '4') 
             or entrust_no in context.state[symbol]['filled_order_ids']
             or entrust_no in cache):
             continue
             
-        # 二次确认实时状态
         final_status = get_order_status(entrust_no)
         if final_status in ('8', '4', '5', '6'):
             continue
@@ -559,25 +599,63 @@ def cancel_all_orders_by_symbol(context, symbol):
             cancel_order_ex({'entrust_no': entrust_no, 'symbol': api_sym})
         except Exception as e:
             info('[{}] ⚠️ 撤单异常 entrust_no={}: {}', dsym(context, symbol), entrust_no, e)
-    if total > 0:
-        info('[{}] 共{}笔遗留挂单尝试撤销完毕（将于下一次 get_open_orders 快照核验）', dsym(context, symbol), total)
 
 # ---------------- 集合竞价挂单 ----------------
 
 def place_auction_orders(context):
     if '回测' in context.env or not (is_auction_time() or is_main_trading_time()):
         return
-    info('🕒 清空防抖缓存，开始集合竞价挂单（按 base_price 补挂）')
-    for st in context.state.values():
-        st.pop('_last_order_bp', None); st.pop('_last_order_ts', None)
+    info('🕒 开始集合竞价挂单流程 (并发模式)...')
+    
+    # 1. 全局清理 (Flash Cancel)
+    _fast_cancel_all_orders_global(context)
+    
+    # 2. 准备挂单数据
+    # 使用列表存储待发订单，实现“计算-执行分离”
+    orders_batch = []
+    
     for sym in context.symbol_list:
         state = context.state[sym]
+        # 重置防抖
+        state.pop('_last_order_bp', None)
+        state.pop('_last_order_ts', None)
+        
         adjust_grid_unit(state)
-        cancel_all_orders_by_symbol(context, sym)
         context.latest_data[sym] = state['base_price']
-        # 集合竞价强制挂单，忽略冷却
-        place_limit_orders(context, sym, state, ignore_cooldown=True)
+        
+        # 预计算挂单参数
+        base = state['base_price']
+        unit = state['grid_unit']
+        buy_p = round(base * (1 - state['buy_grid_spacing']), 3)
+        sell_p = round(base * (1 + state['sell_grid_spacing']), 3)
+        
+        position = get_position(sym)
+        pos = position.amount
+        enable = position.enable_amount - context.pending_frozen.get(sym, 0)
+        
+        # 生成买单
+        if pos + unit <= state['max_position']:
+            orders_batch.append({
+                'symbol': sym, 'side': 'buy', 'price': buy_p, 'amount': unit, 'desc': f'买入 {unit}'
+            })
+            
+        # 生成卖单
+        if enable >= unit and pos - unit >= state['base_position']:
+            orders_batch.append({
+                'symbol': sym, 'side': 'sell', 'price': sell_p, 'amount': -unit, 'desc': f'卖出 {unit}'
+            })
+            
         safe_save_state(sym, state)
+
+    # 3. 爆发式下单 (无IO阻塞循环)
+    info('🚀 生成 {} 笔挂单任务，开始密集发送...', len(orders_batch))
+    for task in orders_batch:
+        try:
+            order(task['symbol'], task['amount'], limit_price=task['price'])
+            # 仅打印极简日志，减少IO
+            # info('[{}] {} @ {}', dsym(context, task['symbol']), task['desc'], task['price']) 
+        except Exception as e:
+            info('⚠️ 下单失败 [{}]: {}', task['symbol'], e)
 
 # ---------------- 实时价：快照获取 + 心跳日志 ----------------
 
@@ -784,7 +862,6 @@ def place_limit_orders(context, symbol, state, ignore_cooldown=False):
         can_sell = not same_sell
         
         # 【Fix 2】: 引入虚拟冻结持仓判断，防止重复卖出
-        # 实际可用 = 系统返回可用 - 策略内部记录的已发单但未成交的冻结
         pending_frozen = context.pending_frozen.get(symbol, 0)
         real_enable = enable_amount - pending_frozen
         
@@ -1119,7 +1196,6 @@ def handle_data(context, data):
     _fetch_quotes_via_snapshot(context)
     
     # 【Fix 3】: 优化看板更新触发逻辑
-    # 只要当前时间是 5 的倍数分钟，且该分钟内还没更新过，就执行一次
     if now_dt.minute % 5 == 0:
         last_update = getattr(context, 'last_report_time', None)
         if last_update is None or last_update.minute != now_dt.minute:
@@ -1256,7 +1332,7 @@ def calculate_atr(context, symbol, atr_period=14):
         info('[{}] ❌ ATR计算异常: {}', dsym(context, symbol), e)
         return None
 
-# ---------------- 【!!! 修复 v3.2.34 (Fast-Cancel) !!!】日终处理 ----------------
+# ---------------- 【!!! 修复 v3.2.36 (Flash-Cancel) !!!】日终处理 ----------------
 
 def end_of_day(context):
     """
@@ -1299,6 +1375,38 @@ def end_of_day(context):
             safe_save_state(sym, context.state[sym])
             
     info('✅ 撤单指令已全部发出，PnL计算已推迟至盘后。')
+    
+# ---------------- 【新增 v3.2.36】全局撤单辅助函数 ----------------
+
+def _fast_cancel_all_orders_global(context):
+    """全局闪电撤单，用于启动时快速清理"""
+    info('⚡ 执行全局闪电撤单 (Flash Cancel)...')
+    try:
+        all_orders = get_all_orders()
+        if not all_orders:
+            return
+        
+        to_cancel = []
+        for o in all_orders:
+            sym = o.get('symbol') or o.get('stock_code')
+            if convert_symbol_to_standard(sym) not in context.symbol_list:
+                continue
+            status = str(o.get('status', ''))
+            if status in ['2', '7']: 
+                to_cancel.append(o)
+        
+        if to_cancel:
+            info('⚡ 扫描到 {} 笔有效挂单，瞬间并发撤销...', len(to_cancel))
+            for o in to_cancel:
+                try:
+                    cancel_order_ex(o)
+                except Exception as e:
+                    info('⚠️ 撤单失败 #{}: {}', o.get('entrust_no'), e)
+        else:
+            info('⚡ 无需撤单。')
+            
+    except Exception as e:
+        info('⚠️ 全局撤单异常: {}', e)
 
 # ---------------- VA & Tools ----------------
 
@@ -1480,6 +1588,171 @@ def after_trading_end(context, data):
         
     info('✅ 盘后作业结束')
 
+# ---------------- 配置热重载 (Fixed v3.2.37: 补回定义) ----------------
+
+def reload_config_if_changed(context):
+    try:
+        current_mod_time = context.config_file_path.stat().st_mtime
+        if current_mod_time == context.last_config_mod_time:
+            return
+        info('♻️ 检测到配置文件发生变更，开始热重载...')
+        context.last_config_mod_time = current_mod_time
+        new_config = json.loads(context.config_file_path.read_text(encoding='utf-8'))
+        old_symbols, new_symbols = set(context.symbol_list), set(new_config.keys())
+
+        # 处理移除
+        for sym in old_symbols - new_symbols:
+            info('[{}] 标的已从配置中移除，将清理其状态和挂单...', dsym(context, sym))
+            cancel_all_orders_by_symbol(context, sym)
+            context.symbol_list.remove(sym)
+            if sym in context.state: del context.state[sym]
+            if sym in context.latest_data: del context.latest_data[sym]
+            context.mark_halted.pop(sym, None)
+            context.last_valid_price.pop(sym, None)
+            context.last_valid_ts.pop(sym, None)
+            context.pending_frozen.pop(sym, None) 
+
+        # 处理新增
+        for sym in new_symbols - old_symbols:
+            info('[{}] 新增标的，正在初始化状态...', dsym(context, sym))
+            cfg = new_config[sym]
+            st = {**cfg}
+            st.update({
+                'base_price': cfg['base_price'], 'grid_unit': cfg['grid_unit'],
+                'filled_order_ids': set(), 'trade_week_set': set(),
+                'base_position': cfg['initial_base_position'],
+                'last_week_position': cfg['initial_base_position'],
+                'initial_position_value': cfg['initial_base_position'] * cfg['base_price'],
+                'buy_grid_spacing': 0.005, 'sell_grid_spacing': 0.005,
+                'max_position': cfg['initial_base_position'] + cfg['grid_unit'] * 20,
+                'va_last_update_dt': None,
+                'va_update_count_date': None,
+                'va_updates_today': 0,
+                '_halt_next_log_dt': None,
+                '_oo_last': 0, 
+                '_recover_until': None, '_after_cancel_until': None, 
+                '_oo_drop_seen_ts': None, '_pos_jump_seen_ts': None, 
+                '_pos_confirm_deadline': None
+            })
+            context.state[sym] = st
+            context.latest_data[sym] = st['base_price']
+            context.symbol_list.append(sym)
+            context.mark_halted[sym] = False
+            context.last_valid_price[sym] = st['base_price']
+            context.last_valid_ts[sym] = None
+            context.pending_frozen[sym] = 0
+
+        # 处理更新
+        for sym in old_symbols.intersection(new_symbols):
+            if context.symbol_config[sym] != new_config[sym]:
+                info('[{}] 参数发生变更，正在更新...', dsym(context, sym))
+                state, new_params = context.state[sym], new_config[sym]
+                state.update({
+                    'grid_unit': new_params['grid_unit'],
+                    'dingtou_base': new_params['dingtou_base'],
+                    'dingtou_rate': new_params['dingtou_rate'],
+                    'max_position': state['base_position'] + new_params['grid_unit'] * 20
+                })
+        context.symbol_config = new_config
+        _load_symbol_names(context)
+        info('✅ 配置文件热重载完成！当前监控标的: {}', context.symbol_list)
+    except Exception as e:
+        info(f'❌ 配置文件热重载失败: {e}')
+
+# ---------------- 【!!! 修复 v3.2.37 (Missing-Func) !!!】日志辅助函数 ----------------
+# 必须明确定义此函数，否则 on_trade_response 会崩溃
+
+def log_trade_details(context, symbol, trade):
+    try:
+        trade_log_path = research_path('reports', 'a_trade_details.csv')
+        is_new = not trade_log_path.exists()
+        entrust_no = trade.get('entrust_no', 'N/A') 
+        with open(trade_log_path, 'a', encoding='utf-8', newline='') as f:
+            if is_new:
+                headers = ["time", "symbol", "direction", "quantity", "price", "base_position_at_trade", "entrust_no"]
+                f.write(",".join(headers) + "\n")
+            direction = "BUY" if trade['entrust_bs'] == '1' else "SELL"
+            base_position = context.state[symbol].get('base_position', 0)
+            row = [
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                symbol,
+                direction,
+                str(trade['business_amount']),
+                f"{trade['business_price']:.3f}",
+                str(base_position),
+                entrust_no 
+            ]
+            f.write(",".join(row) + "\n")
+    except Exception as e:
+        info('❌ [{}] 记录交易日志失败: {}', dsym(context, symbol), e)
+
+# ---------------- 日报/报表 ----------------
+
+def update_daily_reports(context, data):
+    reports_dir = research_path('reports')
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    current_date = context.current_dt.strftime("%Y-%m-%d")
+    for symbol in context.symbol_list:
+        report_file = reports_dir / f"{symbol}.csv"
+        state = context.state[symbol]
+        
+        position = get_position(symbol)
+        amount = position.amount
+        
+        cost_basis = getattr(position, 'cost_basis', state['base_price'])
+        close_price = context.last_valid_price.get(symbol, state['base_price'])
+        try:
+            if not is_valid_price(close_price):
+                close_price = cost_basis if cost_basis > 0 else state['base_price']
+                if not is_valid_price(close_price):
+                    close_price = 1.0
+        except:
+            close_price = state['base_price']
+        weeks = len(state.get('trade_week_set', []))
+        count = weeks
+        d_base = state['dingtou_base']
+        d_rate = state['dingtou_rate']
+        invest_should = d_base
+        invest_actual = d_base * (1 + d_rate) ** weeks
+        cumulative_invest = sum(d_base * (1 + d_rate) ** w for w in range(1, weeks+1))
+        expected_value = state['initial_position_value'] + d_base * weeks
+        last_week_val = state.get('last_week_position', 0) * close_price
+        current_val   = amount * close_price
+        weekly_return = (current_val - last_week_val) / last_week_val if last_week_val>0 else 0.0
+        total_return  = (current_val - cumulative_invest) / cumulative_invest if cumulative_invest>0 else 0.0
+        weekly_bottom_profit = (state['base_position'] - state.get('last_week_position', 0)) * close_price
+        total_bottom_profit  = state['base_position'] * close_price - state['initial_position_value']
+        standard_qty    = state['base_position'] + state['grid_unit'] * 5
+        intermediate_qty= state['base_position'] + state['grid_unit'] * 15
+        added_base      = state['base_position'] - state.get('last_week_position', 0)
+        compare_cost    = added_base * close_price
+        profit_all      = (close_price - cost_basis) * amount if cost_basis > 0 else 0
+        t_quantity = max(0, amount - state['base_position'])
+        row = [
+            current_date, f"{close_price:.3f}", str(weeks), str(count),
+            f"{weekly_return:.2%}", f"{total_return:.2%}", f"{expected_value:.2f}",
+            f"{invest_should:.0f}", f"{invest_actual:.0f}", f"{cumulative_invest:.0f}",
+            str(state['initial_base_position']), str(state['base_position']),
+            f"{state['base_position'] * close_price:.0f}", f"{weekly_bottom_profit:.0f}",
+            f"{total_bottom_profit:.0f}", str(state['base_position']), str(amount),
+            str(state['grid_unit']), str(t_quantity), str(standard_qty),
+            str(intermediate_qty), str(state['max_position']), f"{cost_basis:.3f}",
+            f"{compare_cost:.3f}", f"{profit_all:.0f}"
+        ]
+        is_new = not report_file.exists()
+        with open(report_file, 'a', encoding='utf-8', newline='') as f:
+            if is_new:
+                headers = [
+                    "时间","市价","期数","次数","每期总收益率","盈亏比","应到价值",
+                    "当周应投入金额","当周实际投入金额","实际累计投入金额","定投底仓份额",
+                    "累计底仓份额","累计底仓价值","每期累计底仓盈利","总累计底仓盈利",
+                    "底仓","股票余额","单次网格交易数量","可T数量","标准数量","中间数量",
+                    "极限数量","成本价","对比定投成本","盈亏"
+                ]
+                f.write(",".join(headers) + "\n")
+            f.write(",".join(map(str, row)) + "\n")
+        info('✅ [{}] 已更新每日CSV报表：{}', dsym(context, symbol), report_file)
+
 # ---------------- 【!!! 补全 !!!】HTML 看板生成完整逻辑 ----------------
 
 def generate_html_report(context):
@@ -1551,7 +1824,7 @@ def generate_html_report(context):
     <html lang="zh-CN">
     <head>
         <meta charset="UTF-8">
-        <title>策略运行看板 (v3.2.35-Fix)</title>
+        <title>策略运行看板 (v3.2.38-LIFO-Fix)</title>
         <style>
             body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; background-color: #121212; color: #e0e0e0; margin: 0; padding: 16px; }}
             .container {{ max-width: 1600px; margin: auto; }}
@@ -1576,7 +1849,7 @@ def generate_html_report(context):
     </head>
     <body>
         <div class="container">
-            <h1>策略运行看板 (LIFO-FastCancel)</h1>
+            <h1>策略运行看板 (LIFO-FastCancel-Fix)</h1>
             <p class="update-time">最后更新时间: {update_time}</p>
             
             <div class="summary-cards">
