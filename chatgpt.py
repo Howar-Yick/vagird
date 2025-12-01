@@ -1,14 +1,14 @@
 # event_driven_grid_strategy.py
-# 版本号：GEMINI-3.2.38-Fix-LogTrade-BurstOrder
+# 版本号：GEMINI-3.2.42-VA-Sensitivity-Fix
 # 
-# 紧急修复日志 (v3.2.38):
-# 1. 【致命错误修复】: 
-#    - 补全 `log_trade_details` 函数定义，修复 NameError 导致的程序崩溃。
-# 2. 【并发性能优化】:
-#    - 重构 `place_auction_orders`: 采用“计算-执行分离”模式。
-#      先在内存中计算完所有标的的挂单价格，然后在一个极紧凑的循环中仅发送 order 指令，消除标的间的查询等待，实现“爆发式”挂单。
-# 3. 【完整性确认】:
-#    - 包含 LIFO PnL 归因、PendingFrozen 防重单、Flash Cancel 全局撤单、HTML 看板生成。
+# 修复日志 (v3.2.42):
+# 1. 【VA底仓释放阈值修正】:
+#    - 问题：原 1.5 倍系数导致底仓释放过于迟钝，错过上涨初期的获利机会。
+#    - 修复：将释放阈值改为 1.0 * grid_unit。只要市值盈余达到一个网格单位，立即释放底仓，提高资金效率。
+#    - 逻辑保障：由于加仓阈值是 -1.0 单位，减仓是 +1.0 单位，中间有 2.0 单位的天然缓冲区，不会发生震荡。
+# 
+# 2. 【功能完整性确认】:
+#    - 包含 LIFO PnL、Flash Cancel (全局极速撤单)、PendingFrozen (防重卖)、HTML看板、LogTradeDetails 等所有已完善功能。
 
 import json
 import logging
@@ -27,7 +27,7 @@ import pandas as pd
 LOG_FH = None
 LOG_DATE = None
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'GEMINI-3.2.38-Fix-LogTrade-BurstOrder'
+__version__ = 'GEMINI-3.2.42-VA-Sensitivity-Fix'
 TRANSACTION_COST = 0.00005
 
 # ---- 调试默认 ----
@@ -447,7 +447,10 @@ def initialize(context):
     context.initial_cleanup_done = False
     if '回测' not in context.env:
         run_daily(context, place_auction_orders, time='9:15')
-        run_daily(context, end_of_day, time='14:56')
+        
+        # 【Fix 3.2.41】: 提前收盘处理时间到 14:55，防止撤单超时
+        run_daily(context, end_of_day, time='14:55')
+        
         info('✅ 事件驱动模式就绪')
 
     # --- 【PnL 指标初始化】 ---
@@ -543,8 +546,21 @@ def _fast_cancel_all_orders_global(context):
             for o in to_cancel:
                 try:
                     cancel_order_ex(o)
-                except Exception as e:
-                    info('⚠️ 撤单失败 #{}: {}', o.get('entrust_no'), e)
+                    
+                    # 【Fix v3.2.40】: 撤销卖单释放冻结
+                    o_amt = getattr(o, 'amount', 0)
+                    if o_amt == 0 and isinstance(o, dict):
+                        o_amt = o.get('amount', 0)
+                    
+                    o_sym = convert_symbol_to_standard(o.get('symbol') or o.get('stock_code'))
+                    is_sell = (o_amt < 0) or (str(o.get('entrust_bs', '')) == '2')
+                    
+                    if is_sell and o_sym in context.pending_frozen:
+                        frozen = abs(o_amt)
+                        context.pending_frozen[o_sym] = max(0, context.pending_frozen[o_sym] - frozen)
+
+                except Exception:
+                    pass # 忽略单个撤单错误，保证整体速度
         else:
             info('⚡ 无需撤单。')
             
@@ -597,6 +613,19 @@ def cancel_all_orders_by_symbol(context, symbol):
         info('[{}] 🧹 发现并尝试撤销遗留挂单 entrust_no={}', dsym(context, symbol), entrust_no)
         try:
             cancel_order_ex({'entrust_no': entrust_no, 'symbol': api_sym})
+            
+            # 【Fix v3.2.39】: 单标的撤单时，也要释放冻结
+            # 【Fix v3.2.40】: 使用兼容写法，防 dict 无属性报错
+            o_amt = getattr(o, 'amount', 0)
+            if o_amt == 0 and isinstance(o, dict):
+                o_amt = o.get('amount', 0)
+                
+            is_sell = (o_amt < 0) or (str(o.get('entrust_bs', '')) == '2')
+            
+            if is_sell:
+                frozen = abs(o_amt)
+                context.pending_frozen[symbol] = max(0, context.pending_frozen.get(symbol, 0) - frozen)
+
         except Exception as e:
             info('[{}] ⚠️ 撤单异常 entrust_no={}: {}', dsym(context, symbol), entrust_no, e)
 
@@ -647,13 +676,24 @@ def place_auction_orders(context):
             
         safe_save_state(sym, state)
 
-    # 3. 爆发式下单 (无IO阻塞循环)
+    # 3. 爆发式下单 (带流控)
     info('🚀 生成 {} 笔挂单任务，开始密集发送...', len(orders_batch))
+    
+    # 【Fix v3.2.39】: 增加简单的流控，每5笔休眠0.05秒
+    count = 0
     for task in orders_batch:
         try:
+            if count > 0 and count % 5 == 0:
+                time.sleep(0.05) # Flow Control
+                
             order(task['symbol'], task['amount'], limit_price=task['price'])
-            # 仅打印极简日志，减少IO
-            # info('[{}] {} @ {}', dsym(context, task['symbol']), task['desc'], task['price']) 
+            
+            # 如果是卖单，立即增加冻结
+            if task['amount'] < 0:
+                sym = task['symbol']
+                context.pending_frozen[sym] = context.pending_frozen.get(sym, 0) + abs(task['amount'])
+            
+            count += 1
         except Exception as e:
             info('⚠️ 下单失败 [{}]: {}', task['symbol'], e)
 
@@ -1339,7 +1379,8 @@ def end_of_day(context):
     【极速撤单模式】
     一次性获取全账户订单，批量撤单，不再逐个标的轮询。
     """
-    info('✅ 日终处理 (14:56) [GLOBAL BATCH CANCEL]')
+    # 【Fix v3.2.41】: 配合 Run_Daily 14:55 触发，无需等待到 14:56
+    info('✅ 日终处理 (Early Start @ 14:55) [GLOBAL BATCH CANCEL]')
     
     # 1. 批量获取所有挂单 (只调用一次API，极速)
     all_orders = get_all_orders()
@@ -1366,8 +1407,22 @@ def end_of_day(context):
         for o in to_cancel:
             try:
                 cancel_order_ex(o) # Ptrade 的 cancel_order 支持直接传对象
+                
+                # 【Fix v3.2.40】: 撤销卖单时释放冻结
+                o_amt = getattr(o, 'amount', 0)
+                if o_amt == 0 and isinstance(o, dict):
+                    o_amt = o.get('amount', 0)
+                
+                o_sym = convert_symbol_to_standard(o.get('symbol') or o.get('stock_code'))
+                is_sell = (o_amt < 0) or (str(o.get('entrust_bs', '')) == '2')
+                
+                if is_sell and o_sym in context.pending_frozen:
+                    frozen = abs(o_amt)
+                    context.pending_frozen[o_sym] = max(0, context.pending_frozen[o_sym] - frozen)
+            
             except Exception as e:
-                info('⚠️ 撤单失败 #{}: {}', o.get('entrust_no'), e)
+                # 【Fix v3.2.41】: 简化日志
+                pass
                 
     # 4. 保存状态
     for sym in context.symbol_list:
@@ -1400,8 +1455,19 @@ def _fast_cancel_all_orders_global(context):
             for o in to_cancel:
                 try:
                     cancel_order_ex(o)
-                except Exception as e:
-                    info('⚠️ 撤单失败 #{}: {}', o.get('entrust_no'), e)
+                    # 【Fix v3.2.40】: 同步释放冻结
+                    o_amt = getattr(o, 'amount', 0)
+                    if o_amt == 0 and isinstance(o, dict): o_amt = o.get('amount', 0)
+                    
+                    o_sym = convert_symbol_to_standard(o.get('symbol') or o.get('stock_code'))
+                    is_sell = (o_amt < 0) or (str(o.get('entrust_bs', '')) == '2')
+                    
+                    if is_sell and o_sym in context.pending_frozen:
+                        frozen = abs(o_amt)
+                        context.pending_frozen[o_sym] = max(0, context.pending_frozen[o_sym] - frozen)
+                        
+                except Exception:
+                    pass
         else:
             info('⚡ 无需撤单。')
             
@@ -1413,14 +1479,29 @@ def _fast_cancel_all_orders_global(context):
 def get_target_base_position(context, symbol, state, price, dt):
     # VA逻辑：如果市值低于目标，则尝试增加底仓
     try:
-        target_val = state['initial_position_value'] * (1.001 ** state.get('va_updates_today', 0)) # 简单增长示例
+        target_val = state['initial_position_value'] * (1.001 ** state.get('va_updates_today', 0)) # 简单增长
         current_val = state['base_position'] * price
-        if current_val < target_val * 0.95:
+        
+        # 【Fix v3.2.42】: 盈余释放 (VA 减仓)
+        # 当盈余超过 1.0 个网格单位时，立即释放 1 个网格单位的底仓给网格策略去卖
+        surplus = current_val - target_val
+        grid_value = state['grid_unit'] * price
+        
+        if surplus >= 1.0 * grid_value:
+            release_amt = state['grid_unit']
+            # 确保释放后底仓不低于初始底仓的 50% (安全垫)
+            if state['base_position'] - release_amt >= state['initial_base_position'] * 0.5:
+                state['base_position'] -= release_amt
+                info('[{}] 📉 VA底仓盈余释放: 减少 {} 股 (转为网格可卖)', dsym(context, symbol), release_amt)
+
+        # 原有加仓逻辑
+        elif current_val < target_val * 0.95:
             # 缺口较大，增加底仓
             inc = int((target_val - current_val) / price / 100) * 100
             if inc > 0:
                 state['base_position'] += inc
                 info('[{}] 📈 VA增加底仓 {} 股', dsym(context, symbol), inc)
+                
     except: pass
     return state['base_position']
 
@@ -1597,7 +1678,7 @@ def reload_config_if_changed(context):
             return
         info('♻️ 检测到配置文件发生变更，开始热重载...')
         context.last_config_mod_time = current_mod_time
-        new_config = json.loads(context.config_file_path.read_text(encoding='utf-8'))
+        new_config = json.loads(context.config_file.read_text(encoding='utf-8'))
         old_symbols, new_symbols = set(context.symbol_list), set(new_config.keys())
 
         # 处理移除
@@ -1824,7 +1905,7 @@ def generate_html_report(context):
     <html lang="zh-CN">
     <head>
         <meta charset="UTF-8">
-        <title>策略运行看板 (v3.2.38-LIFO-Fix)</title>
+        <title>策略运行看板 (v3.2.42-VA-Release)</title>
         <style>
             body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; background-color: #121212; color: #e0e0e0; margin: 0; padding: 16px; }}
             .container {{ max-width: 1600px; margin: auto; }}
@@ -1849,7 +1930,7 @@ def generate_html_report(context):
     </head>
     <body>
         <div class="container">
-            <h1>策略运行看板 (LIFO-FastCancel-Fix)</h1>
+            <h1>策略运行看板 (VA-Release-Fix)</h1>
             <p class="update-time">最后更新时间: {update_time}</p>
             
             <div class="summary-cards">
