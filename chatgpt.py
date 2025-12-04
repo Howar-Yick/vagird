@@ -1,15 +1,13 @@
 # event_driven_grid_strategy.py
-# 版本号：GEMINI-3.2.45-RestoreDingtou-Verified
+# 版本号：GEMINI-3.2.48-MutexLock
 # 
-# 修复日志 (v3.2.45):
-# 1. 【严重逻辑修复 - 定投目标计算】: 
-#    - 修正 get_target_base_position 函数。废弃了错误的“日内微增长”公式。
-#    - 恢复了基于 trade_week_set(周数) + dingtou_base(定投额) + dingtou_rate(增长率) 的正确复利目标计算。
-#    - 解决了因目标价值计算偏低导致策略误判“底仓过剩”并触发“VA盈余释放”将底仓卖出的问题。
-# 2. 【热重载保护】: 
-#    - 确保 reload_config_if_changed 优先读取磁盘状态，不重置底仓。
-# 3. 【代码清理】:
-#    - 移除了原版中重复定义的 _fast_cancel_all_orders_global 函数 (节省约50行代码)，逻辑未变。
+# 修复日志 (v3.2.48):
+# 1. 【核心修复 - 交易互斥锁】: 
+#    - 问题：on_order_filled 中的延时等待(sleep)期间，handle_data 可能会“插队”运行，发现无挂单后错误补单，导致双倍挂单。
+#    - 修复：引入 state['_trade_lock_until']。
+#    - 逻辑：当发生成交时，锁定该标的 15秒。在此期间，handle_data 的自动挂单逻辑会被强制挂起(避让)。
+#    - 效果：彻底解决因 API 延时或策略休眠导致的并发重复下单问题。
+# 2. 【完整性】: 包含 v3.2.47 的防抖动、数据自愈、LIFO PnL 等所有功能。
 
 import json
 import logging
@@ -21,21 +19,20 @@ from datetime import time as dtime
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
-
 import pandas as pd
 
 # ---------------- 全局句柄与常量 ----------------
 LOG_FH = None
 LOG_DATE = None
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'GEMINI-3.2.45-RestoreDingtou-Verified'
+__version__ = 'GEMINI-3.2.48-MutexLock'
 TRANSACTION_COST = 0.00005
 
 # ---- 调试默认 ----
 DBG_ENABLE_DEFAULT = True
 DBG_RT_WINDOW_SEC_DEFAULT = 60
 DBG_RT_PREVIEW_DEFAULT = 8
-DELAY_AFTER_CANCEL_SECONDS_DEFAULT = 1.0
+DELAY_AFTER_CANCEL_SECONDS_DEFAULT = 2.0  # 稍微增加默认延时以确保同步
 
 # ---- VA 参数 ----
 VA_VALUE_THRESHOLD_K_DEFAULT = 1.0
@@ -361,7 +358,7 @@ def _load_strategy_config(context, force=False):
 
 def initialize(context):
     log_file = _ensure_daily_logfile()
-    log.info(f'📝 日志同时写入到 {log_file}')
+    log.info(f'🔍 日志同时写入到 {log_file}')
     context.env = check_environment()
     info("当前环境：{}", context.env)
     context.run_cycle = get_saved_param('run_cycle_seconds', 60)
@@ -424,7 +421,8 @@ def initialize(context):
             '_after_cancel_until': None,
             '_oo_drop_seen_ts': None,
             '_pos_jump_seen_ts': None,
-            '_pos_confirm_deadline': None
+            '_pos_confirm_deadline': None,
+            '_trade_lock_until': None # 【Fix v3.2.48】新增：交易处理互斥锁
         })
         context.state[sym] = st
         context.latest_data[sym] = st['base_price']
@@ -450,6 +448,10 @@ def initialize(context):
     _load_strategy_config(context, force=True)
 
     context.initial_cleanup_done = False
+    
+    # 【新增】: 启动时进行数据修复检测
+    _repair_state_logic(context)
+    
     if '回测' not in context.env:
         run_daily(context, place_auction_orders, time='9:15')
         
@@ -466,6 +468,43 @@ def initialize(context):
     # --- PnL 初始化结束 ---
     
     info('✅ 初始化完成，版本:{}', __version__)
+
+# ---------------- 【新增】数据自动修复逻辑 ----------------
+
+def _repair_state_logic(context):
+    info('🛠️ [Data Repair] 开始检查并修复潜在的底仓数据异常...')
+    for sym in context.symbol_list:
+        state = context.state[sym]
+        weeks = len(state.get('trade_week_set', []))
+        
+        # 如果没有定投记录，或者刚开始，跳过
+        if weeks <= 0:
+            continue
+            
+        # 1. 计算理论应有的目标市值 (VA公式)
+        # Target = Initial + Sum(Invest * (1+r)^w)
+        d_base = state.get('dingtou_base', 0)
+        d_rate = state.get('dingtou_rate', 0)
+        acc_invest = sum(d_base * (1 + d_rate)**w for w in range(1, weeks + 1))
+        target_val = state['initial_position_value'] + acc_invest
+        
+        # 2. 获取当前用于计算份额的参考价 (Base Price)
+        price = state['base_price']
+        if price <= 0: continue
+            
+        # 3. 计算理论底仓份额 (向下取整到100股，更保守)
+        theoretical_pos = int(target_val / price / 100) * 100
+        
+        # 4. 检查偏差
+        current_pos = state['base_position']
+        # 容忍度：如果当前底仓 < 理论值的 70% (说明严重偏离/被重置)，且理论值大于初始底仓
+        if current_pos < theoretical_pos * 0.70 and theoretical_pos > state['initial_base_position']:
+            info(f"[{dsym(context, sym)}] ⚠️ 发现底仓异常! 当前:{current_pos} vs 理论:{theoretical_pos} (周数:{weeks})... 正在执行自动修复。")
+            state['base_position'] = theoretical_pos
+            state['last_week_position'] = theoretical_pos # 同步修复上周数据，防止下周跳变
+            state['max_position'] = theoretical_pos + state['grid_unit'] * 20
+            safe_save_state(sym, state)
+            info(f"[{dsym(context, sym)}] ✅ 修复完成。底仓已重置为 {theoretical_pos}")
 
 def is_main_trading_time():
     now = datetime.now().time()
@@ -523,6 +562,7 @@ def after_initialize_cleanup(context):
         if sym in context.state:
             context.state[sym].pop('_pos_change', None)
             context.state[sym].pop('_last_pos_seen', None)
+            context.state[sym].pop('_trade_lock_until', None) # 清理锁
         context.pending_frozen[sym] = 0
     info('✅ 全局清理完成')
 
@@ -795,6 +835,12 @@ def _in_reopen_window(now_t: dtime):
 def place_limit_orders(context, symbol, state, ignore_cooldown=False):
     now_dt = context.current_dt
     dbg_tag = f"[{dsym(context, symbol)}]"
+    
+    # 【Fix v3.2.48】: 检查交易互斥锁。如果正在处理成交回调，暂停 handle_data 的挂单逻辑
+    lock_until = state.get('_trade_lock_until')
+    if lock_until and now_dt < lock_until:
+        # 可选：info(f"[{symbol}] 🔒 交易处理中，暂停挂单逻辑...")
+        return
 
     if (not ignore_cooldown) and state.get('_last_trade_ts') \
       and (now_dt - state['_last_trade_ts']).total_seconds() < 60:
@@ -954,10 +1000,25 @@ def on_order_filled(context, symbol, order):
         context.pending_frozen[symbol] = max(0, current_frozen - abs(order.filled))
 
     last_dt = state.get('_last_fill_dt')
-    if state.get('last_fill_price') == order.price and last_dt and (context.current_dt - last_dt).seconds < 5:
+    last_price = state.get('last_fill_price', 0)
+    time_diff = (context.current_dt - last_dt).total_seconds() if last_dt else 999
+    
+    is_jitter = False
+    if last_dt and time_diff < 10 and last_price > 0:
+        # 偏差率 < 0.1%
+        if abs(order.price - last_price) / last_price < 0.001:
+            is_jitter = True
+            
+    if is_jitter:
+        info('[{}] ⏭️ 忽略短时微小价差抖动: 上次{:.3f} 当前{:.3f} (dt={:.1f}s)', 
+             dsym(context, symbol), last_price, order.price, time_diff)
         return
+
     trade_direction = "买入" if order.amount > 0 else "卖出"
     info('✅ [{}] 成交回报! 方向: {}, 数量: {}, 价格: {:.3f}', dsym(context, symbol), trade_direction, order.filled, order.price)
+
+    # 【Fix v3.2.48】: 设置交易互斥锁，锁定15秒（覆盖撤单延时+网络延时），防止 handle_data 插队补单
+    state['_trade_lock_until'] = context.current_dt + timedelta(seconds=15)
 
     state['_last_trade_ts'] = context.current_dt
     state['_last_fill_dt'] = context.current_dt
@@ -1000,6 +1061,11 @@ def on_order_filled(context, symbol, order):
     state['_oo_drop_seen_ts'] = None
     state['_pos_jump_seen_ts'] = None
     state['_pos_confirm_deadline'] = None
+    
+    # 解锁（其实不解锁也行，反正时间到了会自动失效，但为了严谨）
+    # state['_trade_lock_until'] = None 
+    # 保持锁定状态自然过期更安全
+    
     safe_save_state(symbol, state)
 
 # ---------------- FILL-RECOVER：补偿式成交检测（含误判保护） ----------------
@@ -1156,7 +1222,8 @@ def patrol_and_correct_orders(context, symbol, state):
             if o.amount > 0: 
                 if not should_have_buy_order:
                     is_wrong = True 
-                elif abs(o_price - buy_p) >= 1e-3:
+                # 【v3.2.47 修复】放宽巡检价格容忍度到 0.2%，防止为了几厘钱反复撤单
+                elif abs(o_price - buy_p) / (buy_p + 1e-9) >= 0.002:
                     is_wrong = True 
                 else:
                     has_correct_buy_order = True 
@@ -1164,7 +1231,8 @@ def patrol_and_correct_orders(context, symbol, state):
             elif o.amount < 0: 
                 if not should_have_sell_order:
                     is_wrong = True 
-                elif abs(o_price - sell_p) >= 1e-3:
+                # 【v3.2.47 修复】放宽巡检价格容忍度到 0.2%
+                elif abs(o_price - sell_p) / (sell_p + 1e-9) >= 0.002:
                     is_wrong = True 
                 else:
                     has_correct_sell_order = True 
@@ -1838,7 +1906,7 @@ def generate_html_report(context):
     <html lang="zh-CN">
     <head>
         <meta charset="UTF-8">
-        <title>策略运行看板 (v3.2.45-RestoreDingtou)</title>
+        <title>策略运行看板 (v3.2.48-MutexLock)</title>
         <style>
             body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; background-color: #121212; color: #e0e0e0; margin: 0; padding: 16px; }}
             .container {{ max-width: 1600px; margin: auto; }}
@@ -1863,7 +1931,7 @@ def generate_html_report(context):
     </head>
     <body>
         <div class="container">
-            <h1>策略运行看板 (RestoreDingtou)</h1>
+            <h1>策略运行看板 (MutexLock)</h1>
             <p class="update-time">最后更新时间: {update_time}</p>
             
             <div class="summary-cards">
