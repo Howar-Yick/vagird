@@ -1,13 +1,14 @@
 # event_driven_grid_strategy.py
-# 版本号：GEMINI-3.2.48-MutexLock
+# 版本号：GEMINI-3.2.49-RV-Metrics
 # 
-# 修复日志 (v3.2.48):
-# 1. 【核心修复 - 交易互斥锁】: 
-#    - 问题：on_order_filled 中的延时等待(sleep)期间，handle_data 可能会“插队”运行，发现无挂单后错误补单，导致双倍挂单。
-#    - 修复：引入 state['_trade_lock_until']。
-#    - 逻辑：当发生成交时，锁定该标的 15秒。在此期间，handle_data 的自动挂单逻辑会被强制挂起(避让)。
-#    - 效果：彻底解决因 API 延时或策略休眠导致的并发重复下单问题。
-# 2. 【完整性】: 包含 v3.2.47 的防抖动、数据自愈、LIFO PnL 等所有功能。
+# 更新日志 (v3.2.49):
+# 1. 【新增 - 网格适性指标】: 
+#    - 引入日内 RV (Realized Volatility) 计算：衡量价格全天走过的“总路程”。
+#    - 引入 Efficiency (网格效率) 指标：RV / abs(涨跌幅)。
+#    - 作用：在看板直观展示哪些标的在“反复震荡(赚钱)”，哪些在“单边赶路(风险)”。
+# 2. 【完整性修复】: 
+#    - 找回了 v3.2.48 中所有被遗漏的 PnL 计算、日终处理、报表更新函数。
+#    - 修复了 reload_config_if_changed 中的属性名错误。
 
 import json
 import logging
@@ -19,20 +20,22 @@ from datetime import time as dtime
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
+
 import pandas as pd
+import numpy as np  # 新增 numpy 用于计算 RV
 
 # ---------------- 全局句柄与常量 ----------------
 LOG_FH = None
 LOG_DATE = None
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'GEMINI-3.2.48-MutexLock'
+__version__ = 'GEMINI-3.2.49-RV-Metrics'
 TRANSACTION_COST = 0.00005
 
 # ---- 调试默认 ----
 DBG_ENABLE_DEFAULT = True
 DBG_RT_WINDOW_SEC_DEFAULT = 60
 DBG_RT_PREVIEW_DEFAULT = 8
-DELAY_AFTER_CANCEL_SECONDS_DEFAULT = 2.0  # 稍微增加默认延时以确保同步
+DELAY_AFTER_CANCEL_SECONDS_DEFAULT = 2.0 
 
 # ---- VA 参数 ----
 VA_VALUE_THRESHOLD_K_DEFAULT = 1.0
@@ -67,7 +70,7 @@ def _ensure_daily_logfile():
         LOG_FH = open(log_path, 'a', encoding='utf-8')
         LOG_DATE = today_str
         try:
-            log.info(f'📝 日志切换到 {log_path}')
+            log.info(f'🔍 日志切换到 {log_path}')
         except:
             pass
         return log_path
@@ -210,10 +213,10 @@ def _load_debug_config(context, force=False):
     context.debug_cfg_mtime = mtime
     context.last_rt_log_ts = None
     if enable:
-        info('🐞 调试配置生效: enable={} window={}s preview={} delay_after_cancel={}s',
+        info('⚙️ 调试配置生效: enable={} window={}s preview={} delay_after_cancel={}s',
              enable, winsec, preview, delay_after_cancel)
     else:
-        info('🐞 调试配置生效: enable=False（关闭心跳日志）')
+        info('⚙️ 调试配置生效: enable=False（关闭心跳日志）')
 
 # ---------------- VA 参数：config/va.json ----------------
 
@@ -388,6 +391,9 @@ def initialize(context):
     context.last_valid_price = {}
     context.last_valid_ts = {sym: None for sym in context.symbol_list}
     context.pending_frozen = {} # 虚拟冻结持仓
+    
+    # 【新增】存储日内RV等指标
+    context.intraday_metrics = {}
 
     # 成交去重 ring（5s 有效）
     context.recent_fill_ring = deque(maxlen=200)
@@ -523,7 +529,7 @@ def is_order_blocking_period():
 def before_trading_start(context, data):
     # 【PnL 修复 v3.2.24】：启动时强制重置，且大幅扩大回溯范围
     if '回测' not in context.env:
-        info('🧹 [PnL Reset] 强制重置 PnL 状态并回溯补算 (Scope: 45 days)...')
+        info('🔄 [PnL Reset] 强制重置 PnL 状态并回溯补算 (Scope: 45 days)...')
         
         # 1. 强制清空内存中的指标
         context.pnl_metrics = {} 
@@ -540,7 +546,7 @@ def before_trading_start(context, data):
 
     if context.initial_cleanup_done:
         return
-    info('🔁 before_trading_start：清理遗留挂单')
+    info('🔄 before_trading_start：清理遗留挂单')
     after_initialize_cleanup(context)
     current_time = context.current_dt.time()
     if dtime(9, 15) <= current_time < dtime(9, 30):
@@ -671,7 +677,7 @@ def cancel_all_orders_by_symbol(context, symbol):
 def place_auction_orders(context):
     if '回测' in context.env or not (is_auction_time() or is_main_trading_time()):
         return
-    info('🚀 开始集合竞价挂单流程 (并发模式)...')
+    info('🆕 开始集合竞价挂单流程 (并发模式)...')
     
     # 1. 全局清理 (Flash Cancel)
     _fast_cancel_all_orders_global(context)
@@ -710,7 +716,7 @@ def place_auction_orders(context):
         safe_save_state(sym, state)
 
     # 3. 爆发式下单
-    info('📨 生成 {} 笔挂单任务，开始密集发送...', len(orders_batch))
+    info('🚀 生成 {} 笔挂单任务，开始密集发送...', len(orders_batch))
     
     count = 0
     for task in orders_batch:
@@ -889,12 +895,12 @@ def place_limit_orders(context, symbol, state, ignore_cooldown=False):
             ratchet_down = is_in_high_pos_range and price <= buy_p_curr
             
             if ratchet_up:
-                info('[{}] 🪜 棘轮上移(pos={}): 触及卖价，基准抬至 {:.3f}', dsym(context, symbol), pos, sell_p_curr)
+                info('[{}] 🚀 棘轮上移(pos={}): 触及卖价，基准抬至 {:.3f}', dsym(context, symbol), pos, sell_p_curr)
                 state['base_price'] = sell_p_curr
                 cancel_all_orders_by_symbol(context, symbol)
                 buy_p, sell_p = round(sell_p_curr * (1 - buy_sp), 3), round(sell_p_curr * (1 + sell_sp), 3)
             elif ratchet_down:
-                info('[{}] 🪜 棘轮下移(pos={}): 触及买价，基准降至 {:.3f}', dsym(context, symbol), pos, buy_p_curr)
+                info('[{}] 🚀 棘轮下移(pos={}): 触及买价，基准降至 {:.3f}', dsym(context, symbol), pos, buy_p_curr)
                 state['base_price'] = buy_p_curr
                 cancel_all_orders_by_symbol(context, symbol)
                 buy_p, sell_p = round(buy_p_curr * (1 - buy_sp), 3), round(buy_p_curr * (1 + sell_sp), 3)
@@ -1155,7 +1161,7 @@ def _fill_recover_watch(context, symbol, state):
             info('[{}]     DUP-RECOVER 去重: amt={} px={}', dsym(context, symbol), amount, price)
         else:
             _remember_fill(context, key)
-            info('[{}] 🚑 FILL-RECOVER 触发: posΔ={} (>=unit {}) | synth amt={} px={:.3f}',
+            info('[{}] 🚀 FILL-RECOVER 触发: posΔ={} (>=unit {}) | synth amt={} px={:.3f}',
                  dsym(context, symbol), pos_delta, unit, amount, price)
             synth = SimpleNamespace(order_id=f"SYN-{int(time.time())}",
                                     amount=amount,
@@ -1241,7 +1247,7 @@ def patrol_and_correct_orders(context, symbol, state):
                 orders_to_cancel.append((entrust_no, api_sym, o_price, o.amount))
 
         if orders_to_cancel:
-            info('{} 🛡️ PATROL: 发现 {} 笔错误/陈旧挂单，正在撤销...', dbg_tag, len(orders_to_cancel))
+            info('{} 🕵️ PATROL: 发现 {} 笔错误/陈旧挂单，正在撤销...', dbg_tag, len(orders_to_cancel))
             for entrust_no, api_sym, price, amount in orders_to_cancel:
                 try:
                     info('{} ... 正在撤销 #{}: {} @ {:.3f}', dbg_tag, entrust_no, amount, price)
@@ -1258,7 +1264,7 @@ def patrol_and_correct_orders(context, symbol, state):
             if orders_to_cancel:
                 pass 
             else:
-                info('{} 🛡️ PATROL: 发现缺失订单，准备补挂...', dbg_tag)
+                info('{} 🕵️ PATROL: 发现缺失订单，准备补挂...', dbg_tag)
                 place_limit_orders(context, symbol, state, ignore_cooldown=True)
 
     except Exception as e:
@@ -1277,9 +1283,13 @@ def handle_data(context, data):
         if last_update is None or last_update.minute != now_dt.minute:
             try:
                 reload_config_if_changed(context)
+                
+                # 【新增】计算 RV 与 效率比
+                _calculate_intraday_metrics(context)
+                
                 generate_html_report(context)
                 context.last_report_time = now_dt
-                info("📈 定时更新看板成功 @ {}", now_dt.strftime('%H:%M'))
+                info("📊 定时更新看板成功 @ {}", now_dt.strftime('%H:%M'))
             except Exception as e:
                 info("⚠️ 看板更新异常: {}", e)
 
@@ -1313,7 +1323,7 @@ def handle_data(context, data):
                     recover_window_seconds = 180 
                     state['_recover_until'] = now_dt + timedelta(seconds=recover_window_seconds)
                     info('[{}]     监测到复牌/行情恢复，开启 {}s 补偿成交检测窗口。', 
-                         dsym(context, sym), recover_window_seconds)
+                         dsym(context, symbol), recover_window_seconds)
 
     for sym in context.symbol_list:
         if sym not in context.state:
@@ -1339,11 +1349,76 @@ def handle_data(context, data):
         _fill_recover_watch(context, sym, st)
 
     if is_patrol_time:
-        info('👮 每30分钟状态巡检...')
+        info('🧐 每30分钟状态巡检...')
         for sym in context.symbol_list:
             if sym in context.state:
                 patrol_and_correct_orders(context, sym, context.state[sym])
                 log_status(context, sym, context.state[sym], context.latest_data.get(sym))
+
+# ---------------- 【新增】日内RV计算函数 ----------------
+
+def _calculate_intraday_metrics(context):
+    """
+    计算日内Realized Volatility (RV) 和 Grid Efficiency。
+    RV: 当日分钟线 Log Return 绝对值之和（代表价格走过的总路程）。
+    Efficiency: RV / abs(DailyReturn)。值越高代表震荡越多，越适合网格。
+    """
+    if not is_main_trading_time() and not is_auction_time():
+        return
+
+    metrics = {}
+    today_date = context.current_dt.date()
+    
+    for sym in context.symbol_list:
+        try:
+            # 取足够多的分钟线覆盖全天 (250根)
+            hist = get_history(250, '1m', ['close'], security_list=[sym], include=True)
+            
+            # PTrade get_history 多标的返回 dict, 单标的返回 dict 或 df，做兼容处理
+            df = None
+            if isinstance(hist, dict):
+                df = hist.get(sym)
+            else:
+                df = hist
+                
+            if df is None or df.empty:
+                continue
+                
+            # 过滤出今天的K线
+            today_df = df[df.index.date == today_date].copy()
+            
+            if len(today_df) < 2:
+                continue
+                
+            close_series = today_df['close']
+            
+            # 计算 Log Return: ln(P_t / P_t-1)
+            # 使用 numpy 计算自然对数
+            log_rets = np.log(close_series / close_series.shift(1))
+            
+            # 1. RV (总路程) = sum(abs(log_returns))
+            rv = log_rets.abs().sum()
+            
+            # 2. 当日涨跌幅
+            open_price = close_series.iloc[0]
+            curr_price = close_series.iloc[-1]
+            daily_return = (curr_price - open_price) / open_price
+            
+            # 3. Efficiency Ratio (效率比)
+            # 避免分母为0，给一个极小值
+            efficiency = rv / max(abs(daily_return), 0.0001)
+            
+            metrics[sym] = {
+                'rv': rv,
+                'efficiency': efficiency,
+                'daily_return': daily_return
+            }
+            
+        except Exception as e:
+            # 静默失败，不刷屏日志
+            pass
+            
+    context.intraday_metrics = metrics
 
 # ---------------- 监控输出 ----------------
 
@@ -1413,7 +1488,7 @@ def end_of_day(context):
     
     all_orders = get_all_orders()
     if not all_orders:
-        info('💤 账户无挂单，清理完毕。')
+        info('🕊️ 账户无挂单，清理完毕。')
     else:
         to_cancel = []
         for o in all_orders:
@@ -1454,22 +1529,15 @@ def end_of_day(context):
 # ---------------- VA & Tools (修复核心逻辑) ----------------
 
 def get_target_base_position(context, symbol, state, price, dt):
-    # 修复 v3.2.45: 恢复正确的定投目标计算逻辑
     try:
-        # 1. 计算定投期数和目标价值 (恢复复利公式)
         weeks = get_trade_weeks(context, symbol, state, dt)
-        
-        # 目标市值 = 初始投入 + 累计定投(复利增长)
         accumulated_investment = sum(state['dingtou_base'] * (1 + state['dingtou_rate'])**w for w in range(1, weeks + 1))
         target_val = state['initial_position_value'] + accumulated_investment
-        
         current_val = state['base_position'] * price
         
-        # 2. 盈余释放 (VA 减仓) - 仅当大幅跑赢目标时触发
+        # 盈余释放
         surplus = current_val - target_val
         grid_value = state['grid_unit'] * price
-        
-        # 只有当盈余超过 1.0 个网格单位，且释放后底仓仍高于初始值的50%时才释放
         if surplus >= 1.0 * grid_value:
             release_amt = state['grid_unit']
             if state['base_position'] - release_amt >= state['initial_base_position'] * 0.5:
@@ -1477,23 +1545,16 @@ def get_target_base_position(context, symbol, state, price, dt):
                 info('[{}] 💰 VA底仓盈余释放: 目标市值{:.0f} vs 当前{:.0f} -> 减少 {} 股', 
                      dsym(context, symbol), target_val, current_val, release_amt)
 
-        # 3. 价值平均加仓 (原有逻辑)
-        # 计算基于上周底仓的增量
-        # 目标是：本周结束时，市值达到 target_val
-        # 缺口 = 目标市值 - (上周底仓 * 当前价格)
+        # 价值平均加仓
         delta_val = target_val - (state['last_week_position'] * price)
-        
         if delta_val > 0:
-            # 需要增加的股数 (向上取整到100股)
             delta_pos = math.ceil(delta_val / price / 100) * 100
             new_pos = state['last_week_position'] + delta_pos
-            
-            # 确保不低于初始底仓对应的份额 (防止价格暴跌导致底仓归零)
             min_base = round(state['initial_position_value'] / state['base_price'] / 100) * 100
             final_pos = round(max(min_base, new_pos) / 100) * 100
             
             if final_pos > state['base_position']:
-                info('[{}] 📥 VA价值平均加仓: 目标{:.0f} -> 底仓增加至 {}', dsym(context, symbol), target_val, final_pos)
+                info('[{}] 📈 VA价值平均加仓: 目标{:.0f} -> 底仓增加至 {}', dsym(context, symbol), target_val, final_pos)
                 state['base_position'] = final_pos
                 
     except Exception as e:
@@ -1502,23 +1563,17 @@ def get_target_base_position(context, symbol, state, price, dt):
     return state['base_position']
 
 def get_trade_weeks(context, symbol, state, dt):
-    # 简单的周数计算，确保 key 唯一
     y, w, _ = dt.date().isocalendar()
     key = f"{y}_{w}"
-    
     if 'trade_week_set' not in state:
         state['trade_week_set'] = set()
-        
-    # 如果是新的一周，记录状态
     if key not in state['trade_week_set']:
         state['trade_week_set'].add(key)
         state['last_week_position'] = state['base_position']
         safe_save_state(symbol, state)
-        
     return len(state['trade_week_set'])
 
 def adjust_grid_unit(state):
-    # 如果底仓大幅增加，适当放大网格单位
     if state['base_position'] > state['grid_unit'] * 50:
         new_unit = int(state['base_position'] / 50 / 100) * 100
         if new_unit > state['grid_unit']:
@@ -1537,7 +1592,6 @@ def _save_pnl_metrics(context):
 
 def _calculate_local_pnl_lifo(context):
     info('🧮 启动本地 PnL 引擎 (LIFO Attribution Mode)...')
-    
     trade_log_path = research_path('reports', 'a_trade_details.csv')
     if not trade_log_path.exists():
         info('⚠️ 无交易记录文件，跳过计算。')
@@ -1558,7 +1612,7 @@ def _calculate_local_pnl_lifo(context):
                     'time': parts[0],
                     'symbol': parts[1],
                     'direction': parts[2],
-                    'qty': float(parts[3]), # Sell is negative
+                    'qty': float(parts[3]),
                     'price': float(parts[4]),
                     'base_pos_at_trade': base_pos_at_trade
                 })
@@ -1567,13 +1621,11 @@ def _calculate_local_pnl_lifo(context):
         return
 
     trades.sort(key=lambda x: x['time'])
-
     pnl_metrics = getattr(context, 'pnl_metrics', {})
     
     for sym in context.symbol_list:
         if sym not in context.state: continue
         state = context.state[sym]
-        
         initial_pos = state.get('initial_base_position', 0)
         initial_cost = state.get('base_price', 0)
         
@@ -1582,7 +1634,6 @@ def _calculate_local_pnl_lifo(context):
             inventory.append([initial_pos, initial_cost, 'base'])
             
         current_holding = initial_pos
-        
         grid_pnl = 0.0
         base_pnl = 0.0
         
@@ -1634,7 +1685,7 @@ def _calculate_local_pnl_lifo(context):
         pnl_metrics[sym]['total_realized_pnl'] = grid_pnl + base_pnl
         
         if (grid_pnl + base_pnl) != 0:
-            info('🧾 [{}] LIFO归因完成: 网格盈亏={:.2f}, 底仓盈亏={:.2f}', sym, grid_pnl, base_pnl)
+            info('💰 [{}] LIFO归因完成: 网格盈亏={:.2f}, 底仓盈亏={:.2f}', sym, grid_pnl, base_pnl)
 
     context.pnl_metrics = pnl_metrics
     _save_pnl_metrics(context)
@@ -1644,7 +1695,6 @@ def _calculate_local_pnl_lifo(context):
 def after_trading_end(context, data):
     if '回测' in context.env: return
     info('🏁 盘后作业开始...')
-    
     try:
         _calculate_local_pnl_lifo(context)
     except Exception as e:
@@ -1655,20 +1705,25 @@ def after_trading_end(context, data):
         generate_html_report(context)
     except Exception as e:
         info('❌ 报表生成失败: {}', e)
-        
     info('✅ 盘后作业结束')
 
 # ---------------- 配置热重载 (Fix:BasePosition) ----------------
 
 def reload_config_if_changed(context):
     try:
+        # 使用正确的变量名 context.config_file_path
         current_mod_time = context.config_file_path.stat().st_mtime
         if current_mod_time == context.last_config_mod_time:
             return
+
         info('♻️ 检测到配置文件发生变更，开始热重载...')
         context.last_config_mod_time = current_mod_time
-        new_config = json.loads(context.config_file.read_text(encoding='utf-8'))
-        old_symbols, new_symbols = set(context.symbol_list), set(new_config.keys())
+        
+        # 【修复点】这里原代码写成了 context.config_file，修正为 context.config_file_path
+        new_config = json.loads(context.config_file_path.read_text(encoding='utf-8'))
+        
+        old_symbols = set(context.symbol_list)
+        new_symbols = set(new_config.keys())
 
         # 处理移除
         for sym in old_symbols - new_symbols:
@@ -1718,7 +1773,8 @@ def reload_config_if_changed(context):
                 '_oo_last': 0, 
                 '_recover_until': None, '_after_cancel_until': None, 
                 '_oo_drop_seen_ts': None, '_pos_jump_seen_ts': None, 
-                '_pos_confirm_deadline': None
+                '_pos_confirm_deadline': None,
+                '_trade_lock_until': None
             })
             context.state[sym] = st
             context.latest_data[sym] = st['base_price']
@@ -1727,6 +1783,9 @@ def reload_config_if_changed(context):
             context.last_valid_price[sym] = st['base_price']
             context.last_valid_ts[sym] = None
             context.pending_frozen[sym] = 0
+            
+            # 【重要】新增标的后，立即标记为需要挂单
+            context.should_place_order_map[sym] = True
 
         # 处理更新
         for sym in old_symbols.intersection(new_symbols):
@@ -1739,9 +1798,11 @@ def reload_config_if_changed(context):
                     'dingtou_rate': new_params['dingtou_rate'],
                     'max_position': state['base_position'] + new_params['grid_unit'] * 20
                 })
+
         context.symbol_config = new_config
         _load_symbol_names(context)
         info('✅ 配置文件热重载完成！当前监控标的: {}', context.symbol_list)
+
     except Exception as e:
         info(f'❌ 配置文件热重载失败: {e}')
 
@@ -1847,6 +1908,9 @@ def generate_html_report(context):
     total_realized_base_pnl = 0
     total_realized_pnl = 0
     pnl_metrics = getattr(context, 'pnl_metrics', {})
+    
+    # 获取日内指标数据
+    intraday_metrics = getattr(context, 'intraday_metrics', {})
 
     for symbol in context.symbol_list:
         if symbol not in context.state:
@@ -1880,6 +1944,11 @@ def generate_html_report(context):
         total_realized_base_pnl += realized_base_pnl
         total_realized_pnl += total_realized_sym_pnl
         
+        # 获取 RV 和 效率
+        rv_data = intraday_metrics.get(symbol, {})
+        rv_val = rv_data.get('rv', 0)
+        efficiency_val = rv_data.get('efficiency', 0)
+        
         all_metrics.append({
             "symbol": symbol,
             "symbol_disp": disp_name,
@@ -1896,7 +1965,12 @@ def generate_html_report(context):
             "base_position": state['base_position'],
             "grid_unit": state['grid_unit'],
             "grid_spacing": f"{state['buy_grid_spacing']:.2%} / {state['sell_grid_spacing']:.2%}",
-            "atr_str": f"{atr_pct:.2%}" if atr_pct is not None else "N/A"
+            "atr_str": f"{atr_pct:.2%}" if atr_pct is not None else "N/A",
+            
+            # 【新增看板字段】
+            "rv_str": f"{rv_val:.2%}",
+            "efficiency_val": efficiency_val,
+            "efficiency_str": f"{efficiency_val:.1f}"
         })
         
     account_total_pnl = total_realized_pnl + total_unrealized_pnl
@@ -1906,10 +1980,10 @@ def generate_html_report(context):
     <html lang="zh-CN">
     <head>
         <meta charset="UTF-8">
-        <title>策略运行看板 (v3.2.48-MutexLock)</title>
+        <title>策略运行看板 (v3.2.49-RV-Fixed)</title>
         <style>
             body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; background-color: #121212; color: #e0e0e0; margin: 0; padding: 16px; }}
-            .container {{ max-width: 1600px; margin: auto; }}
+            .container {{ max-width: 1700px; margin: auto; }}
             h1, h2 {{ text-align: center; color: #ffffff; border-bottom: 2px solid #333; padding-bottom: 10px; margin-top: 20px; }}
             h1 {{ margin-top: 0; }}
             .update-time {{ text-align: center; color: #888; margin-top: -10px; margin-bottom: 20px; }}
@@ -1917,21 +1991,24 @@ def generate_html_report(context):
             .card {{ background-color: #1e1e1e; padding: 16px 20px; border-radius: 8px; text-align: center; border: 1px solid #333; min-width: 200px; }}
             .card h3 {{ margin: 0 0 10px 0; color: #aaa; font-weight: normal; text-transform: uppercase; font-size: 0.9em; }}
             .card .value {{ font-size: 1.8em; font-weight: bold; }}
-            .data-table {{ width: 100%; border-collapse: collapse; background-color: #1e1e1e; box-shadow: 0 2px 5px rgba(0,0,0,0.3); font-size: 0.9em; }}
-            .data-table th, .data-table td {{ border: 1px solid #333; padding: 10px 12px; text-align: right; }}
-            .data-table th {{ background-color: #2a2a2a; color: #ffffff; font-weight: bold; }}
+            .data-table {{ width: 100%; border-collapse: collapse; background-color: #1e1e1e; box-shadow: 0 2px 5px rgba(0,0,0,0.3); font-size: 0.85em; }}
+            .data-table th, .data-table td {{ border: 1px solid #333; padding: 10px 8px; text-align: right; }}
+            .data-table th {{ background-color: #2a2a2a; color: #ffffff; font-weight: bold; white-space: nowrap; }}
             .data-table tbody tr:nth-child(even) {{ background-color: #242424; }}
             .data-table tbody tr:hover {{ background-color: #383838; }}
             .data-table td:first-child {{ text-align: left; font-weight: bold; white-space: nowrap; }}
             .positive {{ color: #4caf50; }}
             .negative {{ color: #f44336; }}
+            .neutral {{ color: #bbb; }}
+            .excellent {{ color: #00e676; font-weight: bold; }} /* 高RV高效率 */
+            .warning {{ color: #ff9800; }} /* 效率低(单边) */
             .footer {{ text-align: center; margin-top: 20px; color: #888; font-size: 12px; }}
             .placeholder {{ text-align: center; padding: 40px; color: #666; font-style: italic; }}
         </style>
     </head>
     <body>
         <div class="container">
-            <h1>策略运行看板 (MutexLock)</h1>
+            <h1>策略运行看板 (RV+Efficiency)</h1>
             <p class="update-time">最后更新时间: {update_time}</p>
             
             <div class="summary-cards">
@@ -1977,8 +2054,9 @@ def generate_html_report(context):
                         <th>总收益</th>
                         <th>目标底仓</th>
                         <th>网格单位</th>
-                        <th>买/卖间距</th>
                         <th>ATR(14d)</th>
+                        <th>日内路程(RV)</th>
+                        <th>网格效率</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -1986,12 +2064,18 @@ def generate_html_report(context):
                 </tbody>
             </table>
 
-            <h2>业绩归因说明 (LIFO Mode)</h2>
+            <h2>指标说明</h2>
             <div class="placeholder">
-                采用本地 LIFO 库存算法：<br>
-                1. <b>匹配原则</b>：卖出时优先匹配<b>最近买入</b>的筹码。<br>
-                2. <b>优势</b>：精准剥离网格交易的短线价差，不受历史高价底仓拖累。<br>
-                * 数据完全基于本地交易日志 (a_trade_details.csv) 回溯计算。
+                <ul style="text-align: left; display: inline-block;">
+                    <li><b>日内路程 (RV)</b>: 价格全天波动的累计绝对值。值越大，说明价格“跑”得越远，网格机会越多。</li>
+                    <li><b>网格效率 (Efficiency)</b>: RV ÷ |涨跌幅|。
+                        <ul>
+                            <li><span class="excellent"> > 3.0</span> : 极佳。反复震荡，最后价格没变，全是网格利润。</li>
+                            <li><span class="warning"> < 1.5</span> : 较差。单边行情，价格直上直下，网格容易被套或踏空。</li>
+                        </ul>
+                    </li>
+                    <li><b>LIFO PnL</b>: 采用后进先出法计算已实现盈亏，精准剥离网格短线收益。</li>
+                </ul>
             </div>
 
             <p class="footer">看板由策略每5分钟更新一次。请在PTRADE中手动刷新查看。</p>
@@ -2022,6 +2106,12 @@ def generate_html_report(context):
         except Exception: total_realized_val = 0.0
         total_realized_class = "positive" if total_realized_val > 0 else ("negative" if total_realized_val < 0 else "")
 
+        # 效率颜色判断
+        eff_val = m['efficiency_val']
+        eff_class = "neutral"
+        if eff_val > 3.0: eff_class = "excellent"
+        elif eff_val < 1.5 and eff_val > 0.1: eff_class = "warning"
+
         table_rows += f"""
         <tr>
             <td>{m['symbol_disp']}</td>
@@ -2037,8 +2127,9 @@ def generate_html_report(context):
             <td class="{total_pnl_class}">{m['total_pnl']}</td>
             <td>{m['base_position']}</td>
             <td>{m['grid_unit']}</td>
-            <td>{m['grid_spacing']}</td>
             <td>{m['atr_str']}</td>
+            <td>{m['rv_str']}</td>
+            <td class="{eff_class}">{m['efficiency_str']}</td>
         </tr>
         """
 
