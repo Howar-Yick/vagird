@@ -1,14 +1,14 @@
 # event_driven_grid_strategy.py
-# 版本号：GEMINI-3.2.49-RV-Metrics
+# 版本号：GEMINI-3.2.50-AsyncState
 # 
-# 更新日志 (v3.2.49):
-# 1. 【新增 - 网格适性指标】: 
-#    - 引入日内 RV (Realized Volatility) 计算：衡量价格全天走过的“总路程”。
-#    - 引入 Efficiency (网格效率) 指标：RV / abs(涨跌幅)。
-#    - 作用：在看板直观展示哪些标的在“反复震荡(赚钱)”，哪些在“单边赶路(风险)”。
-# 2. 【完整性修复】: 
-#    - 找回了 v3.2.48 中所有被遗漏的 PnL 计算、日终处理、报表更新函数。
-#    - 修复了 reload_config_if_changed 中的属性名错误。
+# 更新日志 (v3.2.50):
+# 1. 【核心重构 - 异步状态机补单】: 
+#    - 移除 on_order_filled 中的 time.sleep，彻底解决回调阻塞导致的并发问题。
+#    - 引入 _rehang_due_ts (补单生效时间戳) 状态变量。
+#    - 新增 check_pending_rehangs (由 run_interval 每3秒触发)，负责处理到期的补单。
+# 2. 【逻辑修复 - 巡检去重】:
+#    - patrol_and_correct_orders 现在能识别“价格正确但数量重复”的挂单，并自动清理多余单。
+# 3. 【完整性】: 包含 RV/Efficiency 指标、LIFO PnL、VA 自动修复等所有历史功能。
 
 import json
 import logging
@@ -21,14 +21,14 @@ from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
-import pandas as pd
 import numpy as np  # 新增 numpy 用于计算 RV
+import pandas as pd
 
 # ---------------- 全局句柄与常量 ----------------
 LOG_FH = None
 LOG_DATE = None
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'GEMINI-3.2.49-RV-Metrics'
+__version__ = 'GEMINI-3.2.50-AsyncState'
 TRANSACTION_COST = 0.00005
 
 # ---- 调试默认 ----
@@ -428,7 +428,9 @@ def initialize(context):
             '_oo_drop_seen_ts': None,
             '_pos_jump_seen_ts': None,
             '_pos_confirm_deadline': None,
-            '_trade_lock_until': None # 【Fix v3.2.48】新增：交易处理互斥锁
+            
+            # 【v3.2.50】: 使用 _rehang_due_ts 替代 _trade_lock_until
+            '_rehang_due_ts': None 
         })
         context.state[sym] = st
         context.latest_data[sym] = st['base_price']
@@ -440,6 +442,8 @@ def initialize(context):
         if '_pos_change' in st: st.pop('_pos_change')
         if '_last_pos_seen' in st: st.pop('_last_pos_seen')
         if '_rehang_bypass_once' in st: st.pop('_rehang_bypass_once')
+        # 清理旧版锁变量
+        if '_trade_lock_until' in st: st.pop('_trade_lock_until')
 
     context.boot_dt = getattr(context, 'current_dt', None) or datetime.now()
     context.boot_grace_seconds = int(get_saved_param('boot_grace_seconds', 180))
@@ -464,7 +468,10 @@ def initialize(context):
         # 提前收盘处理时间到 14:55，防止撤单超时
         run_daily(context, end_of_day, time='14:55')
         
-        info('✅ 事件驱动模式就绪')
+        # 【核心新增 v3.2.50】注册每3秒的高频巡检，用于处理补单（替代 sleep）
+        run_interval(context, check_pending_rehangs, seconds=3)
+        
+        info('✅ 事件驱动模式就绪 (Async State Machine Active)')
 
     # --- 【PnL 指标初始化】 ---
     context.pnl_metrics_path = research_path('state', 'pnl_metrics.json')
@@ -568,7 +575,8 @@ def after_initialize_cleanup(context):
         if sym in context.state:
             context.state[sym].pop('_pos_change', None)
             context.state[sym].pop('_last_pos_seen', None)
-            context.state[sym].pop('_trade_lock_until', None) # 清理锁
+            context.state[sym].pop('_trade_lock_until', None) # 清理旧版锁
+            context.state[sym].pop('_rehang_due_ts', None) # 清理补单标记
         context.pending_frozen[sym] = 0
     info('✅ 全局清理完成')
 
@@ -836,16 +844,48 @@ def _in_reopen_window(now_t: dtime):
             return True
     return False
 
+# ---------------- 【核心更新】异步补单状态机 ----------------
+
+def check_pending_rehangs(context):
+    """
+    每3秒运行一次。检查所有标的，如果有到期的 '_rehang_due_ts'，说明成交后冷却期已过，
+    执行补单逻辑，并清除标记。
+    """
+    # 1. 严格时间检查：14:55 后禁止任何补单，防止干扰 end_of_day
+    if context.current_dt.time() >= dtime(14, 55):
+        return
+
+    now_dt = context.current_dt
+    
+    for sym in context.symbol_list:
+        if sym not in context.state:
+            continue
+            
+        state = context.state[sym]
+        rehang_ts = state.get('_rehang_due_ts')
+        
+        # 如果设置了补单时间，且当前时间已达到
+        if rehang_ts and now_dt >= rehang_ts:
+            info('[{}] ⏰ 补单冷却期已过 (due={}), 触发挂单...', dsym(context, sym), rehang_ts.strftime('%H:%M:%S'))
+            
+            # 清除标记，防止 handle_data 再次跳过或重复执行
+            state['_rehang_due_ts'] = None
+            
+            # 执行补单 (ignore_cooldown=True)
+            place_limit_orders(context, sym, state, ignore_cooldown=True)
+            safe_save_state(sym, state)
+
+
 # ---------------- 网格限价挂单主逻辑 ----------------
 
 def place_limit_orders(context, symbol, state, ignore_cooldown=False):
     now_dt = context.current_dt
     dbg_tag = f"[{dsym(context, symbol)}]"
     
-    # 【Fix v3.2.48】: 检查交易互斥锁。如果正在处理成交回调，暂停 handle_data 的挂单逻辑
-    lock_until = state.get('_trade_lock_until')
-    if lock_until and now_dt < lock_until:
-        # 可选：info(f"[{symbol}] 🔒 交易处理中，暂停挂单逻辑...")
+    # 1. 如果有未完成的补单任务（且没到时间），则本函数暂不执行，交给 run_interval 处理
+    #    这防止了 handle_data 和 run_interval 的并发冲突
+    rehang_ts = state.get('_rehang_due_ts')
+    if rehang_ts and now_dt < rehang_ts:
         return
 
     if (not ignore_cooldown) and state.get('_last_trade_ts') \
@@ -1023,9 +1063,6 @@ def on_order_filled(context, symbol, order):
     trade_direction = "买入" if order.amount > 0 else "卖出"
     info('✅ [{}] 成交回报! 方向: {}, 数量: {}, 价格: {:.3f}', dsym(context, symbol), trade_direction, order.filled, order.price)
 
-    # 【Fix v3.2.48】: 设置交易互斥锁，锁定15秒（覆盖撤单延时+网络延时），防止 handle_data 插队补单
-    state['_trade_lock_until'] = context.current_dt + timedelta(seconds=15)
-
     state['_last_trade_ts'] = context.current_dt
     state['_last_fill_dt'] = context.current_dt
     state['last_fill_price'] = order.price
@@ -1033,13 +1070,12 @@ def on_order_filled(context, symbol, order):
 
     cancel_all_orders_by_symbol(context, symbol)
 
-    try:
-        delay_s = float(getattr(context, 'delay_after_cancel_seconds', DELAY_AFTER_CANCEL_SECONDS_DEFAULT))
-        state['_after_cancel_until'] = context.current_dt + timedelta(seconds=max(delay_s, 2.5))
-        if delay_s > 0:
-            time.sleep(delay_s)
-    except Exception as _e:
-        info('[{}] ⚠️ 微确认延时失败：{}（忽略，继续）', dsym(context, symbol), _e)
+    # 【Fix v3.2.50】: 彻底移除 sleep，使用状态位控制补单
+    # 设置一个 2秒 后的时间戳，表示 "在此时间之前不许下单，过了这个时间必须补单"
+    delay_s = float(getattr(context, 'delay_after_cancel_seconds', DELAY_AFTER_CANCEL_SECONDS_DEFAULT))
+    state['_rehang_due_ts'] = context.current_dt + timedelta(seconds=max(delay_s, 2.0))
+    
+    info('[{}] ⏳ 设置补单计划，将在 {} 后触发', dsym(context, symbol), state['_rehang_due_ts'].strftime('%H:%M:%S'))
 
     context.mark_halted[symbol] = False
     context.last_valid_price[symbol] = order.price
@@ -1048,12 +1084,6 @@ def on_order_filled(context, symbol, order):
 
     state.pop('_last_order_ts', None)
     state.pop('_last_order_bp', None)
-
-    if is_order_blocking_period():
-        info('[{}] 处于9:25-9:30挂单冻结期，成交后仅更新状态，推迟挂单至9:30后。', dsym(context, symbol))
-    elif context.current_dt.time() < dtime(14, 56):
-        info('[{}] ▶ FILL->REHANG base_price={:.3f} (ignore_cooldown=True) now={}', dsym(context, symbol), state['base_price'], context.current_dt.time())
-        place_limit_orders(context, symbol, state, ignore_cooldown=True)
 
     context.should_place_order_map[symbol] = True
     
@@ -1067,10 +1097,6 @@ def on_order_filled(context, symbol, order):
     state['_oo_drop_seen_ts'] = None
     state['_pos_jump_seen_ts'] = None
     state['_pos_confirm_deadline'] = None
-    
-    # 解锁（其实不解锁也行，反正时间到了会自动失效，但为了严谨）
-    # state['_trade_lock_until'] = None 
-    # 保持锁定状态自然过期更安全
     
     safe_save_state(symbol, state)
 
@@ -1182,7 +1208,7 @@ def _fill_recover_watch(context, symbol, state):
     state['_last_pos_seen'] = pos_now
     safe_save_state(symbol, state)
 
-# ---------------- 主动巡检与修正 ----------------
+# ---------------- 【核心更新】主动巡检与修正 (含去重逻辑) ----------------
 
 def patrol_and_correct_orders(context, symbol, state):
     now_dt = context.current_dt
@@ -1215,8 +1241,10 @@ def patrol_and_correct_orders(context, symbol, state):
         should_have_sell_order = (enable_amount >= unit and pos - unit >= base_pos)
 
         orders_to_cancel = []
-        has_correct_buy_order = False
-        has_correct_sell_order = False
+        
+        # 分组统计，用于去重
+        valid_buy_orders = []
+        valid_sell_orders = []
 
         for o in open_orders:
             api_sym = getattr(o, 'symbol', None) or getattr(o, 'stock_code', None)
@@ -1225,47 +1253,66 @@ def patrol_and_correct_orders(context, symbol, state):
             if not entrust_no: continue
             
             is_wrong = False
-            if o.amount > 0: 
+            
+            if o.amount > 0: # 买单
                 if not should_have_buy_order:
                     is_wrong = True 
-                # 【v3.2.47 修复】放宽巡检价格容忍度到 0.2%，防止为了几厘钱反复撤单
                 elif abs(o_price - buy_p) / (buy_p + 1e-9) >= 0.002:
                     is_wrong = True 
                 else:
-                    has_correct_buy_order = True 
+                    valid_buy_orders.append(o)
             
-            elif o.amount < 0: 
+            elif o.amount < 0: # 卖单
                 if not should_have_sell_order:
                     is_wrong = True 
-                # 【v3.2.47 修复】放宽巡检价格容忍度到 0.2%
                 elif abs(o_price - sell_p) / (sell_p + 1e-9) >= 0.002:
                     is_wrong = True 
                 else:
-                    has_correct_sell_order = True 
+                    valid_sell_orders.append(o)
             
             if is_wrong:
-                orders_to_cancel.append((entrust_no, api_sym, o_price, o.amount))
+                orders_to_cancel.append(o)
+        
+        # 【去重逻辑】：如果存在多个合法的同方向订单，保留一个，其余视为重复并撤销
+        if len(valid_buy_orders) > 1:
+            info('{} ⚠️ 发现 {} 个重复有效买单，正在清理多余单...', dbg_tag, len(valid_buy_orders))
+            # 保留第一个，其他的加入撤销列表
+            for o in valid_buy_orders[1:]:
+                orders_to_cancel.append(o)
+            valid_buy_orders = valid_buy_orders[:1]
 
+        if len(valid_sell_orders) > 1:
+            info('{} ⚠️ 发现 {} 个重复有效卖单，正在清理多余单...', dbg_tag, len(valid_sell_orders))
+            for o in valid_sell_orders[1:]:
+                orders_to_cancel.append(o)
+            valid_sell_orders = valid_sell_orders[:1]
+
+        # 执行撤销
         if orders_to_cancel:
-            info('{} 🕵️ PATROL: 发现 {} 笔错误/陈旧挂单，正在撤销...', dbg_tag, len(orders_to_cancel))
-            for entrust_no, api_sym, price, amount in orders_to_cancel:
+            info('{} 🕵️ PATROL: 发现 {} 笔错误/重复挂单，正在撤销...', dbg_tag, len(orders_to_cancel))
+            for o in orders_to_cancel:
                 try:
-                    info('{} ... 正在撤销 #{}: {} @ {:.3f}', dbg_tag, entrust_no, amount, price)
+                    entrust_no = getattr(o, 'entrust_no', None)
+                    api_sym = getattr(o, 'symbol', None) or getattr(o, 'stock_code', None)
+                    info('{} ... 正在撤销 #{}: {} @ {:.3f}', dbg_tag, entrust_no, o.amount, getattr(o, 'price', 0))
                     cancel_order_ex({'entrust_no': entrust_no, 'symbol': api_sym})
                 except Exception as e:
-                    info('{} ⚠️ PATROL 撤单 #{] 失败: {}', dbg_tag, entrust_no, e)
+                    info('{} ⚠️ PATROL 撤单异常: {}', dbg_tag, e)
+            
+            # 撤单后立即刷新状态并尝试补单
             state.pop('_last_order_ts', None)
             state.pop('_last_order_bp', None)
             place_limit_orders(context, symbol, state, ignore_cooldown=True)
             return 
 
+        # 如果没有要撤的，但缺单，则补单
+        has_correct_buy_order = (len(valid_buy_orders) > 0)
+        has_correct_sell_order = (len(valid_sell_orders) > 0)
+
         if (should_have_buy_order and not has_correct_buy_order) or \
            (should_have_sell_order and not has_correct_sell_order):
-            if orders_to_cancel:
-                pass 
-            else:
-                info('{} 🕵️ PATROL: 发现缺失订单，准备补挂...', dbg_tag)
-                place_limit_orders(context, symbol, state, ignore_cooldown=True)
+            info('{} 🕵️ PATROL: 发现缺失订单，准备补挂...', dbg_tag)
+            place_limit_orders(context, symbol, state, ignore_cooldown=True)
 
     except Exception as e:
         info('{} ⚠️ PATROL 巡检失败: {}', dbg_tag, e)
@@ -1975,114 +2022,22 @@ def generate_html_report(context):
         
     account_total_pnl = total_realized_pnl + total_unrealized_pnl
     
-    html_template = """
-    <!DOCTYPE html>
-    <html lang="zh-CN">
-    <head>
-        <meta charset="UTF-8">
-        <title>策略运行看板 (v3.2.49-RV-Fixed)</title>
-        <style>
-            body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; background-color: #121212; color: #e0e0e0; margin: 0; padding: 16px; }}
-            .container {{ max-width: 1700px; margin: auto; }}
-            h1, h2 {{ text-align: center; color: #ffffff; border-bottom: 2px solid #333; padding-bottom: 10px; margin-top: 20px; }}
-            h1 {{ margin-top: 0; }}
-            .update-time {{ text-align: center; color: #888; margin-top: -10px; margin-bottom: 20px; }}
-            .summary-cards {{ display: flex; flex-wrap: wrap; gap: 16px; justify-content: center; margin-bottom: 30px; }}
-            .card {{ background-color: #1e1e1e; padding: 16px 20px; border-radius: 8px; text-align: center; border: 1px solid #333; min-width: 200px; }}
-            .card h3 {{ margin: 0 0 10px 0; color: #aaa; font-weight: normal; text-transform: uppercase; font-size: 0.9em; }}
-            .card .value {{ font-size: 1.8em; font-weight: bold; }}
-            .data-table {{ width: 100%; border-collapse: collapse; background-color: #1e1e1e; box-shadow: 0 2px 5px rgba(0,0,0,0.3); font-size: 0.85em; }}
-            .data-table th, .data-table td {{ border: 1px solid #333; padding: 10px 8px; text-align: right; }}
-            .data-table th {{ background-color: #2a2a2a; color: #ffffff; font-weight: bold; white-space: nowrap; }}
-            .data-table tbody tr:nth-child(even) {{ background-color: #242424; }}
-            .data-table tbody tr:hover {{ background-color: #383838; }}
-            .data-table td:first-child {{ text-align: left; font-weight: bold; white-space: nowrap; }}
-            .positive {{ color: #4caf50; }}
-            .negative {{ color: #f44336; }}
-            .neutral {{ color: #bbb; }}
-            .excellent {{ color: #00e676; font-weight: bold; }} /* 高RV高效率 */
-            .warning {{ color: #ff9800; }} /* 效率低(单边) */
-            .footer {{ text-align: center; margin-top: 20px; color: #888; font-size: 12px; }}
-            .placeholder {{ text-align: center; padding: 40px; color: #666; font-style: italic; }}
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>策略运行看板 (RV+Efficiency)</h1>
-            <p class="update-time">最后更新时间: {update_time}</p>
+    # ---------------- 核心修改：动态读取外部模板文件 ----------------
+    try:
+        # 尝试读取 config/dashboard_template.html
+        template_file = research_path('config', 'dashboard_template.html')
+        if not template_file.exists():
+            # 如果文件不存在，写入一个默认的简单模板，防止报错
+            default_tpl = "<html><body><h1>Dashboard Template Missing!</h1><p>Please check config/dashboard_template.html</p></body></html>"
+            template_file.write_text(default_tpl, encoding='utf-8')
+            info('⚠️ 未找到看板模板，已生成默认文件: {}', template_file)
             
-            <div class="summary-cards">
-                <div class="card">
-                    <h3>总市值</h3>
-                    <p class="value">{total_market_value}</p>
-                </div>
-                <div class="card">
-                    <h3>总浮动盈亏</h3>
-                    <p class="value {unrealized_pnl_class}">{total_unrealized_pnl}</p>
-                </div>
-                <div class="card">
-                    <h3>总已实现盈亏</h3>
-                    <p class="value {realized_pnl_class}">{total_realized_pnl}</p>
-                </div>
-                <div class="card">
-                    <h3>账户总收益</h3>
-                    <p class="value {total_pnl_class}">{account_total_pnl}</p>
-                </div>
-                <div class="card">
-                    <h3>已实现(网格)</h3>
-                    <p class="value {grid_pnl_class}">{total_realized_grid_pnl}</p>
-                </div>
-                <div class="card">
-                    <h3>已实现(底仓)</h3>
-                    <p class="value {base_pnl_class}">{total_realized_base_pnl}</p>
-                </div>
-            </div>
-            
-            <table class="data-table">
-                <thead>
-                    <tr>
-                        <th style="text-align:left;">标的</th>
-                        <th>持仓(可用)</th>
-                        <th>成本</th>
-                        <th>市价</th>
-                        <th>市值</th>
-                        <th>浮动盈亏</th>
-                        <th>浮动盈K率</th>
-                        <th>已实现(网格)</th>
-                        <th>已实现(底仓)</th>
-                        <th>总已实现</th>
-                        <th>总收益</th>
-                        <th>目标底仓</th>
-                        <th>网格单位</th>
-                        <th>ATR(14d)</th>
-                        <th>日内路程(RV)</th>
-                        <th>网格效率</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {table_rows}
-                </tbody>
-            </table>
-
-            <h2>指标说明</h2>
-            <div class="placeholder">
-                <ul style="text-align: left; display: inline-block;">
-                    <li><b>日内路程 (RV)</b>: 价格全天波动的累计绝对值。值越大，说明价格“跑”得越远，网格机会越多。</li>
-                    <li><b>网格效率 (Efficiency)</b>: RV ÷ |涨跌幅|。
-                        <ul>
-                            <li><span class="excellent"> > 3.0</span> : 极佳。反复震荡，最后价格没变，全是网格利润。</li>
-                            <li><span class="warning"> < 1.5</span> : 较差。单边行情，价格直上直下，网格容易被套或踏空。</li>
-                        </ul>
-                    </li>
-                    <li><b>LIFO PnL</b>: 采用后进先出法计算已实现盈亏，精准剥离网格短线收益。</li>
-                </ul>
-            </div>
-
-            <p class="footer">看板由策略每5分钟更新一次。请在PTRADE中手动刷新查看。</p>
-        </div>
-    </body>
-    </html>
-    """
+        # 实时读取文件内容
+        html_template = template_file.read_text(encoding='utf-8')
+        
+    except Exception as e:
+        info('❌ 读取看板模板失败: {}，将使用极简模式', e)
+        html_template = "<html><body><h1>Error loading template</h1><p>{}</p></body></html>".format(e)
 
     table_rows = ""
     for m in all_metrics:
@@ -2112,6 +2067,7 @@ def generate_html_report(context):
         if eff_val > 3.0: eff_class = "excellent"
         elif eff_val < 1.5 and eff_val > 0.1: eff_class = "warning"
 
+        # 组装行数据
         table_rows += f"""
         <tr>
             <td>{m['symbol_disp']}</td>
@@ -2133,24 +2089,26 @@ def generate_html_report(context):
         </tr>
         """
 
-    final_html = html_template.format(
-        update_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        total_market_value=f"{total_market_value:,.2f}",
-        total_unrealized_pnl=f"{total_unrealized_pnl:,.2f}",
-        unrealized_pnl_class="positive" if total_unrealized_pnl >= 0 else "negative",
-        total_realized_pnl=f"{total_realized_pnl:,.2f}",
-        realized_pnl_class="positive" if total_realized_pnl >= 0 else "negative",
-        account_total_pnl=f"{account_total_pnl:,.2f}",
-        total_pnl_class="positive" if account_total_pnl >= 0 else "negative",
-        total_realized_grid_pnl=f"{total_realized_grid_pnl:,.2f}",
-        grid_pnl_class="positive" if total_realized_grid_pnl > 0 else ("negative" if total_realized_grid_pnl < 0 else ""),
-        total_realized_base_pnl=f"{total_realized_base_pnl:,.2f}",
-        base_pnl_class="positive" if total_realized_base_pnl > 0 else ("negative" if total_realized_base_pnl < 0 else ""),
-        table_rows=table_rows
-    )
-
+    # 填充模板
     try:
+        final_html = html_template.format(
+            update_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            total_market_value=f"{total_market_value:,.2f}",
+            total_unrealized_pnl=f"{total_unrealized_pnl:,.2f}",
+            unrealized_pnl_class="positive" if total_unrealized_pnl >= 0 else "negative",
+            total_realized_pnl=f"{total_realized_pnl:,.2f}",
+            realized_pnl_class="positive" if total_realized_pnl >= 0 else "negative",
+            account_total_pnl=f"{account_total_pnl:,.2f}",
+            total_pnl_class="positive" if account_total_pnl >= 0 else "negative",
+            total_realized_grid_pnl=f"{total_realized_grid_pnl:,.2f}",
+            grid_pnl_class="positive" if total_realized_grid_pnl > 0 else ("negative" if total_realized_grid_pnl < 0 else ""),
+            total_realized_base_pnl=f"{total_realized_base_pnl:,.2f}",
+            base_pnl_class="positive" if total_realized_base_pnl > 0 else ("negative" if total_realized_base_pnl < 0 else ""),
+            table_rows=table_rows
+        )
+
         report_path = research_path('reports', 'strategy_dashboard.html')
         report_path.write_text(final_html, encoding='utf-8')
+        
     except Exception as e:
-        info(f'❌ 生成HTML看板失败: {e}')
+        info(f'❌ 生成HTML看板失败 (模板格式错误?): {e}')
