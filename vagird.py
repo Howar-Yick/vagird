@@ -1,14 +1,13 @@
 # event_driven_grid_strategy.py
-# 版本号：GEMINI-3.2.52-Strict-Full
+# 版本号：GEMINI-3.2.53-Rehang-Fix
 # 
-# 修复与完整性确认 (v3.2.52):
-# 1. 【完整性恢复】: 
-#    - 严格找回 log_trade_details (交易流水) 和 update_daily_reports (每日报表) 的完整逻辑。
-#    - 确保 end_of_day, PnL计算, VA逻辑等所有模块完整无缺。
-# 2. 【核心Bug修复 - 时钟源校准】: 
-#    - 涉及互斥锁的时间全部使用 datetime.now() (服务器墙钟时间)，彻底解决重复下单。
-# 3. 【去重保护】:
-#    - 巡检函数包含双重下单检测与撤单逻辑。
+# 更新日志 (v3.2.53):
+# 1. 【核心修复 - 重复下单避让】: 
+#    - 在 check_pending_rehangs 中增加 9:30 和 13:00 的分钟级避让逻辑。
+#    - 此时段的补单/挂单统一由 handle_data -> patrol_and_correct_orders 接管，
+#      彻底解决因竞价撤单积压导致的双线程并发下单冲突 (Race Condition)。
+# 2. 【完整性确认】: 
+#    - 保持所有现有功能（PnL, VA, 看板, 巡检, 数据修复）完整无缺。
 
 import json
 import logging
@@ -28,7 +27,7 @@ import pandas as pd
 LOG_FH = None
 LOG_DATE = None
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'GEMINI-3.2.52-Strict-Full'
+__version__ = 'GEMINI-3.2.53-Rehang-Fix'
 TRANSACTION_COST = 0.00005
 
 # ---- 调试默认 ----
@@ -854,6 +853,14 @@ def check_pending_rehangs(context):
     """
     # 1. 严格时间检查：14:55 后禁止任何补单，防止干扰 end_of_day
     if context.current_dt.time() >= dtime(14, 55):
+        return
+
+    # 【新增 v3.2.53】避开 9:30 和 13:00 两个特殊分钟
+    # 原因：此时段存在集合竞价后的撤单/重挂积压，
+    # 统一交由 handle_data -> patrol_and_correct_orders 处理，防止双重下单。
+    now_t = context.current_dt.time()
+    if (now_t.hour == 9 and now_t.minute == 30) or \
+       (now_t.hour == 13 and now_t.minute == 0):
         return
 
     # 【Fix v3.2.51】: 使用服务器真实时间进行检查
