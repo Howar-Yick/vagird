@@ -1,13 +1,12 @@
 # event_driven_grid_strategy.py
-# 版本号：GEMINI-3.2.53-Rehang-Fix
+# 版本号：GEMINI-3.2.54-Lock-Fix
 # 
-# 更新日志 (v3.2.53):
-# 1. 【核心修复 - 重复下单避让】: 
-#    - 在 check_pending_rehangs 中增加 9:30 和 13:00 的分钟级避让逻辑。
-#    - 此时段的补单/挂单统一由 handle_data -> patrol_and_correct_orders 接管，
-#      彻底解决因竞价撤单积压导致的双线程并发下单冲突 (Race Condition)。
-# 2. 【完整性确认】: 
-#    - 保持所有现有功能（PnL, VA, 看板, 巡检, 数据修复）完整无缺。
+# 更新日志 (v3.2.54):
+# 1. 【核心修复 - 严格防重方案】: 
+#    - 修改 place_limit_orders，实施“有单即止”原则。只要同方向有单，绝不补新单，杜绝重复。
+# 2. 【核心修复 - 修正锁机制】: 
+#    - 引入 _ignore_place_until 互斥锁。
+#    - patrol 在撤单修正时开启 10s 锁，物理屏蔽异步线程的干扰，解决撤单真空期的并发风险。
 
 import json
 import logging
@@ -27,7 +26,7 @@ import pandas as pd
 LOG_FH = None
 LOG_DATE = None
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'GEMINI-3.2.53-Rehang-Fix'
+__version__ = 'GEMINI-3.2.54-Lock-Fix'
 TRANSACTION_COST = 0.00005
 
 # ---- 调试默认 ----
@@ -429,7 +428,10 @@ def initialize(context):
             '_pos_confirm_deadline': None,
             
             # 【v3.2.51】: 使用 _rehang_due_ts 替代 _trade_lock_until
-            '_rehang_due_ts': None 
+            '_rehang_due_ts': None,
+            
+            # 【v3.2.54】: 修正锁
+            '_ignore_place_until': None
         })
         context.state[sym] = st
         context.latest_data[sym] = st['base_price']
@@ -881,16 +883,29 @@ def check_pending_rehangs(context):
             state['_rehang_due_ts'] = None
             
             # 执行补单 (ignore_cooldown=True)
+            # 注意：此处不传入 bypass_lock=True，遵守修正锁
             place_limit_orders(context, sym, state, ignore_cooldown=True)
             safe_save_state(sym, state)
 
 
 # ---------------- 网格限价挂单主逻辑 ----------------
 
-def place_limit_orders(context, symbol, state, ignore_cooldown=False):
+def place_limit_orders(context, symbol, state, ignore_cooldown=False, bypass_lock=False):
+    """
+    Args:
+        bypass_lock (bool): 是否绕过修正锁。只有 patrol 函数有权设为 True。
+                            check_pending_rehangs 和 handle_data 必须为 False。
+    """
     now_dt = context.current_dt
     dbg_tag = f"[{dsym(context, symbol)}]"
     
+    # 【Fix v3.2.54】: 修正锁检查 (Correction Lock)
+    # 如果当前处于巡检修正期(撤单真空期)，且不是 patrol 主动调用，则避让
+    if not bypass_lock:
+        ignore_until = state.get('_ignore_place_until')
+        if ignore_until and datetime.now() < ignore_until:
+             return
+
     # 【Fix v3.2.51】: 严格互斥逻辑
     # 只要存在补单计划（_rehang_due_ts 不为空），无论时间是否到达，本函数（由handle_data/patrol调用）
     # 都必须避让，绝对不执行下单。只有 check_pending_rehangs 有权处理。
@@ -966,8 +981,12 @@ def place_limit_orders(context, symbol, state, ignore_cooldown=False):
 
     try:
         open_orders = [o for o in (get_open_orders(symbol) or []) if getattr(o, 'status', None) == '2']
-        same_buy   = any(o.amount > 0 and abs(getattr(o, 'price', 0) - buy_p)  < 1e-3 for o in open_orders)
-        same_sell = any(o.amount < 0 and abs(getattr(o, 'price', 0) - sell_p) < 1e-3 for o in open_orders)
+        
+        # 【Fix v3.2.54】: 严格有单即止
+        # 只要该方向存在任何未成交订单，无论价格多少，都视为"已挂单"，坚决不补新单。
+        # 价格修正责任全权交给 patrol，避免双重标准导致的重复下单。
+        same_buy   = any(o.amount > 0 for o in open_orders)
+        same_sell = any(o.amount < 0 for o in open_orders)
 
         enable_amount = position.enable_amount
         state['_oo_last'] = len(open_orders)
@@ -1299,6 +1318,12 @@ def patrol_and_correct_orders(context, symbol, state):
         # 执行撤销
         if orders_to_cancel:
             info('{} 🕵️ PATROL: 发现 {} 笔错误/重复挂单，正在撤销...', dbg_tag, len(orders_to_cancel))
+            
+            # 【Fix v3.2.54】设置修正锁，防止撤单真空期内 check_pending_rehangs 乘虚而入
+            # 锁定 10 秒
+            state['_ignore_place_until'] = datetime.now() + timedelta(seconds=10)
+            safe_save_state(symbol, state)
+            
             for o in orders_to_cancel:
                 try:
                     entrust_no = getattr(o, 'entrust_no', None)
@@ -1311,7 +1336,9 @@ def patrol_and_correct_orders(context, symbol, state):
             # 撤单后立即刷新状态并尝试补单
             state.pop('_last_order_ts', None)
             state.pop('_last_order_bp', None)
-            place_limit_orders(context, symbol, state, ignore_cooldown=True)
+            
+            # 【Fix v3.2.54】传入 bypass_lock=True，允许 patrol 绕过自己刚设置的锁
+            place_limit_orders(context, symbol, state, ignore_cooldown=True, bypass_lock=True)
             return 
 
         # 如果没有要撤的，但缺单，则补单
@@ -1321,6 +1348,7 @@ def patrol_and_correct_orders(context, symbol, state):
         if (should_have_buy_order and not has_correct_buy_order) or \
            (should_have_sell_order and not has_correct_sell_order):
             info('{} 🕵️ PATROL: 发现缺失订单，准备补挂...', dbg_tag)
+            # 这里调用 place，但不需要绕过锁，因为并没有设置锁
             place_limit_orders(context, symbol, state, ignore_cooldown=True)
 
     except Exception as e:
@@ -1834,7 +1862,10 @@ def reload_config_if_changed(context):
                 '_recover_until': None, '_after_cancel_until': None, 
                 '_oo_drop_seen_ts': None, '_pos_jump_seen_ts': None, 
                 '_pos_confirm_deadline': None,
-                '_rehang_due_ts': None # 使用新版时间锁变量
+                '_rehang_due_ts': None, # 使用新版时间锁变量
+                
+                # 【v3.2.54】: 修正锁
+                '_ignore_place_until': None
             })
             context.state[sym] = st
             context.latest_data[sym] = st['base_price']
