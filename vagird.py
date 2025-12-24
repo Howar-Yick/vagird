@@ -1,12 +1,14 @@
 # event_driven_grid_strategy.py
-# 版本号：GEMINI-3.2.54-Lock-Fix
+# 版本号：GEMINI-3.2.56-Ghost-Buster
 # 
-# 更新日志 (v3.2.54):
-# 1. 【核心修复 - 严格防重方案】: 
-#    - 修改 place_limit_orders，实施“有单即止”原则。只要同方向有单，绝不补新单，杜绝重复。
-# 2. 【核心修复 - 修正锁机制】: 
-#    - 引入 _ignore_place_until 互斥锁。
-#    - patrol 在撤单修正时开启 10s 锁，物理屏蔽异步线程的干扰，解决撤单真空期的并发风险。
+# 更新日志 (v3.2.56):
+# 1. 【核心修复 - 已成交幽灵单过滤】:
+#    - 修改 place_limit_orders: 增加对 `state['filled_order_ids']` 的过滤。
+#    - 解决场景: 订单已成交但API仍返回Status=2，导致系统误判"有单"而跳过补单。
+# 2. 【逻辑增强 - 撤单状态传递】:
+#    - cancel_all_orders_by_symbol 现在返回已撤销的ID集合。
+#    - on_order_filled 将撤销的ID存入 state['_pending_ignore_ids']。
+#    - check_pending_rehangs 读取该集合并传给下单函数，确保撤单真空期无缝补单。
 
 import json
 import logging
@@ -26,7 +28,7 @@ import pandas as pd
 LOG_FH = None
 LOG_DATE = None
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'GEMINI-3.2.54-Lock-Fix'
+__version__ = 'GEMINI-3.2.56-Ghost-Buster'
 TRANSACTION_COST = 0.00005
 
 # ---- 调试默认 ----
@@ -431,7 +433,10 @@ def initialize(context):
             '_rehang_due_ts': None,
             
             # 【v3.2.54】: 修正锁
-            '_ignore_place_until': None
+            '_ignore_place_until': None,
+            
+            # 【v3.2.56】: 撤单ID缓存
+            '_pending_ignore_ids': []
         })
         context.state[sym] = st
         context.latest_data[sym] = st['base_price']
@@ -579,6 +584,7 @@ def after_initialize_cleanup(context):
             context.state[sym].pop('_last_pos_seen', None)
             context.state[sym].pop('_trade_lock_until', None) # 清理旧版锁
             context.state[sym].pop('_rehang_due_ts', None) # 清理补单标记
+            context.state[sym].pop('_pending_ignore_ids', None) # 清理ID缓存
         context.pending_frozen[sym] = 0
     info('✅ 全局清理完成')
 
@@ -636,9 +642,13 @@ def get_order_status(entrust_no):
         return ''
 
 def cancel_all_orders_by_symbol(context, symbol):
-    # 此函数现在仅用于盘中针对单一标的的定点清理
+    """
+    [更新 v3.2.56] 返回已撤销的订单号集合，用于防止幽灵单。
+    """
     all_orders = get_all_orders() or []
     total = 0
+    cancelled_ids = set()
+    
     if not hasattr(context, 'canceled_cache'):
         context.canceled_cache = {'date': None, 'orders': set()}
     today = context.current_dt.date()
@@ -668,6 +678,8 @@ def cancel_all_orders_by_symbol(context, symbol):
         info('[{}] 👉 发现并尝试撤销遗留挂单 entrust_no={}', dsym(context, symbol), entrust_no)
         try:
             cancel_order_ex({'entrust_no': entrust_no, 'symbol': api_sym})
+            if entrust_no:
+                cancelled_ids.add(entrust_no)
             
             o_amt = getattr(o, 'amount', 0)
             if o_amt == 0 and isinstance(o, dict):
@@ -681,6 +693,8 @@ def cancel_all_orders_by_symbol(context, symbol):
 
         except Exception as e:
             info('[{}] ⚠️ 撤单异常 entrust_no={}: {}', dsym(context, symbol), entrust_no, e)
+            
+    return cancelled_ids
 
 # ---------------- 集合竞价挂单 ----------------
 
@@ -882,19 +896,27 @@ def check_pending_rehangs(context):
             # 清除标记，防止 handle_data 再次跳过或重复执行
             state['_rehang_due_ts'] = None
             
+            # 【修复 v3.2.56】获取并清理待忽略的ID列表
+            ignore_ids = set(state.get('_pending_ignore_ids', []))
+            if '_pending_ignore_ids' in state:
+                state.pop('_pending_ignore_ids')
+
             # 执行补单 (ignore_cooldown=True)
             # 注意：此处不传入 bypass_lock=True，遵守修正锁
-            place_limit_orders(context, sym, state, ignore_cooldown=True)
+            place_limit_orders(context, sym, state, 
+                               ignore_cooldown=True,
+                               ignore_entrust_nos=ignore_ids)
             safe_save_state(sym, state)
 
 
 # ---------------- 网格限价挂单主逻辑 ----------------
 
-def place_limit_orders(context, symbol, state, ignore_cooldown=False, bypass_lock=False):
+def place_limit_orders(context, symbol, state, ignore_cooldown=False, bypass_lock=False, ignore_entrust_nos=None):
     """
     Args:
         bypass_lock (bool): 是否绕过修正锁。只有 patrol 函数有权设为 True。
                             check_pending_rehangs 和 handle_data 必须为 False。
+        ignore_entrust_nos (set): 需要主动忽略的订单号集合（用于过滤幽灵订单）
     """
     now_dt = context.current_dt
     dbg_tag = f"[{dsym(context, symbol)}]"
@@ -980,7 +1002,26 @@ def place_limit_orders(context, symbol, state, ignore_cooldown=False, bypass_loc
     state['_last_order_ts'], state['_last_order_bp'] = now_dt, base
 
     try:
-        open_orders = [o for o in (get_open_orders(symbol) or []) if getattr(o, 'status', None) == '2']
+        raw_open_orders = get_open_orders(symbol) or []
+        open_orders = []
+        
+        # 【核心修复 v3.2.56】双重幽灵过滤
+        # 1. 过滤传入的“刚撤销”订单
+        # 2. 过滤已成交但API返回未成交的订单
+        ignore_set = set(ignore_entrust_nos) if ignore_entrust_nos else set()
+        filled_ids = state.get('filled_order_ids', set())
+        
+        for o in raw_open_orders:
+             if getattr(o, 'status', None) == '2':
+                 eid = getattr(o, 'entrust_no', None)
+                 # 过滤被主动忽略的 ID
+                 if eid and eid in ignore_set:
+                     continue
+                 # 【关键修复】过滤已成交的 ID (防止 Status=2 的假象)
+                 if eid and eid in filled_ids:
+                     continue
+                     
+                 open_orders.append(o)
         
         # 【Fix v3.2.54】: 严格有单即止
         # 只要该方向存在任何未成交订单，无论价格多少，都视为"已挂单"，坚决不补新单。
@@ -1096,7 +1137,10 @@ def on_order_filled(context, symbol, order):
     state['last_fill_price'] = order.price
     state['base_price'] = order.price
 
-    cancel_all_orders_by_symbol(context, symbol)
+    # 【修复 v3.2.56】保存撤销的ID，供 rehang 使用
+    cancelled_ids = cancel_all_orders_by_symbol(context, symbol)
+    if cancelled_ids:
+        state['_pending_ignore_ids'] = list(cancelled_ids)
 
     # 【Fix v3.2.51】: 使用 datetime.now() 获取真实时间，避免 K线时间滞后导致锁失效
     delay_s = float(getattr(context, 'delay_after_cancel_seconds', DELAY_AFTER_CANCEL_SECONDS_DEFAULT))
@@ -1324,12 +1368,17 @@ def patrol_and_correct_orders(context, symbol, state):
             state['_ignore_place_until'] = datetime.now() + timedelta(seconds=10)
             safe_save_state(symbol, state)
             
+            # 【修复 v3.2.55】收集已撤销的订单号
+            cancelled_ids = set()
+            
             for o in orders_to_cancel:
                 try:
                     entrust_no = getattr(o, 'entrust_no', None)
                     api_sym = getattr(o, 'symbol', None) or getattr(o, 'stock_code', None)
                     info('{} ... 正在撤销 #{}: {} @ {:.3f}', dbg_tag, entrust_no, o.amount, getattr(o, 'price', 0))
                     cancel_order_ex({'entrust_no': entrust_no, 'symbol': api_sym})
+                    if entrust_no:
+                        cancelled_ids.add(entrust_no)
                 except Exception as e:
                     info('{} ⚠️ PATROL 撤单异常: {}', dbg_tag, e)
             
@@ -1338,7 +1387,11 @@ def patrol_and_correct_orders(context, symbol, state):
             state.pop('_last_order_bp', None)
             
             # 【Fix v3.2.54】传入 bypass_lock=True，允许 patrol 绕过自己刚设置的锁
-            place_limit_orders(context, symbol, state, ignore_cooldown=True, bypass_lock=True)
+            # 【Fix v3.2.55】传入 ignore_entrust_nos，强制忽略幽灵订单
+            place_limit_orders(context, symbol, state, 
+                               ignore_cooldown=True, 
+                               bypass_lock=True,
+                               ignore_entrust_nos=cancelled_ids)
             return 
 
         # 如果没有要撤的，但缺单，则补单
@@ -1865,7 +1918,10 @@ def reload_config_if_changed(context):
                 '_rehang_due_ts': None, # 使用新版时间锁变量
                 
                 # 【v3.2.54】: 修正锁
-                '_ignore_place_until': None
+                '_ignore_place_until': None,
+                
+                # 【v3.2.56】: 撤单ID缓存
+                '_pending_ignore_ids': []
             })
             context.state[sym] = st
             context.latest_data[sym] = st['base_price']
