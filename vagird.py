@@ -1,14 +1,15 @@
 # event_driven_grid_strategy.py
-# 版本号：GEMINI-3.2.56-Ghost-Buster
+# 版本号：GEMINI-3.2.58-Fix-Attribute
 # 
-# 更新日志 (v3.2.56):
-# 1. 【核心修复 - 已成交幽灵单过滤】:
-#    - 修改 place_limit_orders: 增加对 `state['filled_order_ids']` 的过滤。
-#    - 解决场景: 订单已成交但API仍返回Status=2，导致系统误判"有单"而跳过补单。
-# 2. 【逻辑增强 - 撤单状态传递】:
-#    - cancel_all_orders_by_symbol 现在返回已撤销的ID集合。
-#    - on_order_filled 将撤销的ID存入 state['_pending_ignore_ids']。
-#    - check_pending_rehangs 读取该集合并传给下单函数，确保撤单真空期无缝补单。
+# 更新日志 (v3.2.58):
+# 1. 【紧急修复 - API对象兼容性】: 
+#    - 修复 _recalc_pending_frozen 中使用 .get() 访问 Order 对象导致的报错。
+#    - 改为使用 getattr()，兼容实盘 API 返回的 Object 结构。
+#
+# 更新日志 (v3.2.57):
+# 1. 【核心修复 - 冻结量漂移】: 
+#    - 新增 _recalc_pending_frozen 函数，基于 get_open_orders 实时计算卖单冻结量。
+#    - 在 place_limit_orders 入口处强制调用校准，彻底解决 pending_frozen 计数器只增不减导致的“有仓不卖”问题。
 
 import json
 import logging
@@ -28,7 +29,7 @@ import pandas as pd
 LOG_FH = None
 LOG_DATE = None
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'GEMINI-3.2.56-Ghost-Buster'
+__version__ = 'GEMINI-3.2.58-Fix-Attribute'
 TRANSACTION_COST = 0.00005
 
 # ---- 调试默认 ----
@@ -602,7 +603,7 @@ def _fast_cancel_all_orders_global(context):
             if convert_symbol_to_standard(sym) not in context.symbol_list:
                 continue
             
-            status = str(o.get('status', ''))
+            status = str(getattr(o, 'status', ''))
             if status in ['2', '7']: 
                 to_cancel.append(o)
         
@@ -617,7 +618,9 @@ def _fast_cancel_all_orders_global(context):
                         o_amt = o.get('amount', 0)
                     
                     o_sym = convert_symbol_to_standard(o.get('symbol') or o.get('stock_code'))
-                    is_sell = (o_amt < 0) or (str(o.get('entrust_bs', '')) == '2')
+                    # 兼容对象和字典
+                    bs = str(getattr(o, 'entrust_bs', ''))
+                    is_sell = (o_amt < 0) or (bs == '2')
                     
                     if is_sell and o_sym in context.pending_frozen:
                         frozen = abs(o_amt)
@@ -660,7 +663,7 @@ def cancel_all_orders_by_symbol(context, symbol):
         api_sym = o.get('symbol') or o.get('stock_code') 
         if convert_symbol_to_standard(api_sym) != symbol:
             continue
-        status = str(o.get('status', ''))
+        status = str(getattr(o, 'status', ''))
         entrust_no = o.get('entrust_no')
         
         if (not entrust_no
@@ -685,7 +688,9 @@ def cancel_all_orders_by_symbol(context, symbol):
             if o_amt == 0 and isinstance(o, dict):
                 o_amt = o.get('amount', 0)
                 
-            is_sell = (o_amt < 0) or (str(o.get('entrust_bs', '')) == '2')
+            # 兼容对象和字典
+            bs = str(getattr(o, 'entrust_bs', ''))
+            is_sell = (o_amt < 0) or (bs == '2')
             
             if is_sell:
                 frozen = abs(o_amt)
@@ -908,6 +913,42 @@ def check_pending_rehangs(context):
                                ignore_entrust_nos=ignore_ids)
             safe_save_state(sym, state)
 
+# ---------------- 【核心新增】实时冻结量校准 ----------------
+
+def _recalc_pending_frozen(context, symbol):
+    """
+    【v3.2.58 修复】: 兼容 Order 对象和字典，修复 .get() 报错。
+    """
+    try:
+        orders = get_open_orders(symbol) or []
+        frozen = 0
+        for o in orders:
+            # 兼容对象(getattr)和字典
+            status = str(getattr(o, 'status', ''))
+            
+            # 状态: 2=已报, 7=部成 (PTRADE API)
+            if status in ['2', '7']: 
+                amt = getattr(o, 'amount', 0)
+                # 如果是字典，getattr 可能拿到 0 或 None，需再次确认
+                if amt == 0 and isinstance(o, dict):
+                    amt = o.get('amount', 0)
+                
+                # 识别卖单
+                bs = str(getattr(o, 'entrust_bs', ''))
+                if isinstance(o, dict) and not bs:
+                    bs = str(o.get('entrust_bs', ''))
+                    
+                is_sell = (amt < 0) or (bs == '2')
+                if is_sell:
+                    frozen += abs(amt)
+        
+        context.pending_frozen[symbol] = frozen
+        return frozen
+    except Exception as e:
+        # 只有在调试模式下才频繁报错，否则降级处理
+        if getattr(context, 'enable_debug_log', False):
+            info('[{}] ⚠️ 同步冻结量失败: {}', dsym(context, symbol), e)
+        return context.pending_frozen.get(symbol, 0)
 
 # ---------------- 网格限价挂单主逻辑 ----------------
 
@@ -918,6 +959,10 @@ def place_limit_orders(context, symbol, state, ignore_cooldown=False, bypass_loc
                             check_pending_rehangs 和 handle_data 必须为 False。
         ignore_entrust_nos (set): 需要主动忽略的订单号集合（用于过滤幽灵订单）
     """
+    
+    # 【v3.2.57 Fix】: 无论何时进入下单逻辑，先校准冻结量
+    _recalc_pending_frozen(context, symbol)
+    
     now_dt = context.current_dt
     dbg_tag = f"[{dsym(context, symbol)}]"
     
@@ -1012,7 +1057,7 @@ def place_limit_orders(context, symbol, state, ignore_cooldown=False, bypass_loc
         filled_ids = state.get('filled_order_ids', set())
         
         for o in raw_open_orders:
-             if getattr(o, 'status', None) == '2':
+             if str(getattr(o, 'status', '')) == '2':
                  eid = getattr(o, 'entrust_no', None)
                  # 过滤被主动忽略的 ID
                  if eid and eid in ignore_set:
@@ -1617,7 +1662,7 @@ def end_of_day(context):
             if convert_symbol_to_standard(sym) not in context.symbol_list:
                 continue
             
-            status = str(o.get('status', ''))
+            status = str(getattr(o, 'status', ''))
             if status == '2': 
                 to_cancel.append(o)
         
@@ -1632,7 +1677,9 @@ def end_of_day(context):
                     o_amt = o.get('amount', 0)
                 
                 o_sym = convert_symbol_to_standard(o.get('symbol') or o.get('stock_code'))
-                is_sell = (o_amt < 0) or (str(o.get('entrust_bs', '')) == '2')
+                # 兼容对象和字典
+                bs = str(getattr(o, 'entrust_bs', ''))
+                is_sell = (o_amt < 0) or (bs == '2')
                 
                 if is_sell and o_sym in context.pending_frozen:
                     frozen = abs(o_amt)
