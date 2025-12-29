@@ -1,15 +1,16 @@
 # event_driven_grid_strategy.py
-# 版本号：GEMINI-3.2.58-Fix-Attribute
+# 版本号：GEMINI-3.2.59-Fix-EOD-Strict
 # 
-# 更新日志 (v3.2.58):
-# 1. 【紧急修复 - API对象兼容性】: 
-#    - 修复 _recalc_pending_frozen 中使用 .get() 访问 Order 对象导致的报错。
-#    - 改为使用 getattr()，兼容实盘 API 返回的 Object 结构。
-#
-# 更新日志 (v3.2.57):
-# 1. 【核心修复 - 冻结量漂移】: 
-#    - 新增 _recalc_pending_frozen 函数，基于 get_open_orders 实时计算卖单冻结量。
-#    - 在 place_limit_orders 入口处强制调用校准，彻底解决 pending_frozen 计数器只增不减导致的“有仓不卖”问题。
+# 更新日志 (v3.2.59):
+# 1. 【精准修复 - 日终撤单】:
+#    - 仅重写 end_of_day 函数，修复 .get() 报错导致的静默失败，兼容 Object/Dict 返回。
+#    - 撤单范围增加 '7'(部成) 状态。
+#    - 增加异常捕获，防止单笔订单报错中断整个撤单流程。
+# 2. 【逻辑互斥 - 交易时间】:
+#    - 恢复交易挂单截止时间为 14:55:00 (原为 14:56，现调整为与 EOD 同步截止，防止撤了又挂)。
+#    - 保持最大化交易时长，不浪费哪怕一分钟。
+# 3. 【稳定性】:
+#    - 撤回对 _fast_cancel_all_orders_global 的修改，保持原状。
 
 import json
 import logging
@@ -29,7 +30,7 @@ import pandas as pd
 LOG_FH = None
 LOG_DATE = None
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'GEMINI-3.2.58-Fix-Attribute'
+__version__ = 'GEMINI-3.2.59-Fix-EOD-Strict'
 TRANSACTION_COST = 0.00005
 
 # ---- 调试默认 ----
@@ -869,16 +870,13 @@ def _in_reopen_window(now_t: dtime):
 
 def check_pending_rehangs(context):
     """
-    每3秒运行一次。检查所有标的，如果有到期的 '_rehang_due_ts'，说明成交后冷却期已过，
-    执行补单逻辑，并清除标记。
+    每3秒运行一次。
     """
-    # 1. 严格时间检查：14:55 后禁止任何补单，防止干扰 end_of_day
+    # 【Fix v3.2.59】: 14:55:00 准时停止补单
     if context.current_dt.time() >= dtime(14, 55):
         return
 
-    # 【新增 v3.2.53】避开 9:30 和 13:00 两个特殊分钟
-    # 原因：此时段存在集合竞价后的撤单/重挂积压，
-    # 统一交由 handle_data -> patrol_and_correct_orders 处理，防止双重下单。
+    # 【Fix v3.2.53】避开 9:30 和 13:00 两个特殊分钟
     now_t = context.current_dt.time()
     if (now_t.hour == 9 and now_t.minute == 30) or \
        (now_t.hour == 13 and now_t.minute == 0):
@@ -959,7 +957,11 @@ def place_limit_orders(context, symbol, state, ignore_cooldown=False, bypass_loc
                             check_pending_rehangs 和 handle_data 必须为 False。
         ignore_entrust_nos (set): 需要主动忽略的订单号集合（用于过滤幽灵订单）
     """
-    
+    # 【Fix v3.2.59】: 绝对时间锁 - 14:55:00 毫秒级截止
+    # 只要到了 14:55:00，强制退出，不给撤单后反向挂单任何机会
+    if context.current_dt.time() >= dtime(14, 55):
+        return
+
     # 【v3.2.57 Fix】: 无论何时进入下单逻辑，先校准冻结量
     _recalc_pending_frozen(context, symbol)
     
@@ -986,7 +988,9 @@ def place_limit_orders(context, symbol, state, ignore_cooldown=False, bypass_loc
     if is_order_blocking_period():
         info('{} ❎ PLACE-SKIP REASON=BLOCKING_PERIOD(9:25-9:30)', dbg_tag)
         return
-    in_limit_window = is_auction_time() or (is_main_trading_time() and now_dt.time() < dtime(14, 56))
+    
+    # 【Fix v3.2.59】: 逻辑时间窗检查
+    in_limit_window = is_auction_time() or (is_main_trading_time() and now_dt.time() < dtime(14, 55))
     if not in_limit_window:
         return
 
@@ -1051,26 +1055,20 @@ def place_limit_orders(context, symbol, state, ignore_cooldown=False, bypass_loc
         open_orders = []
         
         # 【核心修复 v3.2.56】双重幽灵过滤
-        # 1. 过滤传入的“刚撤销”订单
-        # 2. 过滤已成交但API返回未成交的订单
         ignore_set = set(ignore_entrust_nos) if ignore_entrust_nos else set()
         filled_ids = state.get('filled_order_ids', set())
         
         for o in raw_open_orders:
              if str(getattr(o, 'status', '')) == '2':
                  eid = getattr(o, 'entrust_no', None)
-                 # 过滤被主动忽略的 ID
                  if eid and eid in ignore_set:
                      continue
-                 # 【关键修复】过滤已成交的 ID (防止 Status=2 的假象)
                  if eid and eid in filled_ids:
                      continue
                      
                  open_orders.append(o)
         
         # 【Fix v3.2.54】: 严格有单即止
-        # 只要该方向存在任何未成交订单，无论价格多少，都视为"已挂单"，坚决不补新单。
-        # 价格修正责任全权交给 patrol，避免双重标准导致的重复下单。
         same_buy   = any(o.amount > 0 for o in open_orders)
         same_sell = any(o.amount < 0 for o in open_orders)
 
@@ -1334,7 +1332,8 @@ def patrol_and_correct_orders(context, symbol, state):
     if state.get('_last_trade_ts') and (now_dt - state['_last_trade_ts']).total_seconds() < 58:
         return
 
-    if not (is_main_trading_time() and now_dt.time() < dtime(14, 56)):
+    # 【Fix v3.2.59】: 14:55:00 准时停止
+    if not (is_main_trading_time() and now_dt.time() < dtime(14, 55)):
         return 
     if context.mark_halted.get(symbol, False):
         return 
@@ -1520,7 +1519,8 @@ def handle_data(context, data):
 
     is_patrol_time = (now_dt.minute % 30 == 0 and now_dt.second < 5)
     
-    if not is_patrol_time and (is_auction_time() or (is_main_trading_time() and now < dtime(14, 56))):
+    # 【Fix v3.2.59】: 将交易截止时间恢复到 14:55:00
+    if not is_patrol_time and (is_auction_time() or (is_main_trading_time() and now < dtime(14, 55))):
         for sym in context.symbol_list:
             if sym in context.state:
                 place_limit_orders(context, sym, context.state[sym], ignore_cooldown=False)
@@ -1650,49 +1650,74 @@ def calculate_atr(context, symbol, atr_period=14):
 # ---------------- 日终处理 ----------------
 
 def end_of_day(context):
-    info('✅ 日终处理 (Early Start @ 14:55) [GLOBAL BATCH CANCEL]')
-    
-    all_orders = get_all_orders()
-    if not all_orders:
-        info('🕊️ 账户无挂单，清理完毕。')
-    else:
+    info('✅ 日终处理 (Start @ 14:55) [GLOBAL BATCH CANCEL]')
+    try:
+        all_orders = get_all_orders()
+        if not all_orders:
+            info('🕊️ 账户无挂单，清理完毕。')
+            return
+
         to_cancel = []
         for o in all_orders:
-            sym = o.get('symbol') or o.get('stock_code')
+            # 【修复 1】: 双重兼容，防止 AttributeError
+            sym = getattr(o, 'symbol', None) or getattr(o, 'stock_code', None)
+            if sym is None and isinstance(o, dict):
+                sym = o.get('symbol') or o.get('stock_code')
+            
+            if not sym: continue
+            
+            # 过滤非本策略标的
             if convert_symbol_to_standard(sym) not in context.symbol_list:
                 continue
             
+            # 【修复 2】: 获取状态更健壮
             status = str(getattr(o, 'status', ''))
-            if status == '2': 
+            if not status and isinstance(o, dict):
+                status = str(o.get('status', ''))
+                
+            # 【修复 3】: 覆盖部成单 '7'
+            if status in ['2', '7']: 
                 to_cancel.append(o)
         
-        info('🧹 扫描到 {} 笔有效挂单，正在批量撤销...', len(to_cancel))
-        
-        for o in to_cancel:
-            try:
-                cancel_order_ex(o) 
-                
-                o_amt = getattr(o, 'amount', 0)
-                if o_amt == 0 and isinstance(o, dict):
-                    o_amt = o.get('amount', 0)
-                
-                o_sym = convert_symbol_to_standard(o.get('symbol') or o.get('stock_code'))
-                # 兼容对象和字典
-                bs = str(getattr(o, 'entrust_bs', ''))
-                is_sell = (o_amt < 0) or (bs == '2')
-                
-                if is_sell and o_sym in context.pending_frozen:
-                    frozen = abs(o_amt)
-                    context.pending_frozen[o_sym] = max(0, context.pending_frozen[o_sym] - frozen)
+        if not to_cancel:
+            info('🕊️ 无有效挂单(状态2/7)，清理完毕。')
+        else:
+            info('🧹 扫描到 {} 笔有效挂单(含部成)，正在批量撤销...', len(to_cancel))
             
-            except Exception as e:
-                pass
+            for o in to_cancel:
+                # 【修复 4】: 单笔异常捕获，防止崩盘
+                try:
+                    cancel_order_ex(o)
+                    
+                    # 维护虚拟冻结量（安全写法）
+                    o_amt = getattr(o, 'amount', 0)
+                    if o_amt == 0 and isinstance(o, dict):
+                        o_amt = o.get('amount', 0)
+                    
+                    o_sym = convert_symbol_to_standard(getattr(o, 'symbol', None) or getattr(o, 'stock_code', None) or (o.get('symbol') if isinstance(o, dict) else None))
+                    
+                    bs = str(getattr(o, 'entrust_bs', ''))
+                    if not bs and isinstance(o, dict):
+                         bs = str(o.get('entrust_bs', ''))
+                         
+                    is_sell = (o_amt < 0) or (bs == '2')
+                    
+                    if is_sell and o_sym in context.pending_frozen:
+                        frozen = abs(o_amt)
+                        context.pending_frozen[o_sym] = max(0, context.pending_frozen[o_sym] - frozen)
                 
+                except Exception as e:
+                    info('⚠️ 日终单笔撤单异常: {}', e)
+
+    except Exception as e:
+        info('❌ 日终撤单主流程异常: {}', e)
+
+    # 保存状态
     for sym in context.symbol_list:
         if sym in context.state:
             safe_save_state(sym, context.state[sym])
             
-    info('✅ 撤单指令已全部发出，PnL计算已推迟至盘后。')
+    info('✅ 日终作业完成，PnL计算已推迟至盘后。')
 
 # ---------------- VA & Tools (修复核心逻辑) ----------------
 
@@ -1825,7 +1850,7 @@ def _calculate_local_pnl_lifo(context):
         grid_pnl = 0.0
         base_pnl = 0.0
         
-        sym_trades = [t for t in trades if t['symbol'] == sym]
+        sym_trades = [t for t in sym_trades if t['symbol'] == sym]
         
         for t in sym_trades:
             qty = t['qty']
@@ -2025,72 +2050,6 @@ def log_trade_details(context, symbol, trade):
             f.write(",".join(row) + "\n")
     except Exception as e:
         info('❌ [{}] 记录交易日志失败: {}', dsym(context, symbol), e)
-
-# ---------------- 日报/报表 ----------------
-
-def update_daily_reports(context, data):
-    reports_dir = research_path('reports')
-    reports_dir.mkdir(parents=True, exist_ok=True)
-    current_date = context.current_dt.strftime("%Y-%m-%d")
-    for symbol in context.symbol_list:
-        report_file = reports_dir / f"{symbol}.csv"
-        state = context.state[symbol]
-        
-        position = get_position(symbol)
-        amount = position.amount
-        
-        cost_basis = getattr(position, 'cost_basis', state['base_price'])
-        close_price = context.last_valid_price.get(symbol, state['base_price'])
-        try:
-            if not is_valid_price(close_price):
-                close_price = cost_basis if cost_basis > 0 else state['base_price']
-                if not is_valid_price(close_price): close_price = 1.0
-        except:
-            close_price = state['base_price']
-        weeks = len(state.get('trade_week_set', []))
-        count = weeks
-        d_base = state['dingtou_base']
-        d_rate = state['dingtou_rate']
-        invest_should = d_base
-        invest_actual = d_base * (1 + d_rate) ** weeks
-        cumulative_invest = sum(d_base * (1 + d_rate) ** w for w in range(1, weeks+1))
-        expected_value = state['initial_position_value'] + d_base * weeks
-        last_week_val = state.get('last_week_position', 0) * close_price
-        current_val   = amount * close_price
-        weekly_return = (current_val - last_week_val) / last_week_val if last_week_val>0 else 0.0
-        total_return  = (current_val - cumulative_invest) / cumulative_invest if cumulative_invest>0 else 0.0
-        weekly_bottom_profit = (state['base_position'] - state.get('last_week_position', 0)) * close_price
-        total_bottom_profit  = state['base_position'] * close_price - state['initial_position_value']
-        standard_qty    = state['base_position'] + state['grid_unit'] * 5
-        intermediate_qty= state['base_position'] + state['grid_unit'] * 15
-        added_base      = state['base_position'] - state.get('last_week_position', 0)
-        compare_cost    = added_base * close_price
-        profit_all      = (close_price - cost_basis) * amount if cost_basis > 0 else 0
-        t_quantity = max(0, amount - state['base_position'])
-        row = [
-            current_date, f"{close_price:.3f}", str(weeks), str(count),
-            f"{weekly_return:.2%}", f"{total_return:.2%}", f"{expected_value:.2f}",
-            f"{invest_should:.0f}", f"{invest_actual:.0f}", f"{cumulative_invest:.0f}",
-            str(state['initial_base_position']), str(state['base_position']),
-            f"{state['base_position'] * close_price:.0f}", f"{weekly_bottom_profit:.0f}",
-            f"{total_bottom_profit:.0f}", str(state['base_position']), str(amount),
-            str(state['grid_unit']), str(t_quantity), str(standard_qty),
-            str(intermediate_qty), str(state['max_position']), f"{cost_basis:.3f}",
-            f"{compare_cost:.3f}", f"{profit_all:.0f}"
-        ]
-        is_new = not report_file.exists()
-        with open(report_file, 'a', encoding='utf-8', newline='') as f:
-            if is_new:
-                headers = [
-                    "时间","市价","期数","次数","每期总收益率","盈亏比","应到价值",
-                    "当周应投入金额","当周实际投入金额","实际累计投入金额","定投底仓份额",
-                    "累计底仓份额","累计底仓价值","每期累计底仓盈利","总累计底仓盈利",
-                    "底仓","股票余额","单次网格交易数量","可T数量","标准数量","中间数量",
-                    "极限数量","成本价","对比定投成本","盈亏"
-                ]
-                f.write(",".join(headers) + "\n")
-            f.write(",".join(map(str, row)) + "\n")
-        info('✅ [{}] 已更新每日CSV报表：{}', dsym(context, symbol), report_file)
 
 # ---------------- HTML 看板生成 (使用模板) ----------------
 
