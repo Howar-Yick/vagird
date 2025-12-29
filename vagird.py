@@ -1,16 +1,10 @@
 # event_driven_grid_strategy.py
-# 版本号：GEMINI-3.2.59-Fix-EOD-Strict
+# 版本号：GEMINI-3.2.60-Final
 # 
-# 更新日志 (v3.2.59):
-# 1. 【精准修复 - 日终撤单】:
-#    - 仅重写 end_of_day 函数，修复 .get() 报错导致的静默失败，兼容 Object/Dict 返回。
-#    - 撤单范围增加 '7'(部成) 状态。
-#    - 增加异常捕获，防止单笔订单报错中断整个撤单流程。
-# 2. 【逻辑互斥 - 交易时间】:
-#    - 恢复交易挂单截止时间为 14:55:00 (原为 14:56，现调整为与 EOD 同步截止，防止撤了又挂)。
-#    - 保持最大化交易时长，不浪费哪怕一分钟。
-# 3. 【稳定性】:
-#    - 撤回对 _fast_cancel_all_orders_global 的修改，保持原状。
+# 更新日志 (v3.2.60):
+# 1. 【完整性】补全 update_daily_reports 函数，修复日报生成缺失。
+# 2. 【Bug修复】修复 _calculate_local_pnl_lifo 中的变量引用错误 (sym_trades -> trades)。
+# 3. 【集成】包含 v3.2.59 的所有修复 (日终撤单增强、14:55 时间互斥)。
 
 import json
 import logging
@@ -1850,7 +1844,7 @@ def _calculate_local_pnl_lifo(context):
         grid_pnl = 0.0
         base_pnl = 0.0
         
-        sym_trades = [t for t in sym_trades if t['symbol'] == sym]
+        sym_trades = [t for t in trades if t['symbol'] == sym]
         
         for t in sym_trades:
             qty = t['qty']
@@ -2050,6 +2044,73 @@ def log_trade_details(context, symbol, trade):
             f.write(",".join(row) + "\n")
     except Exception as e:
         info('❌ [{}] 记录交易日志失败: {}', dsym(context, symbol), e)
+
+# ---------------- 日报/报表 ----------------
+
+def update_daily_reports(context, data):
+    reports_dir = research_path('reports')
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    current_date = context.current_dt.strftime("%Y-%m-%d")
+    for symbol in context.symbol_list:
+        report_file = reports_dir / f"{symbol}.csv"
+        state = context.state[symbol]
+        
+        position = get_position(symbol)
+        amount = position.amount
+        
+        cost_basis = getattr(position, 'cost_basis', state['base_price'])
+        close_price = context.last_valid_price.get(symbol, state['base_price'])
+        try:
+            if not is_valid_price(close_price):
+                close_price = cost_basis if cost_basis > 0 else state['base_price']
+                if not is_valid_price(close_price): close_price = 1.0
+        except:
+            close_price = state['base_price']
+        weeks = len(state.get('trade_week_set', []))
+        count = weeks
+        d_base = state['dingtou_base']
+        d_rate = state['dingtou_rate']
+        invest_should = d_base
+        invest_actual = d_base * (1 + d_rate) ** weeks
+        cumulative_invest = sum(d_base * (1 + d_rate) ** w for w in range(1, weeks+1))
+        expected_value = state['initial_position_value'] + d_base * weeks
+        last_week_val = state.get('last_week_position', 0) * close_price
+        current_val   = amount * close_price
+        weekly_return = (current_val - last_week_val) / last_week_val if last_week_val>0 else 0.0
+        total_return  = (current_val - cumulative_invest) / cumulative_invest if cumulative_invest>0 else 0.0
+        weekly_bottom_profit = (state['base_position'] - state.get('last_week_position', 0)) * close_price
+        total_bottom_profit  = state['base_position'] * close_price - state['initial_position_value']
+        standard_qty    = state['base_position'] + state['grid_unit'] * 5
+        intermediate_qty= state['base_position'] + state['grid_unit'] * 15
+        added_base      = state['base_position'] - state.get('last_week_position', 0)
+        compare_cost    = added_base * close_price
+        profit_all      = (close_price - cost_basis) * amount if cost_basis > 0 else 0
+        t_quantity = max(0, amount - state['base_position'])
+        row = [
+            current_date, f"{close_price:.3f}", str(weeks), str(count),
+            f"{weekly_return:.2%}", f"{total_return:.2%}", f"{expected_value:.2f}",
+            f"{invest_should:.0f}", f"{invest_actual:.0f}", f"{cumulative_invest:.0f}",
+            str(state['initial_base_position']), str(state['base_position']),
+            f"{state['base_position'] * close_price:.0f}", f"{weekly_bottom_profit:.0f}",
+            f"{total_bottom_profit:.0f}", str(state['base_position']), str(amount),
+            str(state['grid_unit']), str(t_quantity), str(standard_qty),
+            str(intermediate_qty), str(state['max_position']), f"{cost_basis:.3f}",
+            f"{compare_cost:.3f}", f"{profit_all:.0f}"
+        ]
+        is_new = not report_file.exists()
+        with open(report_file, 'a', encoding='utf-8', newline='') as f:
+            if is_new:
+                headers = [
+                    "时间","市价","期数","次数","每期总收益率","盈亏比","应到价值",
+                    "当周应投入金额","当周实际投入金额","实际累计投入金额","定投底仓份额",
+                    "累计底仓份额","累计底仓价值","每期累计底仓盈利","总累计底仓盈利",
+                    "底仓","股票余额","单次网格交易数量","可T数量","标准数量","中间数量",
+                    "极限数量","成本价","对比定投成本","盈亏"
+                ]
+                f.write(",".join(headers) + "\n")
+            f.write(",".join(map(str, row)) + "\n")
+        info('✅ [{}] 已更新每日CSV报表：{}', dsym(context, symbol), report_file)
+
 
 # ---------------- HTML 看板生成 (使用模板) ----------------
 
