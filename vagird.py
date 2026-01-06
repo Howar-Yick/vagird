@@ -1781,8 +1781,8 @@ def get_trade_weeks(context, symbol, state, dt):
 
 def adjust_grid_unit(state):
     # 如果底仓大幅增加，适当放大网格单位
-    if state['base_position'] > state['grid_unit'] * 50:
-        new_unit = int(state['base_position'] / 50 / 100) * 100
+    if state['base_position'] > state['grid_unit'] * 20:
+        new_unit = int(state['base_position'] / 20 / 100) * 100
         if new_unit > state['grid_unit']:
             state['grid_unit'] = new_unit
             info('[{}] 🔧 网格单位放大至 {}', state.get('symbol'), new_unit)
