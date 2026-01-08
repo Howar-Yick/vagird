@@ -1,10 +1,11 @@
 # event_driven_grid_strategy.py
-# 版本号：GEMINI-3.2.60-Final
+# 版本号：GEMINI-3.2.61-DynamicMaxPos
 # 
-# 更新日志 (v3.2.60):
-# 1. 【完整性】补全 update_daily_reports 函数，修复日报生成缺失。
-# 2. 【Bug修复】修复 _calculate_local_pnl_lifo 中的变量引用错误 (sym_trades -> trades)。
-# 3. 【集成】包含 v3.2.59 的所有修复 (日终撤单增强、14:55 时间互斥)。
+# 更新日志 (v3.2.61):
+# 1. 【核心修复】重构最大持仓(max_position)计算逻辑：
+#    - 现在 max_position 始终动态锚定为 "当前底仓 + 20个网格单位"。
+#    - 修复了定投(VA)导致底仓增加后，因持仓上限未同步提升而触发 "POS_CAP" 限制无法买入的问题。
+# 2. 【完整性】包含 v3.2.60 的日报修复及 v3.2.59 的所有补丁。
 
 import json
 import logging
@@ -1757,6 +1758,10 @@ def get_target_base_position(context, symbol, state, price, dt):
             if final_pos > state['base_position']:
                 info('[{}] 📈 VA价值平均加仓: 目标{:.0f} -> 底仓增加至 {}', dsym(context, symbol), target_val, final_pos)
                 state['base_position'] = final_pos
+
+        # 【核心修改点】: 无论底仓是否变化，每次计算后强制刷新最大持仓上限
+        # 公式：Max Position = 当前底仓 + 20 * 网格单位
+        state['max_position'] = state['base_position'] + state['grid_unit'] * 20
                 
     except Exception as e:
         info('[{}] ⚠️ 定投目标计算出错: {}', dsym(context, symbol), e)
@@ -1785,7 +1790,9 @@ def adjust_grid_unit(state):
         new_unit = math.ceil(state['base_position'] / 20 / 100) * 100
         if new_unit > state['grid_unit']:
             state['grid_unit'] = new_unit
-            info('[{}] 🔧 网格单位放大至 {}', state.get('symbol'), new_unit)
+            # 【核心修改点】: 网格单位放大时，也必须同步更新最大持仓，否则会导致上限偏小
+            state['max_position'] = state['base_position'] + new_unit * 20
+            info('[{}] 🔧 网格单位放大至 {}, 新最大持仓上限 {}', state.get('symbol'), new_unit, state['max_position'])
 
 def _load_pnl_metrics(path):
     if path.exists(): return json.loads(path.read_text(encoding='utf-8'))
