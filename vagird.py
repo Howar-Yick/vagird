@@ -25,7 +25,7 @@ import pandas as pd
 LOG_FH = None
 LOG_DATE = None
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'GEMINI-3.2.59-Fix-EOD-Strict'
+__version__ = 'GEMINI-3.2.61-DynamicMaxPos'
 TRANSACTION_COST = 0.00005
 
 # ---- 调试默认 ----
