@@ -1,11 +1,14 @@
 # event_driven_grid_strategy.py
-# 版本号：GEMINI-3.2.69-ManualFix
+# 版本号：GEMINI-3.2.62-CappedUnit
 # 
-# 更新日志 (v3.2.69):
-# 1. 【巡检修复】patrol_and_correct_orders 撤单逻辑改为构建字典传参（参考成交后撤单），解决“参数不支持”报错。
-# 2. 【收盘回退】end_of_day 恢复至 3.2.62 版本的验证代码（传入对象）。
-# 3. 【重启同步】after_initialize_cleanup 的逻辑完全复制 3.2.62 的 end_of_day 实现。
-# 4. 【移除】删除了 v3.2.68 引入的 _robust_cancel_scan 函数，待测试稳定后再重构。
+# 更新日志 (v3.2.62):
+# 1. 【核心优化】引入单笔交易金额封顶机制 (MAX_TRADE_AMOUNT = 5000)。
+#    - 当底仓巨大导致理论网格单位金额超过 5000 时，强制锁定网格单位，防止交易冲击。
+#    - 在资金量小时（当前阶段），逻辑与旧版本完全一致 (Scale Factor = 1.0)。
+# 2. 【逻辑增强】引入动态缩放因子 (Scale Factor)：
+#    - 当网格单位被封顶限制而变相对较小时，自动放大策略的持仓阈值区间。
+#    - 确保策略覆盖的“涨跌幅比例”不随资金体量增大而收窄。
+# 3. 【兼容性】完整包含 v3.2.61 的动态最大持仓修复。
 
 import json
 import logging
@@ -25,7 +28,7 @@ import pandas as pd
 LOG_FH = None
 LOG_DATE = None
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'GEMINI-3.2.69-ManualFix'
+__version__ = 'GEMINI-3.2.62-CappedUnit'
 TRANSACTION_COST = 0.00005
 
 # ---- 调试默认 ----
@@ -584,67 +587,8 @@ def after_initialize_cleanup(context):
     if '回测' in context.env or not hasattr(context, 'symbol_list'):
         return
     
-    # 【v3.2.69】完全复制 3.2.62 end_of_day 的逻辑
-    info('⚡ 执行全局启动清理 (Restart Cleanup / EOD Logic)...')
-    try:
-        all_orders = get_all_orders()
-        if not all_orders:
-            info('🕊️ 账户无挂单，清理完毕。')
-            return
-
-        to_cancel = []
-        for o in all_orders:
-            # 兼容性处理
-            sym = getattr(o, 'symbol', None) or getattr(o, 'stock_code', None)
-            if sym is None and isinstance(o, dict):
-                sym = o.get('symbol') or o.get('stock_code')
-            
-            if not sym: continue
-            
-            # 过滤非本策略标的
-            if convert_symbol_to_standard(sym) not in context.symbol_list:
-                continue
-            
-            # 获取状态
-            status = str(getattr(o, 'status', ''))
-            if not status and isinstance(o, dict):
-                status = str(o.get('status', ''))
-                
-            # 覆盖部成单 '7'
-            if status in ['2', '7']: 
-                to_cancel.append(o)
-        
-        if not to_cancel:
-            info('🕊️ 无有效挂单(状态2/7)，清理完毕。')
-        else:
-            info('🧹 扫描到 {} 笔有效挂单(含部成)，正在批量撤销...', len(to_cancel))
-            
-            for o in to_cancel:
-                try:
-                    cancel_order_ex(o) # 保持 3.2.62 原样：传入对象
-                    
-                    # 维护虚拟冻结量
-                    o_amt = getattr(o, 'amount', 0)
-                    if o_amt == 0 and isinstance(o, dict):
-                        o_amt = o.get('amount', 0)
-                    
-                    o_sym = convert_symbol_to_standard(getattr(o, 'symbol', None) or getattr(o, 'stock_code', None) or (o.get('symbol') if isinstance(o, dict) else None))
-                    
-                    bs = str(getattr(o, 'entrust_bs', ''))
-                    if not bs and isinstance(o, dict):
-                         bs = str(o.get('entrust_bs', ''))
-                         
-                    is_sell = (o_amt < 0) or (bs == '2')
-                    
-                    if is_sell and o_sym in context.pending_frozen:
-                        frozen = abs(o_amt)
-                        context.pending_frozen[o_sym] = max(0, context.pending_frozen[o_sym] - frozen)
-                
-                except Exception as e:
-                    info('⚠️ 单笔撤单异常: {}', e)
-
-    except Exception as e:
-        info('❌ 启动清理主流程异常: {}', e)
+    # 全局闪电撤单
+    _fast_cancel_all_orders_global(context)
     
     # 清理内存状态
     for sym in context.symbol_list:
@@ -658,10 +602,49 @@ def after_initialize_cleanup(context):
     info('✅ 全局清理完成')
 
 def _fast_cancel_all_orders_global(context):
-    """
-    保留函数名以兼容旧调用，内部转发给 after_initialize_cleanup (这里不再使用 _robust_cancel_scan)
-    """
-    after_initialize_cleanup(context)
+    """全局闪电撤单，一次IO获取所有，批量撤单"""
+    info('⚡ 执行全局闪电撤单 (Flash Cancel)...')
+    try:
+        all_orders = get_all_orders()
+        if not all_orders:
+            return
+        
+        to_cancel = []
+        for o in all_orders:
+            sym = o.get('symbol') or o.get('stock_code')
+            if convert_symbol_to_standard(sym) not in context.symbol_list:
+                continue
+            
+            status = str(getattr(o, 'status', ''))
+            if status in ['2', '7']: 
+                to_cancel.append(o)
+        
+        if to_cancel:
+            info('⚡ 扫描到 {} 笔有效挂单，瞬间并发撤销...', len(to_cancel))
+            for o in to_cancel:
+                try:
+                    cancel_order_ex(o)
+                    
+                    o_amt = getattr(o, 'amount', 0)
+                    if o_amt == 0 and isinstance(o, dict):
+                        o_amt = o.get('amount', 0)
+                    
+                    o_sym = convert_symbol_to_standard(o.get('symbol') or o.get('stock_code'))
+                    # 兼容对象和字典
+                    bs = str(getattr(o, 'entrust_bs', ''))
+                    is_sell = (o_amt < 0) or (bs == '2')
+                    
+                    if is_sell and o_sym in context.pending_frozen:
+                        frozen = abs(o_amt)
+                        context.pending_frozen[o_sym] = max(0, context.pending_frozen[o_sym] - frozen)
+
+                except Exception:
+                    pass 
+        else:
+            info('⚡ 无需撤单。')
+            
+    except Exception as e:
+        info('⚠️ 全局撤单异常: {}', e)
 
 # ---------------- 订单与撤单工具 ----------------
 
@@ -738,7 +721,6 @@ def place_auction_orders(context):
     info('🆕 开始集合竞价挂单流程 (并发模式)...')
     
     # 1. 全局清理 (Flash Cancel)
-    # 调用 _fast_cancel_all_orders_global 会转发到 after_initialize_cleanup (使用 EOD 逻辑)
     _fast_cancel_all_orders_global(context)
     
     # 2. 准备挂单数据
@@ -1436,30 +1418,31 @@ def patrol_and_correct_orders(context, symbol, state):
         if orders_to_cancel:
             info('{} 🕵️ PATROL: 发现 {} 笔错误/重复挂单，正在撤销...', dbg_tag, len(orders_to_cancel))
             
-            # 【Fix v3.2.54】设置修正锁
+            # 【Fix v3.2.54】设置修正锁，防止撤单真空期内 check_pending_rehangs 乘虚而入
+            # 锁定 10 秒
             state['_ignore_place_until'] = datetime.now() + timedelta(seconds=10)
             safe_save_state(symbol, state)
             
-            # 【v3.2.69 修复】这里使用“成交后撤单”的方法（构建字典），确保成功率
+            # 【修复 v3.2.55】收集已撤销的订单号
             cancelled_ids = set()
+            
             for o in orders_to_cancel:
                 try:
-                    entrust_no = getattr(o, 'entrust_no', None) or o.get('entrust_no')
-                    api_sym = getattr(o, 'symbol', None) or getattr(o, 'stock_code', None) or o.get('symbol') or o.get('stock_code')
-                    
-                    if entrust_no and api_sym:
-                        # 显式构造字典，避免“参数不支持”错误
-                        cancel_order_ex({'entrust_no': entrust_no, 'symbol': api_sym})
+                    entrust_no = getattr(o, 'entrust_no', None)
+                    api_sym = getattr(o, 'symbol', None) or getattr(o, 'stock_code', None)
+                    info('{} ... 正在撤销 #{}: {} @ {:.3f}', dbg_tag, entrust_no, o.amount, getattr(o, 'price', 0))
+                    cancel_order_ex({'entrust_no': entrust_no, 'symbol': api_sym})
+                    if entrust_no:
                         cancelled_ids.add(entrust_no)
-                        
                 except Exception as e:
-                    info('{} ⚠️ PATROL 单笔撤单异常: {}', dbg_tag, e)
+                    info('{} ⚠️ PATROL 撤单异常: {}', dbg_tag, e)
             
             # 撤单后立即刷新状态并尝试补单
             state.pop('_last_order_ts', None)
             state.pop('_last_order_bp', None)
             
-            # 【Fix v3.2.54】传入 bypass_lock=True
+            # 【Fix v3.2.54】传入 bypass_lock=True，允许 patrol 绕过自己刚设置的锁
+            # 【Fix v3.2.55】传入 ignore_entrust_nos，强制忽略幽灵订单
             place_limit_orders(context, symbol, state, 
                                ignore_cooldown=True, 
                                bypass_lock=True,
@@ -1683,7 +1666,6 @@ def calculate_atr(context, symbol, atr_period=14):
 # ---------------- 日终处理 ----------------
 
 def end_of_day(context):
-    # 【v3.2.69】完全恢复 3.2.62 原版逻辑
     info('✅ 日终处理 (Start @ 14:55) [GLOBAL BATCH CANCEL]')
     try:
         all_orders = get_all_orders()
@@ -1693,7 +1675,7 @@ def end_of_day(context):
 
         to_cancel = []
         for o in all_orders:
-            # 兼容性处理
+            # 【修复 1】: 双重兼容，防止 AttributeError
             sym = getattr(o, 'symbol', None) or getattr(o, 'stock_code', None)
             if sym is None and isinstance(o, dict):
                 sym = o.get('symbol') or o.get('stock_code')
@@ -1704,12 +1686,12 @@ def end_of_day(context):
             if convert_symbol_to_standard(sym) not in context.symbol_list:
                 continue
             
-            # 获取状态
+            # 【修复 2】: 获取状态更健壮
             status = str(getattr(o, 'status', ''))
             if not status and isinstance(o, dict):
                 status = str(o.get('status', ''))
                 
-            # 覆盖部成单 '7'
+            # 【修复 3】: 覆盖部成单 '7'
             if status in ['2', '7']: 
                 to_cancel.append(o)
         
@@ -1719,10 +1701,11 @@ def end_of_day(context):
             info('🧹 扫描到 {} 笔有效挂单(含部成)，正在批量撤销...', len(to_cancel))
             
             for o in to_cancel:
+                # 【修复 4】: 单笔异常捕获，防止崩盘
                 try:
-                    cancel_order_ex(o) # 保持 3.2.62 原样：传入对象
+                    cancel_order_ex(o)
                     
-                    # 维护虚拟冻结量
+                    # 维护虚拟冻结量（安全写法）
                     o_amt = getattr(o, 'amount', 0)
                     if o_amt == 0 and isinstance(o, dict):
                         o_amt = o.get('amount', 0)
