@@ -1,11 +1,13 @@
 # event_driven_grid_strategy.py
-# 版本号：GEMINI-3.2.69-ManualFix
+# 版本号：GEMINI-3.2.71-Simplified
 # 
-# 更新日志 (v3.2.69):
-# 1. 【巡检修复】patrol_and_correct_orders 撤单逻辑改为构建字典传参（参考成交后撤单），解决“参数不支持”报错。
-# 2. 【收盘回退】end_of_day 恢复至 3.2.62 版本的验证代码（传入对象）。
-# 3. 【重启同步】after_initialize_cleanup 的逻辑完全复制 3.2.62 的 end_of_day 实现。
-# 4. 【移除】删除了 v3.2.68 引入的 _robust_cancel_scan 函数，待测试稳定后再重构。
+# 更新日志 (v3.2.71):
+# 1. 【策略逻辑回归】移除 Scale Factor (缩放因子) 逻辑。
+#    - 接受“大资金下网格权重自然降低”的设计哲学。
+#    - Max Position 回归为 base_position + grid_unit * 20。
+#    - 即使触发单笔金额封顶，也不再强行放大持仓上限或加密网格。
+# 2. 【核心保持】保留 MAX_TRADE_AMOUNT = 5000 的单笔封顶，防止冲击盘口。
+# 3. 【稳定性】继承 v3.2.70 的所有底层修复（OpenOrders撤单优化、字典传参巡检等）。
 
 import json
 import logging
@@ -25,7 +27,7 @@ import pandas as pd
 LOG_FH = None
 LOG_DATE = None
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'GEMINI-3.2.69-ManualFix'
+__version__ = 'GEMINI-3.2.71-Simplified'
 TRANSACTION_COST = 0.00005
 
 # ---- 调试默认 ----
@@ -44,7 +46,7 @@ MKT_HALT_SKIP_PLACE_DEFAULT = True
 MKT_HALT_SKIP_AFTER_SECONDS_DEFAULT = 180
 MKT_HALT_LOG_EVERY_MINUTES_DEFAULT = 10
 
-# ---- 【新增 v3.2.62】大资金风控参数 ----
+# ---- 【风控参数】 ----
 MAX_TRADE_AMOUNT = 5000  # 单笔网格交易最大金额（人民币）
 
 # ---------------- 通用路径与工具函数 ----------------
@@ -158,7 +160,8 @@ def is_valid_price(x):
 def save_state(symbol, state):
     ids = list(state.get('filled_order_ids', set()))
     state['filled_order_ids'] = set(ids[-MAX_SAVED_FILLED_IDS:])
-    store_keys = ['base_price', 'grid_unit', 'max_position', 'last_week_position', 'base_position', 'scale_factor']
+    # 移除 scale_factor 的保存
+    store_keys = ['base_price', 'grid_unit', 'max_position', 'last_week_position', 'base_position']
     store = {k: state.get(k) for k in store_keys}
     store['filled_order_ids'] = ids[-MAX_SAVED_FILLED_IDS:]
     store['trade_week_set'] = list(state.get('trade_week_set', []))
@@ -418,11 +421,8 @@ def initialize(context):
             'buy_grid_spacing': 0.005,
             'sell_grid_spacing': 0.005,
             
-            # 【v3.2.62】引入 scale_factor, 默认为 1.0
-            'scale_factor': saved.get('scale_factor', 1.0),
-            
-            # 【v3.2.62】MaxPos 包含 scale_factor 修正
-            'max_position': saved.get('max_position', saved.get('base_position', cfg['initial_base_position']) + saved.get('grid_unit', cfg['grid_unit']) * 20 * saved.get('scale_factor', 1.0)),
+            # 【v3.2.71】MaxPos 回归原始公式（移除 scale_factor）
+            'max_position': saved.get('max_position', saved.get('base_position', cfg['initial_base_position']) + saved.get('grid_unit', cfg['grid_unit']) * 20),
             
             'va_last_update_dt': None,
             'va_update_count_date': None,
@@ -444,6 +444,10 @@ def initialize(context):
             # 【v3.2.56】: 撤单ID缓存
             '_pending_ignore_ids': []
         })
+        
+        # 清理旧数据中的 scale_factor
+        if 'scale_factor' in st: st.pop('scale_factor')
+            
         context.state[sym] = st
         context.latest_data[sym] = st['base_price']
         context.should_place_order_map[sym] = True
@@ -529,9 +533,8 @@ def _repair_state_logic(context):
             state['base_position'] = theoretical_pos
             state['last_week_position'] = theoretical_pos # 同步修复上周数据，防止下周跳变
             
-            # 【v3.2.62】修复时同步考虑 scale_factor
-            sf = state.get('scale_factor', 1.0)
-            state['max_position'] = theoretical_pos + state['grid_unit'] * 20 * sf
+            # 【v3.2.71】修复时移除 scale_factor，回归原始公式
+            state['max_position'] = theoretical_pos + state['grid_unit'] * 20
             
             safe_save_state(sym, state)
             info(f"[{dsym(context, sym)}] ✅ 修复完成。底仓已重置为 {theoretical_pos}")
@@ -659,7 +662,7 @@ def after_initialize_cleanup(context):
 
 def _fast_cancel_all_orders_global(context):
     """
-    保留函数名以兼容旧调用，内部转发给 after_initialize_cleanup (这里不再使用 _robust_cancel_scan)
+    保留函数名以兼容旧调用，内部转发给 after_initialize_cleanup
     """
     after_initialize_cleanup(context)
 
@@ -675,9 +678,12 @@ def get_order_status(entrust_no):
 
 def cancel_all_orders_by_symbol(context, symbol):
     """
-    [更新 v3.2.56] 返回已撤销的订单号集合，用于防止幽灵单。
+    [更新 v3.2.70] 改用 get_open_orders 获取实时活单，减少对已撤订单的重复操作报错。
     """
-    all_orders = get_all_orders() or []
+    # 改用 get_open_orders(symbol) 仅获取该标的的未结订单
+    # 注意：PTrade 的 get_open_orders 返回的是对象列表
+    current_open_orders = get_open_orders(symbol) or []
+    
     total = 0
     cancelled_ids = set()
     
@@ -688,13 +694,26 @@ def cancel_all_orders_by_symbol(context, symbol):
         context.canceled_cache = {'date': today, 'orders': set()}
     cache = context.canceled_cache['orders']
 
-    for o in all_orders:
-        api_sym = o.get('symbol') or o.get('stock_code') 
-        if convert_symbol_to_standard(api_sym) != symbol:
+    for o in current_open_orders:
+        # 双重确认 symbol (虽然接口应该只返回该标的)
+        api_sym = getattr(o, 'symbol', None) or getattr(o, 'stock_code', None)
+        if isinstance(o, dict): 
+             api_sym = o.get('symbol') or o.get('stock_code')
+             
+        if api_sym and convert_symbol_to_standard(api_sym) != symbol:
             continue
+
+        # 获取状态
         status = str(getattr(o, 'status', ''))
-        entrust_no = o.get('entrust_no')
+        if not status and isinstance(o, dict):
+            status = str(o.get('status', ''))
+            
+        entrust_no = getattr(o, 'entrust_no', None)
+        if not entrust_no and isinstance(o, dict):
+            entrust_no = o.get('entrust_no')
         
+        # 过滤掉非活跃状态 (虽然 get_open_orders 理论上只返回活跃的，但为了稳健...)
+        # 8=成, 5=废, 6=撤, 4=报废
         if (not entrust_no
             or status in ('8', '5', '6', '4') 
             or entrust_no in context.state[symbol]['filled_order_ids']
@@ -709,16 +728,20 @@ def cancel_all_orders_by_symbol(context, symbol):
         total += 1
         info('[{}] 👉 发现并尝试撤销遗留挂单 entrust_no={}', dsym(context, symbol), entrust_no)
         try:
+            # 必须用字典传参
             cancel_order_ex({'entrust_no': entrust_no, 'symbol': api_sym})
             if entrust_no:
                 cancelled_ids.add(entrust_no)
             
+            # 冻结量维护
             o_amt = getattr(o, 'amount', 0)
             if o_amt == 0 and isinstance(o, dict):
                 o_amt = o.get('amount', 0)
                 
-            # 兼容对象和字典
             bs = str(getattr(o, 'entrust_bs', ''))
+            if not bs and isinstance(o, dict):
+                bs = str(o.get('entrust_bs', ''))
+            
             is_sell = (o_amt < 0) or (bs == '2')
             
             if is_sell:
@@ -1641,10 +1664,9 @@ def update_grid_spacing_final(context, symbol, state, curr_pos):
     min_spacing = TRANSACTION_COST * 5
     base_spacing = max(base_spacing, min_spacing)
     
-    # 【v3.2.62】使用缩放因子调整区间，防止网格加密后区间变窄
-    sf = state.get('scale_factor', 1.0)
-    thresh_low = 5 * sf
-    thresh_high = 15 * sf
+    # 【v3.2.71】移除 scale_factor 的放大逻辑
+    thresh_low = 5
+    thresh_high = 15
     
     if pos <= base_pos + unit * thresh_low:
         new_buy, new_sell = base_spacing, base_spacing * 2
@@ -1797,9 +1819,8 @@ def get_target_base_position(context, symbol, state, price, dt):
                 info('[{}] 📈 VA价值平均加仓: 目标{:.0f} -> 底仓增加至 {}', dsym(context, symbol), target_val, final_pos)
                 state['base_position'] = final_pos
 
-        # 【核心修改点 v3.2.62】: 计算最大持仓时考虑缩放因子
-        sf = state.get('scale_factor', 1.0)
-        state['max_position'] = state['base_position'] + state['grid_unit'] * 20 * sf
+        # 【v3.2.71】移除 scale_factor，MaxPos 回归原始公式
+        state['max_position'] = state['base_position'] + state['grid_unit'] * 20
                 
     except Exception as e:
         info('[{}] ⚠️ 定投目标计算出错: {}', dsym(context, symbol), e)
@@ -1842,16 +1863,10 @@ def adjust_grid_unit(state):
         if new_unit > state['grid_unit']:
             state['grid_unit'] = new_unit
             info(f"[{state.get('symbol')}] 🔧 网格单位放大至 {new_unit} (理论:{theoretical_unit}, 封顶:{capped_unit})")
-            
-        # 4. 计算缩放因子 (Scale Factor)
-        # 如果 Unit 被封顶了，Factor 会 > 1.0，用于后续放大持仓区间
-        ideal_unit_size = state['base_position'] / 20
-        current_factor = ideal_unit_size / state['grid_unit'] if state['grid_unit'] > 0 else 1.0
-        state['scale_factor'] = max(1.0, round(current_factor, 2))
         
-        # 5. 更新最大持仓
-        # Max = Base + 20 * Unit * Factor
-        state['max_position'] = state['base_position'] + state['grid_unit'] * 20 * state['scale_factor']
+        # 【v3.2.71】移除 scale_factor 计算逻辑
+        # 5. 更新最大持仓 (回归原始公式)
+        state['max_position'] = state['base_position'] + state['grid_unit'] * 20
 
 def _load_pnl_metrics(path):
     if path.exists(): return json.loads(path.read_text(encoding='utf-8'))
@@ -2039,10 +2054,8 @@ def reload_config_if_changed(context):
                 'initial_position_value': cfg['initial_base_position'] * cfg['base_price'],
                 'buy_grid_spacing': 0.005, 'sell_grid_spacing': 0.005,
                 
-                # 【v3.2.62】引入 scale_factor
-                'scale_factor': saved.get('scale_factor', 1.0),
-                
-                'max_position': saved.get('max_position', saved.get('base_position', cfg['initial_base_position']) + saved.get('grid_unit', cfg['grid_unit']) * 20 * saved.get('scale_factor', 1.0)),
+                # 【v3.2.71】移除 scale_factor，回归原始 MaxPos 公式
+                'max_position': saved.get('max_position', saved.get('base_position', cfg['initial_base_position']) + saved.get('grid_unit', cfg['grid_unit']) * 20),
                 
                 'va_last_update_dt': None,
                 'va_update_count_date': None,
@@ -2060,6 +2073,10 @@ def reload_config_if_changed(context):
                 # 【v3.2.56】: 撤单ID缓存
                 '_pending_ignore_ids': []
             })
+            
+            # 清理旧数据
+            if 'scale_factor' in st: st.pop('scale_factor')
+                
             context.state[sym] = st
             context.latest_data[sym] = st['base_price']
             context.symbol_list.append(sym)
@@ -2077,13 +2094,12 @@ def reload_config_if_changed(context):
                 info('[{}] 参数发生变更，正在更新...', dsym(context, sym))
                 state, new_params = context.state[sym], new_config[sym]
                 
-                # 【v3.2.62】更新参数时，同步更新 max_position (含 scale_factor)
-                sf = state.get('scale_factor', 1.0)
+                # 【v3.2.71】更新参数时，MaxPos 回归原始公式 (移除 SF)
                 state.update({
                     'grid_unit': new_params['grid_unit'],
                     'dingtou_base': new_params['dingtou_base'],
                     'dingtou_rate': new_params['dingtou_rate'],
-                    'max_position': state['base_position'] + new_params['grid_unit'] * 20 * sf
+                    'max_position': state['base_position'] + new_params['grid_unit'] * 20
                 })
 
         context.symbol_config = new_config
