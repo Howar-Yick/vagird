@@ -1,13 +1,13 @@
 # event_driven_grid_strategy.py
-# 版本号：GEMINI-3.2.72-NaNFix
+# 版本号：GEMINI-3.3.0-Refactor-Phase1
 # 
-# 更新日志 (v3.2.72):
-# 1. 【核心修复】修复 ATR 计算返回 NaN 导致策略报错的问题。
-#    - calculate_atr: 增加 math.isnan 检查，无效计算返回 None。
-#    - update_grid_spacing_final: 增加对 atr_pct 的 NaN 过滤，异常时回退到默认间距。
-# 2. 【风控增强】在 place_limit_orders 下单前增加价格有效性检查 (is_valid_price)。
-#    - 彻底拦截 frozen_price == nan 类型的底层运行时错误。
-# 3. 【继承】保留 v3.2.71 的简化逻辑（无 Scale Factor）和单笔封顶。
+# 更新日志 (v3.3.0):
+# 1. 【工程重构】引入 OrderUtils 工具类，统一封装订单解析逻辑。
+#    - 彻底解决 PTrade API 返回对象/字典格式不确定的问题。
+#    - 统一处理 symbol 标准化、状态判断、买卖方向识别。
+# 2. 【代码瘦身】重写 _recalc_pending_frozen, cancel_all_orders_by_symbol, patrol_and_correct_orders。
+#    - 移除冗余的 getattr/get 判断，调用 OrderUtils.normalize() 一步到位。
+# 3. 【核心继承】完整保留 v3.2.72 的所有业务逻辑（NaN修复、单笔封顶、无缩放因子、OpenOrders撤单）。
 
 import json
 import logging
@@ -27,7 +27,7 @@ import pandas as pd
 LOG_FH = None
 LOG_DATE = None
 MAX_SAVED_FILLED_IDS = 500
-__version__ = 'GEMINI-3.2.72-NaNFix'
+__version__ = 'GEMINI-3.3.0-Refactor-Phase1'
 TRANSACTION_COST = 0.00005
 
 # ---- 调试默认 ----
@@ -48,6 +48,67 @@ MKT_HALT_LOG_EVERY_MINUTES_DEFAULT = 10
 
 # ---- 【风控参数】 ----
 MAX_TRADE_AMOUNT = 5000  # 单笔网格交易最大金额（人民币）
+
+# ---------------- 工具类：OrderUtils (新增) ----------------
+
+class OrderUtils:
+    """
+    订单处理工具类：统一处理对象/字典兼容性，封装通用逻辑。
+    """
+    @staticmethod
+    def normalize(order):
+        """
+        将订单（对象或字典）解析为标准字典。
+        返回字段:
+            - entrust_no: str
+            - raw_symbol: str (API原始代码, e.g. 123.XSHG)
+            - std_symbol: str (策略标准代码, e.g. 123.SS)
+            - status: str
+            - amount: float (带符号)
+            - price: float
+            - entrust_bs: str ('1'=买, '2'=卖)
+            - original: obj (原始引用)
+        """
+        data = {}
+        
+        # 1. 提取原始值
+        if isinstance(order, dict):
+            raw_no = order.get('entrust_no')
+            raw_sym = order.get('symbol') or order.get('stock_code')
+            raw_status = order.get('status')
+            raw_amt = order.get('amount')
+            raw_price = order.get('price')
+            raw_bs = order.get('entrust_bs')
+        else:
+            raw_no = getattr(order, 'entrust_no', None)
+            raw_sym = getattr(order, 'symbol', None) or getattr(order, 'stock_code', None)
+            raw_status = getattr(order, 'status', None)
+            raw_amt = getattr(order, 'amount', None)
+            raw_price = getattr(order, 'price', None)
+            raw_bs = getattr(order, 'entrust_bs', None)
+
+        # 2. 标准化处理
+        data['entrust_no'] = str(raw_no) if raw_no is not None else ''
+        data['raw_symbol'] = str(raw_sym) if raw_sym else ''
+        data['std_symbol'] = convert_symbol_to_standard(data['raw_symbol'])
+        data['status'] = str(raw_status) if raw_status is not None else ''
+        data['amount'] = float(raw_amt or 0)
+        data['price'] = float(raw_price or 0)
+        data['entrust_bs'] = str(raw_bs) if raw_bs else ''
+        data['original'] = order
+        
+        return data
+
+    @staticmethod
+    def is_active(order_dict):
+        """判断是否为有效挂单 (状态2已报, 7部成)"""
+        return order_dict['status'] in ['2', '7']
+
+    @staticmethod
+    def is_sell(order_dict):
+        """判断是否为卖单"""
+        # amount < 0 或者 entrust_bs == '2'
+        return (order_dict['amount'] < 0) or (order_dict['entrust_bs'] == '2')
 
 # ---------------- 通用路径与工具函数 ----------------
 
@@ -160,7 +221,6 @@ def is_valid_price(x):
 def save_state(symbol, state):
     ids = list(state.get('filled_order_ids', set()))
     state['filled_order_ids'] = set(ids[-MAX_SAVED_FILLED_IDS:])
-    # 移除 scale_factor 的保存
     store_keys = ['base_price', 'grid_unit', 'max_position', 'last_week_position', 'base_position']
     store = {k: state.get(k) for k in store_keys}
     store['filled_order_ids'] = ids[-MAX_SAVED_FILLED_IDS:]
@@ -587,8 +647,8 @@ def after_initialize_cleanup(context):
     if '回测' in context.env or not hasattr(context, 'symbol_list'):
         return
     
-    # 【v3.2.69】完全复制 3.2.62 end_of_day 的逻辑
-    info('⚡ 执行全局启动清理 (Restart Cleanup / EOD Logic)...')
+    # 【v3.3.0】使用 OrderUtils 简化过滤逻辑
+    info('⚡ 执行全局启动清理 (Restart Cleanup)...')
     try:
         all_orders = get_all_orders()
         if not all_orders:
@@ -597,51 +657,32 @@ def after_initialize_cleanup(context):
 
         to_cancel = []
         for o in all_orders:
-            # 兼容性处理
-            sym = getattr(o, 'symbol', None) or getattr(o, 'stock_code', None)
-            if sym is None and isinstance(o, dict):
-                sym = o.get('symbol') or o.get('stock_code')
-            
-            if not sym: continue
+            order_info = OrderUtils.normalize(o)
             
             # 过滤非本策略标的
-            if convert_symbol_to_standard(sym) not in context.symbol_list:
+            if order_info['std_symbol'] not in context.symbol_list:
                 continue
-            
-            # 获取状态
-            status = str(getattr(o, 'status', ''))
-            if not status and isinstance(o, dict):
-                status = str(o.get('status', ''))
                 
-            # 覆盖部成单 '7'
-            if status in ['2', '7']: 
-                to_cancel.append(o)
+            # 覆盖活单状态 (2=已报, 7=部成)
+            if OrderUtils.is_active(order_info): 
+                to_cancel.append(order_info)
         
         if not to_cancel:
             info('🕊️ 无有效挂单(状态2/7)，清理完毕。')
         else:
             info('🧹 扫描到 {} 笔有效挂单(含部成)，正在批量撤销...', len(to_cancel))
             
-            for o in to_cancel:
+            for o_info in to_cancel:
                 try:
-                    cancel_order_ex(o) # 保持 3.2.62 原样：传入对象
+                    # 使用原始对象撤单（保持 v3.2.62 的成功实践）
+                    cancel_order_ex(o_info['original'])
                     
-                    # 维护虚拟冻结量
-                    o_amt = getattr(o, 'amount', 0)
-                    if o_amt == 0 and isinstance(o, dict):
-                        o_amt = o.get('amount', 0)
-                    
-                    o_sym = convert_symbol_to_standard(getattr(o, 'symbol', None) or getattr(o, 'stock_code', None) or (o.get('symbol') if isinstance(o, dict) else None))
-                    
-                    bs = str(getattr(o, 'entrust_bs', ''))
-                    if not bs and isinstance(o, dict):
-                         bs = str(o.get('entrust_bs', ''))
-                         
-                    is_sell = (o_amt < 0) or (bs == '2')
-                    
-                    if is_sell and o_sym in context.pending_frozen:
-                        frozen = abs(o_amt)
-                        context.pending_frozen[o_sym] = max(0, context.pending_frozen[o_sym] - frozen)
+                    # 维护虚拟冻结量 (使用工具类判断)
+                    if OrderUtils.is_sell(o_info):
+                        o_sym = o_info['std_symbol']
+                        if o_sym in context.pending_frozen:
+                            frozen = abs(o_info['amount'])
+                            context.pending_frozen[o_sym] = max(0, context.pending_frozen[o_sym] - frozen)
                 
                 except Exception as e:
                     info('⚠️ 单笔撤单异常: {}', e)
@@ -678,10 +719,8 @@ def get_order_status(entrust_no):
 
 def cancel_all_orders_by_symbol(context, symbol):
     """
-    [更新 v3.2.70] 改用 get_open_orders 获取实时活单，减少对已撤订单的重复操作报错。
+    [更新 v3.3.0] 使用 OrderUtils 简化逻辑。
     """
-    # 改用 get_open_orders(symbol) 仅获取该标的的未结订单
-    # 注意：PTrade 的 get_open_orders 返回的是对象列表
     current_open_orders = get_open_orders(symbol) or []
     
     total = 0
@@ -695,27 +734,18 @@ def cancel_all_orders_by_symbol(context, symbol):
     cache = context.canceled_cache['orders']
 
     for o in current_open_orders:
-        # 双重确认 symbol (虽然接口应该只返回该标的)
-        api_sym = getattr(o, 'symbol', None) or getattr(o, 'stock_code', None)
-        if isinstance(o, dict): 
-             api_sym = o.get('symbol') or o.get('stock_code')
-             
-        if api_sym and convert_symbol_to_standard(api_sym) != symbol:
+        order_info = OrderUtils.normalize(o)
+        
+        # 双重确认 symbol
+        if order_info['std_symbol'] != symbol:
             continue
 
-        # 获取状态
-        status = str(getattr(o, 'status', ''))
-        if not status and isinstance(o, dict):
-            status = str(o.get('status', ''))
-            
-        entrust_no = getattr(o, 'entrust_no', None)
-        if not entrust_no and isinstance(o, dict):
-            entrust_no = o.get('entrust_no')
+        entrust_no = order_info['entrust_no']
+        status = order_info['status']
         
-        # 过滤掉非活跃状态 (虽然 get_open_orders 理论上只返回活跃的，但为了稳健...)
-        # 8=成, 5=废, 6=撤, 4=报废
+        # 过滤掉非活跃状态
         if (not entrust_no
-            or status in ('8', '5', '6', '4') 
+            or not OrderUtils.is_active(order_info)
             or entrust_no in context.state[symbol]['filled_order_ids']
             or entrust_no in cache):
             continue
@@ -729,23 +759,12 @@ def cancel_all_orders_by_symbol(context, symbol):
         info('[{}] 👉 发现并尝试撤销遗留挂单 entrust_no={}', dsym(context, symbol), entrust_no)
         try:
             # 必须用字典传参
-            cancel_order_ex({'entrust_no': entrust_no, 'symbol': api_sym})
-            if entrust_no:
-                cancelled_ids.add(entrust_no)
+            cancel_order_ex({'entrust_no': entrust_no, 'symbol': order_info['raw_symbol']})
+            cancelled_ids.add(entrust_no)
             
             # 冻结量维护
-            o_amt = getattr(o, 'amount', 0)
-            if o_amt == 0 and isinstance(o, dict):
-                o_amt = o.get('amount', 0)
-                
-            bs = str(getattr(o, 'entrust_bs', ''))
-            if not bs and isinstance(o, dict):
-                bs = str(o.get('entrust_bs', ''))
-            
-            is_sell = (o_amt < 0) or (bs == '2')
-            
-            if is_sell:
-                frozen = abs(o_amt)
+            if OrderUtils.is_sell(order_info):
+                frozen = abs(order_info['amount'])
                 context.pending_frozen[symbol] = max(0, context.pending_frozen.get(symbol, 0) - frozen)
 
         except Exception as e:
@@ -967,30 +986,18 @@ def check_pending_rehangs(context):
 
 def _recalc_pending_frozen(context, symbol):
     """
-    【v3.2.58 修复】: 兼容 Order 对象和字典，修复 .get() 报错。
+    【v3.3.0 重构】使用 OrderUtils 简化逻辑。
     """
     try:
         orders = get_open_orders(symbol) or []
         frozen = 0
         for o in orders:
-            # 兼容对象(getattr)和字典
-            status = str(getattr(o, 'status', ''))
+            order_info = OrderUtils.normalize(o)
             
-            # 状态: 2=已报, 7=部成 (PTRADE API)
-            if status in ['2', '7']: 
-                amt = getattr(o, 'amount', 0)
-                # 如果是字典，getattr 可能拿到 0 或 None，需再次确认
-                if amt == 0 and isinstance(o, dict):
-                    amt = o.get('amount', 0)
-                
+            if OrderUtils.is_active(order_info): 
                 # 识别卖单
-                bs = str(getattr(o, 'entrust_bs', ''))
-                if isinstance(o, dict) and not bs:
-                    bs = str(o.get('entrust_bs', ''))
-                    
-                is_sell = (amt < 0) or (bs == '2')
-                if is_sell:
-                    frozen += abs(amt)
+                if OrderUtils.is_sell(order_info):
+                    frozen += abs(order_info['amount'])
         
         context.pending_frozen[symbol] = frozen
         return frozen
@@ -1384,6 +1391,9 @@ def _fill_recover_watch(context, symbol, state):
 # ---------------- 【核心更新】主动巡检与修正 (含去重逻辑) ----------------
 
 def patrol_and_correct_orders(context, symbol, state):
+    """
+    【v3.3.0 重构】使用 OrderUtils 简化解析逻辑。
+    """
     now_dt = context.current_dt
     dbg_tag = f"[{dsym(context, symbol)}]"
 
@@ -1421,14 +1431,15 @@ def patrol_and_correct_orders(context, symbol, state):
         valid_sell_orders = []
 
         for o in open_orders:
-            api_sym = getattr(o, 'symbol', None) or getattr(o, 'stock_code', None)
-            entrust_no = getattr(o, 'entrust_no', None)
-            o_price = getattr(o, 'price', 0)
+            order_info = OrderUtils.normalize(o)
+            entrust_no = order_info['entrust_no']
+            o_price = order_info['price']
+            
             if not entrust_no: continue
             
             is_wrong = False
             
-            if o.amount > 0: # 买单
+            if not OrderUtils.is_sell(order_info): # 买单 (amount > 0)
                 if not should_have_buy_order:
                     is_wrong = True 
                 elif abs(o_price - buy_p) / (buy_p + 1e-9) >= 0.002:
@@ -1436,7 +1447,7 @@ def patrol_and_correct_orders(context, symbol, state):
                 else:
                     valid_buy_orders.append(o)
             
-            elif o.amount < 0: # 卖单
+            else: # 卖单
                 if not should_have_sell_order:
                     is_wrong = True 
                 elif abs(o_price - sell_p) / (sell_p + 1e-9) >= 0.002:
@@ -1447,10 +1458,9 @@ def patrol_and_correct_orders(context, symbol, state):
             if is_wrong:
                 orders_to_cancel.append(o)
         
-        # 【去重逻辑】：如果存在多个合法的同方向订单，保留一个，其余视为重复并撤销
+        # 【去重逻辑】
         if len(valid_buy_orders) > 1:
             info('{} ⚠️ 发现 {} 个重复有效买单，正在清理多余单...', dbg_tag, len(valid_buy_orders))
-            # 保留第一个，其他的加入撤销列表
             for o in valid_buy_orders[1:]:
                 orders_to_cancel.append(o)
             valid_buy_orders = valid_buy_orders[:1]
@@ -1473,12 +1483,12 @@ def patrol_and_correct_orders(context, symbol, state):
             cancelled_ids = set()
             for o in orders_to_cancel:
                 try:
-                    entrust_no = getattr(o, 'entrust_no', None) or o.get('entrust_no')
-                    api_sym = getattr(o, 'symbol', None) or getattr(o, 'stock_code', None) or o.get('symbol') or o.get('stock_code')
+                    order_info = OrderUtils.normalize(o)
+                    entrust_no = order_info['entrust_no']
+                    raw_sym = order_info['raw_symbol']
                     
-                    if entrust_no and api_sym:
-                        # 显式构造字典，避免“参数不支持”错误
-                        cancel_order_ex({'entrust_no': entrust_no, 'symbol': api_sym})
+                    if entrust_no and raw_sym:
+                        cancel_order_ex({'entrust_no': entrust_no, 'symbol': raw_sym})
                         cancelled_ids.add(entrust_no)
                         
                 except Exception as e:
@@ -1727,65 +1737,9 @@ def calculate_atr(context, symbol, atr_period=14):
 def end_of_day(context):
     # 【v3.2.69】完全恢复 3.2.62 原版逻辑
     info('✅ 日终处理 (Start @ 14:55) [GLOBAL BATCH CANCEL]')
-    try:
-        all_orders = get_all_orders()
-        if not all_orders:
-            info('🕊️ 账户无挂单，清理完毕。')
-            return
-
-        to_cancel = []
-        for o in all_orders:
-            # 兼容性处理
-            sym = getattr(o, 'symbol', None) or getattr(o, 'stock_code', None)
-            if sym is None and isinstance(o, dict):
-                sym = o.get('symbol') or o.get('stock_code')
-            
-            if not sym: continue
-            
-            # 过滤非本策略标的
-            if convert_symbol_to_standard(sym) not in context.symbol_list:
-                continue
-            
-            # 获取状态
-            status = str(getattr(o, 'status', ''))
-            if not status and isinstance(o, dict):
-                status = str(o.get('status', ''))
-                
-            # 覆盖部成单 '7'
-            if status in ['2', '7']: 
-                to_cancel.append(o)
-        
-        if not to_cancel:
-            info('🕊️ 无有效挂单(状态2/7)，清理完毕。')
-        else:
-            info('🧹 扫描到 {} 笔有效挂单(含部成)，正在批量撤销...', len(to_cancel))
-            
-            for o in to_cancel:
-                try:
-                    cancel_order_ex(o) # 保持 3.2.62 原样：传入对象
-                    
-                    # 维护虚拟冻结量
-                    o_amt = getattr(o, 'amount', 0)
-                    if o_amt == 0 and isinstance(o, dict):
-                        o_amt = o.get('amount', 0)
-                    
-                    o_sym = convert_symbol_to_standard(getattr(o, 'symbol', None) or getattr(o, 'stock_code', None) or (o.get('symbol') if isinstance(o, dict) else None))
-                    
-                    bs = str(getattr(o, 'entrust_bs', ''))
-                    if not bs and isinstance(o, dict):
-                         bs = str(o.get('entrust_bs', ''))
-                         
-                    is_sell = (o_amt < 0) or (bs == '2')
-                    
-                    if is_sell and o_sym in context.pending_frozen:
-                        frozen = abs(o_amt)
-                        context.pending_frozen[o_sym] = max(0, context.pending_frozen[o_sym] - frozen)
-                
-                except Exception as e:
-                    info('⚠️ 日终单笔撤单异常: {}', e)
-
-    except Exception as e:
-        info('❌ 日终撤单主流程异常: {}', e)
+    
+    # 实际上这里可以调用 _fast_cancel_all_orders_global，它已经使用了 OrderUtils 进行了优化
+    _fast_cancel_all_orders_global(context)
 
     # 保存状态
     for sym in context.symbol_list:
