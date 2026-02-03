@@ -1,11 +1,12 @@
 # event_driven_grid_strategy.py
-# 版本号：GEMINI-3.5.9
+# 版本号：GEMINI-3.5.7-Release
 #
-#[v3.5.9] 修复: 重构 execute_stack_logic 以显式处理买卖方向
-#- 修复了依靠 pending_fill_amount 正负号隐式判断方向可能导致的逻辑倒错问题。
-#- 将买入处理 (Path A) 和卖出处理 (Path B) 物理隔离。
-#- 增加了明确的 [买入平空/开多] 和 [卖出平多/开空] 日志标签。
-#- 强制升级 execute_stack_logic 函数版本至 v2.0。
+# 更新日志 (v3.5.7):
+# 1. 【核心修复】重构成交方向识别逻辑，增加对 entrust_bs (1:买/2:卖) 的显式强类型校验，杜绝反向入库。
+# 2. 【架构升级】元组化堆栈 (Tuple Stack)：buy_stack/sell_stack 存储 (price, unit)，确保网格单位调整后的逻辑连续性。
+# 3. 【精准核销】引入“余额结余法”处理分批成交。基于订单累计成交量，只要攒够一个 unit 即触发 Pop。
+# 4. 【审计增强】启动时增加 Audit 逻辑。对比 len(stack) 与 (实际持仓-底仓) 的份数偏差并高亮提醒。
+# 5. 【防御逻辑】在 heappush 前置同价位检查，避免因系统回报异常导致的记录堆积。
 
 import json
 import logging
@@ -1044,80 +1045,46 @@ def on_trade_response(context, trade_list):
 
 def execute_stack_logic(context, symbol, fill_price):
     """
-    [Global Ver: v3.5.9] [Func Ver: 2.0]
-    [Change]: 重构核销逻辑，显式分离买/卖处理路径，杜绝反向入库。
-              逻辑：
-              1. 余额 > 0 (买入积累) -> 优先平空(Pop Sell)，无空可平则开多(Push Buy)
-              2. 余额 < 0 (卖出积累) -> 优先平多(Pop Buy)，无多可平则开空(Push Sell)
+    3.5.7 新增：根据 pending_fill_amount 执行堆栈操作
     """
     state = context.state[symbol]
     unit = state['grid_unit']
     
-    # -----------------------------------------------------------
-    # PATH A: 处理【买入】积累 (Pending Amount is POSITIVE)
-    # -----------------------------------------------------------
+    # --- 处理买入积攒 (余额 >= unit) ---
     while state['pending_fill_amount'] >= unit * 0.95:
-        # 1. 优先平空 (Check Sell Stack)
         if state['sell_stack']:
-            # 卖单堆栈存的是 (-price, unit)，Pop取出最高卖价
+            # 平空：弹出卖单堆栈的最高价 (-price)
             neg_price, s_unit = heapq.heappop(state['sell_stack'])
             max_sell_p = -neg_price
-            
-            # 风控：亏损买回记录
             if fill_price > max_sell_p:
-                credit = state.get('credit_limit', 0)
-                if credit > 0:
-                    state['credit_limit'] -= 1
-                    info('[{}] 📉 亏损买回: 现买{:.3f} > 原卖{:.3f} (剩余额度:{})', 
-                         dsym(context, symbol), fill_price, max_sell_p, state['credit_limit'])
-            
-            pnl = (max_sell_p - fill_price) * unit
-            state['history_pnl'] += pnl
-            info('[{}] ⚖️ [买入平空] 消耗 SellStack ({:.3f}), 获利: {:.2f}', dsym(context, symbol), max_sell_p, pnl)
-            
-        # 2. 无空可平 -> 开多 (Push to Buy Stack)
+                current_credit = state.get('credit_limit', 0)
+                if current_credit > 0:
+                    state['credit_limit'] = current_credit - 1
+                    info('[{}] 📉 亏损买回 (Used Credit): 买{:.3f} > 卖{:.3f}, 剩余额度: {}', dsym(context, symbol), fill_price, max_sell_p, state['credit_limit'])
         else:
-            # 查重：避免同价位重复
+            # 开多：入库买单堆栈 (去重检查)
             if not any(abs(item[0] - fill_price) < 1e-5 for item in state['buy_stack']):
                 heapq.heappush(state['buy_stack'], (fill_price, unit))
-                info('[{}] 📥 [买入开多] 入库 BuyStack ({:.3f})', dsym(context, symbol), fill_price)
             else:
-                info('[{}] ⚠️ [买入忽略] BuyStack 已存在价位 {:.3f}', dsym(context, symbol), fill_price)
-        
-        # 扣减处理完的份额
+                info("⚠️ [{}] 忽略同价位重复入库: {:.3f}", dsym(context, symbol), fill_price)
         state['pending_fill_amount'] -= unit
 
-    # -----------------------------------------------------------
-    # PATH B: 处理【卖出】积累 (Pending Amount is NEGATIVE)
-    # -----------------------------------------------------------
+    # --- 处理卖出积攒 (余额 <= -unit) ---
     while state['pending_fill_amount'] <= -unit * 0.95:
-        # 1. 优先平多 (Check Buy Stack)
         if state['buy_stack']:
-            # 买单堆栈存的是 (price, unit)，Pop取出最低买价
+            # 平多：弹出买单堆栈的最低价 (price)
             min_buy_p, b_unit = heapq.heappop(state['buy_stack'])
-            
-            # 风控：亏损卖出记录
             if fill_price < min_buy_p:
-                credit = state.get('credit_limit', 0)
-                if credit > 0:
-                    state['credit_limit'] -= 1
-                    info('[{}] 📉 亏损卖出: 现卖{:.3f} < 原买{:.3f} (剩余额度:{})', 
-                         dsym(context, symbol), fill_price, min_buy_p, state['credit_limit'])
-            
-            pnl = (fill_price - min_buy_p) * unit
-            state['history_pnl'] += pnl
-            info('[{}] ⚖️ [卖出平多] 消耗 BuyStack ({:.3f}), 获利: {:.2f}', dsym(context, symbol), min_buy_p, pnl)
-            
-        # 2. 无多可平 -> 开空 (Push to Sell Stack)
+                current_credit = state.get('credit_limit', 0)
+                if current_credit > 0:
+                    state['credit_limit'] = current_credit - 1
+                    info('[{}] 📉 亏损卖出 (Used Credit): 卖{:.3f} < 买{:.3f}, 剩余额度: {}', dsym(context, symbol), fill_price, min_buy_p, state['credit_limit'])
         else:
-            # 查重：卖单存负数 (-price)
+            # 开空：入库卖单堆栈 (-price)
             if not any(abs((-item[0]) - fill_price) < 1e-5 for item in state['sell_stack']):
                 heapq.heappush(state['sell_stack'], (-fill_price, unit))
-                info('[{}] 📤 [卖出开空] 入库 SellStack ({:.3f})', dsym(context, symbol), fill_price)
             else:
-                info('[{}] ⚠️ [卖出忽略] SellStack 已存在价位 {:.3f}', dsym(context, symbol), fill_price)
-        
-        # 加回处理完的份额 (负数加正数 = 归零方向)
+                info("⚠️ [{}] 忽略同价位重复卖单: {:.3f}", dsym(context, symbol), fill_price)
         state['pending_fill_amount'] += unit
 
 def on_order_filled(context, symbol, order):

@@ -1,11 +1,11 @@
 # event_driven_grid_strategy.py
-# 版本号：GEMINI-3.5.9
+# 版本号：GEMINI-3.5.4-Release
 #
-#[v3.5.9] 修复: 重构 execute_stack_logic 以显式处理买卖方向
-#- 修复了依靠 pending_fill_amount 正负号隐式判断方向可能导致的逻辑倒错问题。
-#- 将买入处理 (Path A) 和卖出处理 (Path B) 物理隔离。
-#- 增加了明确的 [买入平空/开多] 和 [卖出平多/开空] 日志标签。
-#- 强制升级 execute_stack_logic 函数版本至 v2.0。
+# 更新日志 (v3.5.4):
+# 1. 【语法修复】彻底重写 reload_config_if_changed，修复 v3.5.3 中非法的表达式串联语法，确保标的增删逻辑可编译。
+# 2. 【兼容增强】升级 get_order_status，使用 OrderUtils.normalize 兼容字典与对象返回，提高订单状态查询的鲁棒性。
+# 3. 【内存闭环】在热重载删除标的分支中，同步清理 should_place_order_map，防止无效数据残留。
+# 4. 【逻辑继承】保留全双工堆栈、信用额度、ATR动态间距及巡检对齐等所有已验证功能。
 
 import json
 import logging
@@ -25,7 +25,7 @@ import pandas as pd
 # ---------------- 全局句柄 ----------------
 LOG_FH = None
 LOG_DATE = None
-__version__ = 'GEMINI-3.5.7-Release'
+__version__ = 'GEMINI-3.5.4-Release'
 
 # ---------------- 配置管理类 ----------------
 
@@ -301,9 +301,8 @@ def save_state(symbol, state):
     ids = list(state.get('filled_order_ids', set()))
     state['filled_order_ids'] = set(ids[-StrategyConfig.MAX_SAVED_FILLED_IDS:])
     
-    # 增加 pending_fill_amount 持久化
     store_keys = ['symbol', 'base_price', 'grid_unit', 'max_position', 'last_week_position', 'base_position', 
-                  'used_atr_rate', 'cached_atr_ema', 'buy_stack', 'sell_stack', 'credit_limit', 'pending_fill_amount']
+                  'used_atr_rate', 'cached_atr_ema', 'buy_stack', 'sell_stack', 'credit_limit']
     store = {k: state.get(k) for k in store_keys}
     
     store['filled_order_ids'] = ids[-StrategyConfig.MAX_SAVED_FILLED_IDS:]
@@ -357,7 +356,50 @@ def initialize(context):
 
     # 初始化每个标的状态
     for sym, cfg in context.symbol_config.items():
-        init_symbol_state(context, sym, cfg)
+        state_file = research_path('state', f'{sym}.json')
+        saved = json.loads(state_file.read_text(encoding='utf-8')) if state_file.exists() else get_saved_param(f'state_{sym}', {}) or {}
+        st = {**cfg}
+        st.update({
+            'symbol': sym, 
+            'base_price': saved.get('base_price', cfg['base_price']),
+            'grid_unit': saved.get('grid_unit', cfg['grid_unit']),
+            'filled_order_ids': set(saved.get('filled_order_ids', [])),
+            'trade_week_set': set(saved.get('trade_week_set', [])),
+            'base_position': saved.get('base_position', cfg['initial_base_position']),
+            'last_week_position': saved.get('last_week_position', cfg['initial_base_position']),
+            'initial_position_value': cfg['initial_base_position'] * cfg['base_price'],
+            'buy_grid_spacing': 0.005,
+            'sell_grid_spacing': 0.005,
+            'max_position': saved.get('max_position', saved.get('base_position', cfg['initial_base_position']) + saved.get('grid_unit', cfg['grid_unit']) * 20),
+            'used_atr_rate': saved.get('used_atr_rate', None),
+            'cached_atr_ema': saved.get('cached_atr_ema', None),
+            'buy_stack': saved.get('buy_stack', []),
+            'sell_stack': saved.get('sell_stack', []),
+            'credit_limit': cfg.get('credit_limit', saved.get('credit_limit', StrategyConfig.CREDIT_LIMIT)),
+            'va_last_update_dt': None,
+            '_halt_next_log_dt': None,
+            '_oo_last': 0,
+            '_recover_until': None,
+            '_after_cancel_until': None,
+            '_oo_drop_seen_ts': None,
+            '_pos_jump_seen_ts': None,
+            '_pos_confirm_deadline': None,
+            '_rehang_due_ts': None,
+            '_ignore_place_until': None,
+            '_pending_ignore_ids': []
+        })
+        
+        heapq.heapify(st['buy_stack'])
+        heapq.heapify(st['sell_stack'])
+        if 'scale_factor' in st: st.pop('scale_factor')
+            
+        context.state[sym] = st
+        context.latest_data[sym] = st['base_price']
+        context.should_place_order_map[sym] = True
+        context.mark_halted[sym] = False
+        context.last_valid_price[sym] = st['base_price']
+        context.last_valid_ts[sym] = None
+        context.pending_frozen[sym] = 0
 
     context.boot_dt = getattr(context, 'current_dt', None) or datetime.now()
     context.last_report_time = None
@@ -376,88 +418,6 @@ def initialize(context):
     context.pnl_metrics = _load_pnl_metrics(context.pnl_metrics_path)
     
     info('✅ 初始化完成，版本:{}', __version__)
-
-# ---------------- 初始化状态辅助函数 (3.5.7) ----------------
-
-def init_symbol_state(context, sym, cfg):
-    state_file = research_path('state', f'{sym}.json')
-    saved = json.loads(state_file.read_text(encoding='utf-8')) if state_file.exists() else get_saved_param(f'state_{sym}', {}) or {}
-    
-    st = {**cfg}
-    # 基础字段合并
-    st.update({
-        'symbol': sym, 
-        'base_price': saved.get('base_price', cfg['base_price']),
-        'grid_unit': saved.get('grid_unit', cfg['grid_unit']),
-        'filled_order_ids': set(saved.get('filled_order_ids', [])),
-        'trade_week_set': set(saved.get('trade_week_set', [])),
-        'base_position': saved.get('base_position', cfg['initial_base_position']),
-        'last_week_position': saved.get('last_week_position', cfg['initial_base_position']),
-        'initial_position_value': cfg['initial_base_position'] * cfg['base_price'],
-        'buy_grid_spacing': 0.005,
-        'sell_grid_spacing': 0.005,
-        'max_position': saved.get('max_position', saved.get('base_position', cfg['initial_base_position']) + saved.get('grid_unit', cfg['grid_unit']) * 20),
-        'used_atr_rate': saved.get('used_atr_rate', None),
-        'cached_atr_ema': saved.get('cached_atr_ema', None),
-        'buy_stack': [],
-        'sell_stack': [],
-        'credit_limit': cfg.get('credit_limit', saved.get('credit_limit', StrategyConfig.CREDIT_LIMIT)),
-        'pending_fill_amount': saved.get('pending_fill_amount', 0), # 3.5.7 新增
-        'va_last_update_dt': None,
-        '_halt_next_log_dt': None,
-        '_oo_last': 0,
-        '_recover_until': None,
-        '_after_cancel_until': None,
-        '_oo_drop_seen_ts': None,
-        '_pos_jump_seen_ts': None,
-        '_pos_confirm_deadline': None,
-        '_rehang_due_ts': None,
-        '_ignore_place_until': None,
-        '_pending_ignore_ids': []
-    })
-
-    # 堆栈数据结构升级 (兼容旧版 [price] -> 新版 [(price, unit)])
-    for key in ['buy_stack', 'sell_stack']:
-        raw = saved.get(key, [])
-        for item in raw:
-            if isinstance(item, (list, tuple)):
-                st[key].append(tuple(item)) # 已经是新格式
-            else:
-                st[key].append((item, st['grid_unit'])) # 旧格式升级
-        heapq.heapify(st[key])
-
-    if 'scale_factor' in st: st.pop('scale_factor')
-        
-    context.state[sym] = st
-    context.latest_data[sym] = st['base_price']
-    context.should_place_order_map[sym] = True
-    context.mark_halted[sym] = False
-    context.last_valid_price[sym] = st['base_price']
-    context.last_valid_ts[sym] = None
-    context.pending_frozen[sym] = 0
-    
-    # 执行启动审计
-    audit_initial_consistency(context, sym)
-
-def audit_initial_consistency(context, symbol):
-    """启动审计：检查 159934 类似的账实不符问题"""
-    try:
-        p = get_position(symbol)
-        actual_pos = p.amount if p else 0
-        state = context.state[symbol]
-        base_pos = state['base_position']
-        
-        # 理论上 Stack 里应该有多少股
-        theoretical_stack_shares = actual_pos - base_pos
-        # 实际上 Stack 里记录了多少股
-        current_stack_shares = sum(item[1] for item in state['buy_stack'])
-        
-        if theoretical_stack_shares != current_stack_shares:
-            info("⚠️ [{}] 审计异常: 实盘持仓网格部分 {} 股, 但 Stack 记录 {} 股。差额: {}。请检查 JSON。", 
-                 dsym(context, symbol), theoretical_stack_shares, current_stack_shares, theoretical_stack_shares - current_stack_shares)
-        else:
-            info("✅ [{}] 数据对齐审计通过。", dsym(context, symbol))
-    except: pass
 
 # ---------------- 数据自动修复逻辑 ----------------
 
@@ -572,14 +532,14 @@ def _fast_cancel_all_orders_global(context):
 # ---------------- 订单与撤单工具 ----------------
 
 def get_order_status(entrust_no):
-    """使用 normalize 兼容字典/对象返回"""
+    """【修正】使用 normalize 增加鲁棒性，应对 PTRADE 将来可能的对象化返回"""
     try:
         order_detail = get_order(entrust_no)
         if order_detail:
             normalized = OrderUtils.normalize(order_detail)
             return normalized.get('status', '')
         return ''
-    except Exception:
+    except Exception as e:
         return ''
 
 def cancel_all_orders_by_symbol(context, symbol):
@@ -664,7 +624,7 @@ def place_auction_orders(context):
                 sym = task['symbol']
                 context.pending_frozen[sym] = context.pending_frozen.get(sym, 0) + abs(task['amount'])
             count += 1
-        except Exception:
+        except Exception as e:
             pass
 
 # ---------------- 实时价：快照获取 + 心跳日志 ----------------
@@ -677,7 +637,7 @@ def _fetch_quotes_via_snapshot(context):
     snaps = {}
     try:
         snaps = get_snapshot(symbols) or {}
-    except Exception:
+    except Exception as e:
         snaps = {}
 
     if isinstance(snaps, list):
@@ -691,12 +651,6 @@ def _fetch_quotes_via_snapshot(context):
         if isinstance(snap, dict):
             px = snap.get('last_px')
             if not is_valid_price(px): px = snap.get('last') or snap.get('price')
-            
-            # 【核心】缓存物理涨跌停边界
-            if sym in context.state:
-                context.state[sym]['_up_limit'] = snap.get('p_up_price')
-                context.state[sym]['_down_limit'] = snap.get('p_down_price')
-
         if is_valid_price(px):
             px = float(px)
             context.latest_data[sym] = px
@@ -801,8 +755,7 @@ def _apply_price_guard(context, state, buy_p, sell_p, buy_sp, sell_sp):
     # 1. 守门员逻辑：买入检查 (防止高位追高接回空单)
     sell_stack = state.get('sell_stack', [])
     if sell_stack:
-        # 3.5.7 升级：元组结构 (-price, unit)
-        max_sell_price = -sell_stack[0][0] 
+        max_sell_price = -sell_stack[0] 
         if final_buy_p > max_sell_price:
             credit = state.get('credit_limit', 0)
             if credit <= 0:
@@ -814,8 +767,7 @@ def _apply_price_guard(context, state, buy_p, sell_p, buy_sp, sell_sp):
     # 2. 守门员逻辑：卖出检查 (防止低位割肉卖出持仓)
     buy_stack = state.get('buy_stack', [])
     if buy_stack:
-        # 3.5.7 升级：元组结构 (price, unit)
-        min_buy_price = buy_stack[0][0]
+        min_buy_price = buy_stack[0]
         if final_sell_p < min_buy_price:
             credit = state.get('credit_limit', 0)
             if credit <= 0:
@@ -867,22 +819,7 @@ def place_limit_orders(context, symbol, state, ignore_cooldown=False, bypass_loc
     buy_p, sell_p = round(base * (1 - buy_sp), 3), round(base * (1 + sell_sp), 3)
     if not is_valid_price(buy_p) or not is_valid_price(sell_p): return
 
-    # 1. 全双工风控应用
     buy_p, sell_p = _apply_price_guard(context, state, buy_p, sell_p, buy_sp, sell_sp)
-
-    # 2. 涨跌停物理空间过滤
-    up_limit = state.get('_up_limit')
-    down_limit = state.get('_down_limit')
-    can_place_buy = True
-    can_place_sell = True
-
-    if is_valid_price(up_limit) and is_valid_price(down_limit):
-        if buy_p < down_limit:
-            info('[{}] 🛡️ 空间封锁：买价 {:.3f} 低于跌停线 {:.3f}，暂停挂买。', dsym(context, symbol), buy_p, down_limit)
-            can_place_buy = False
-        if sell_p > up_limit:
-            info('[{}] 🛡️ 空间封锁：卖价 {:.3f} 高于涨停线 {:.3f}，暂停挂卖。', dsym(context, symbol), sell_p, up_limit)
-            can_place_sell = False
 
     position = get_position(symbol)
     pos = position.amount 
@@ -935,39 +872,23 @@ def place_limit_orders(context, symbol, state, ignore_cooldown=False, bypass_loc
         
         same_buy = any(o.amount > 0 for o in open_orders)
         same_sell = any(o.amount < 0 for o in open_orders)
-
         enable_amount = position.enable_amount
         state['_oo_last'] = len(open_orders)
         state['_last_pos_seen'] = pos 
 
-        # 发起买入 (增加空间检查和错误熔断)
-        if can_place_buy and not same_buy and pos + unit <= state['max_position']:
-            try:
-                order(symbol, unit, limit_price=buy_p)
-                info('[{}] --> 发起买入委托: {}股 @ {:.3f}', dsym(context, symbol), unit, buy_p)
-            except Exception as e:
-                err_str = str(e)
-                if "超过涨跌停范围" in err_str or "120162" in err_str:
-                    info('[{}] 🚨 瞬时触及边界：买单申报失败，进入静默冷却。', dsym(context, symbol))
-                    state['_last_trade_ts'] = now_dt + timedelta(seconds=60)
-                else: raise e
+        can_buy = not same_buy
+        if can_buy and pos + unit <= state['max_position']:
+            info('[{}] --> 发起买入委托: {}股 @ {:.3f}', dsym(context, symbol), unit, buy_p)
+            order(symbol, unit, limit_price=buy_p)
 
-        # 发起卖出 (增加空间检查和错误熔断)
         can_sell = not same_sell
         pending_frozen = context.pending_frozen.get(symbol, 0)
         real_enable = enable_amount - pending_frozen
         
-        if can_place_sell and can_sell and real_enable >= unit and pos - unit >= state['base_position']:
-            try:
-                order(symbol, -unit, limit_price=sell_p)
-                info('[{}] --> 发起卖出委托: {}股 @ {:.3f} (可用:{}, 冻结:{})', dsym(context, symbol), unit, sell_p, enable_amount, pending_frozen)
-                context.pending_frozen[symbol] = pending_frozen + unit
-            except Exception as e:
-                err_str = str(e)
-                if "超过涨跌停范围" in err_str or "120162" in err_str:
-                    info('[{}] 🚨 瞬时触及边界：卖单申报失败，进入静默冷却。', dsym(context, symbol))
-                    state['_last_trade_ts'] = now_dt + timedelta(seconds=60)
-                else: raise e
+        if can_sell and real_enable >= unit and pos - unit >= state['base_position']:
+            info('[{}] --> 发起卖出委托: {}股 @ {:.3f} (可用:{}, 冻结:{})', dsym(context, symbol), unit, sell_p, enable_amount, pending_frozen)
+            order(symbol, -unit, limit_price=sell_p)
+            context.pending_frozen[symbol] = pending_frozen + unit
 
     except Exception as e:
         info('[{}] ⚠️ 限价挂单异常：{}', dsym(context, symbol), e)
@@ -978,152 +899,29 @@ def place_limit_orders(context, symbol, state, ignore_cooldown=False, bypass_loc
 # ---------------- 成交回报与后续挂单 ----------------
 
 def on_trade_response(context, trade_list):
-    """
-    3.5.7 重构：严格方向识别 + 余额结余法核销
-    """
     for tr in trade_list:
         if str(tr.get('status')) != '8': continue
         sym = convert_symbol_to_standard(tr['stock_code'])
-        entrust_no = str(tr['entrust_no'])
+        entrust_no = tr['entrust_no']
         
         log_trade_details(context, sym, tr) 
         if sym not in context.state or entrust_no in context.state[sym]['filled_order_ids']: continue
-        
-        state = context.state[sym]
 
-        # 1. 严格方向识别
-        bs = str(tr.get('entrust_bs')) # '1':买, '2':卖
-        if bs == '1':
-            amount = tr['business_amount']
-            trade_dir = "买入"
-        elif bs == '2':
-            amount = -tr['business_amount']
-            trade_dir = "卖出"
-        else: 
-            # 未知方向，保守处理：不累加余额
-            continue
-            
+        amount = tr['business_amount'] if tr['entrust_bs']=='1' else -tr['business_amount']
         price  = tr['business_price']
         key = _make_fill_key(sym, amount, price, context.current_dt)
         if _is_dup_fill(context, key): continue
         _remember_fill(context, key)
 
-        state['filled_order_ids'].add(entrust_no)
-        
-        # 2. 余额结余法核心入口
-        state['pending_fill_amount'] += amount
-        execute_stack_logic(context, sym, price)
-        
-        info('✅ [{}] 成交回报! 方向: {}, 数量: {}, 价格: {:.3f}', dsym(context, sym), trade_dir, abs(amount), price)
-
-        # 3. 更新基准
-        state['_last_trade_ts'] = context.current_dt
-        state['_last_fill_dt'] = context.current_dt
-        state['last_fill_price'] = price
-        state['base_price'] = price
-
-        cancelled_ids = cancel_all_orders_by_symbol(context, sym)
-        if cancelled_ids: state['_pending_ignore_ids'] = list(cancelled_ids)
-
-        delay_s = StrategyConfig.DEBUG.DELAY_AFTER_CANCEL
-        state['_rehang_due_ts'] = datetime.now() + timedelta(seconds=max(delay_s, 2.0))
-        
-        context.mark_halted[sym] = False
-        context.last_valid_price[sym] = price
-        context.latest_data[sym] = price
-        context.last_valid_ts[sym] = context.current_dt
-
-        state.pop('_last_order_ts', None)
-        state.pop('_last_order_bp', None)
-        context.should_place_order_map[sym] = True
-        
-        try: state['_last_pos_seen'] = get_position(sym).amount
-        except: state['_last_pos_seen'] = None
-            
-        safe_save_state(sym, state)
-
-def execute_stack_logic(context, symbol, fill_price):
-    """
-    [Global Ver: v3.5.9] [Func Ver: 2.0]
-    [Change]: 重构核销逻辑，显式分离买/卖处理路径，杜绝反向入库。
-              逻辑：
-              1. 余额 > 0 (买入积累) -> 优先平空(Pop Sell)，无空可平则开多(Push Buy)
-              2. 余额 < 0 (卖出积累) -> 优先平多(Pop Buy)，无多可平则开空(Push Sell)
-    """
-    state = context.state[symbol]
-    unit = state['grid_unit']
-    
-    # -----------------------------------------------------------
-    # PATH A: 处理【买入】积累 (Pending Amount is POSITIVE)
-    # -----------------------------------------------------------
-    while state['pending_fill_amount'] >= unit * 0.95:
-        # 1. 优先平空 (Check Sell Stack)
-        if state['sell_stack']:
-            # 卖单堆栈存的是 (-price, unit)，Pop取出最高卖价
-            neg_price, s_unit = heapq.heappop(state['sell_stack'])
-            max_sell_p = -neg_price
-            
-            # 风控：亏损买回记录
-            if fill_price > max_sell_p:
-                credit = state.get('credit_limit', 0)
-                if credit > 0:
-                    state['credit_limit'] -= 1
-                    info('[{}] 📉 亏损买回: 现买{:.3f} > 原卖{:.3f} (剩余额度:{})', 
-                         dsym(context, symbol), fill_price, max_sell_p, state['credit_limit'])
-            
-            pnl = (max_sell_p - fill_price) * unit
-            state['history_pnl'] += pnl
-            info('[{}] ⚖️ [买入平空] 消耗 SellStack ({:.3f}), 获利: {:.2f}', dsym(context, symbol), max_sell_p, pnl)
-            
-        # 2. 无空可平 -> 开多 (Push to Buy Stack)
-        else:
-            # 查重：避免同价位重复
-            if not any(abs(item[0] - fill_price) < 1e-5 for item in state['buy_stack']):
-                heapq.heappush(state['buy_stack'], (fill_price, unit))
-                info('[{}] 📥 [买入开多] 入库 BuyStack ({:.3f})', dsym(context, symbol), fill_price)
-            else:
-                info('[{}] ⚠️ [买入忽略] BuyStack 已存在价位 {:.3f}', dsym(context, symbol), fill_price)
-        
-        # 扣减处理完的份额
-        state['pending_fill_amount'] -= unit
-
-    # -----------------------------------------------------------
-    # PATH B: 处理【卖出】积累 (Pending Amount is NEGATIVE)
-    # -----------------------------------------------------------
-    while state['pending_fill_amount'] <= -unit * 0.95:
-        # 1. 优先平多 (Check Buy Stack)
-        if state['buy_stack']:
-            # 买单堆栈存的是 (price, unit)，Pop取出最低买价
-            min_buy_p, b_unit = heapq.heappop(state['buy_stack'])
-            
-            # 风控：亏损卖出记录
-            if fill_price < min_buy_p:
-                credit = state.get('credit_limit', 0)
-                if credit > 0:
-                    state['credit_limit'] -= 1
-                    info('[{}] 📉 亏损卖出: 现卖{:.3f} < 原买{:.3f} (剩余额度:{})', 
-                         dsym(context, symbol), fill_price, min_buy_p, state['credit_limit'])
-            
-            pnl = (fill_price - min_buy_p) * unit
-            state['history_pnl'] += pnl
-            info('[{}] ⚖️ [卖出平多] 消耗 BuyStack ({:.3f}), 获利: {:.2f}', dsym(context, symbol), min_buy_p, pnl)
-            
-        # 2. 无多可平 -> 开空 (Push to Sell Stack)
-        else:
-            # 查重：卖单存负数 (-price)
-            if not any(abs((-item[0]) - fill_price) < 1e-5 for item in state['sell_stack']):
-                heapq.heappush(state['sell_stack'], (-fill_price, unit))
-                info('[{}] 📤 [卖出开空] 入库 SellStack ({:.3f})', dsym(context, symbol), fill_price)
-            else:
-                info('[{}] ⚠️ [卖出忽略] SellStack 已存在价位 {:.3f}', dsym(context, symbol), fill_price)
-        
-        # 加回处理完的份额 (负数加正数 = 归零方向)
-        state['pending_fill_amount'] += unit
+        context.state[sym]['filled_order_ids'].add(entrust_no)
+        safe_save_state(sym, context.state[sym])
+        order_obj = SimpleNamespace(order_id = entrust_no, amount = amount, filled = abs(amount), price = price)
+        try:
+            on_order_filled(context, sym, order_obj)
+        except Exception as e:
+            info('[{}] ❌ 成交处理失败：{}', dsym(context, sym), e)
 
 def on_order_filled(context, symbol, order):
-    """
-    3.5.7 适配：FILL-RECOVER 调用此函数时，重定向至 pending_fill_amount 逻辑
-    """
     state = context.state[symbol]
     if order.filled == 0: return
     
@@ -1131,11 +929,77 @@ def on_order_filled(context, symbol, order):
         current_frozen = context.pending_frozen.get(symbol, 0)
         context.pending_frozen[symbol] = max(0, current_frozen - abs(order.filled))
 
-    state['pending_fill_amount'] += order.amount
-    execute_stack_logic(context, symbol, order.price)
+    fill_price = order.price
+    buy_stack = state.setdefault('buy_stack', [])
+    sell_stack = state.setdefault('sell_stack', [])
     
+    if order.amount > 0: 
+        matched = False
+        if sell_stack:
+            max_sell_price = -sell_stack[0]
+            heapq.heappop(sell_stack) 
+            matched = True
+            if fill_price > max_sell_price:
+                current_credit = state.get('credit_limit', 0)
+                if current_credit > 0:
+                    state['credit_limit'] = current_credit - 1
+                    info('[{}] 📉 亏损买回 (Used Credit): 买{:.3f} > 卖{:.3f}, 剩余额度: {}', dsym(context, symbol), fill_price, max_sell_price, state['credit_limit'])
+        if not matched:
+            heapq.heappush(buy_stack, fill_price)
+    else:
+        matched = False
+        if buy_stack:
+            min_buy_price = buy_stack[0]
+            heapq.heappop(buy_stack) 
+            matched = True
+            if fill_price < min_buy_price:
+                current_credit = state.get('credit_limit', 0)
+                if current_credit > 0:
+                    state['credit_limit'] = current_credit - 1
+                    info('[{}] 📉 亏损卖出 (Used Credit): 卖{:.3f} < 买{:.3f}, 剩余额度: {}', dsym(context, symbol), fill_price, min_buy_price, state['credit_limit'])
+        if not matched:
+            heapq.heappush(sell_stack, -fill_price)
+            
+    last_dt = state.get('_last_fill_dt')
+    last_price = state.get('last_fill_price', 0)
+    time_diff = (context.current_dt - last_dt).total_seconds() if last_dt else 999
+    if last_dt and time_diff < 10 and last_price > 0:
+        if abs(order.price - last_price) / last_price < 0.001: return
+
     trade_direction = "买入" if order.amount > 0 else "卖出"
-    # info('✅ [{}] 补录成交! 方向: {}, 数量: {}, 价格: {:.3f}', dsym(context, symbol), trade_direction, order.filled, order.price)
+    info('✅ [{}] 成交回报! 方向: {}, 数量: {}, 价格: {:.3f}', dsym(context, symbol), trade_direction, order.filled, order.price)
+
+    state['_last_trade_ts'] = context.current_dt
+    state['_last_fill_dt'] = context.current_dt
+    state['last_fill_price'] = order.price
+    state['base_price'] = order.price
+
+    cancelled_ids = cancel_all_orders_by_symbol(context, symbol)
+    if cancelled_ids: state['_pending_ignore_ids'] = list(cancelled_ids)
+
+    delay_s = StrategyConfig.DEBUG.DELAY_AFTER_CANCEL
+    state['_rehang_due_ts'] = datetime.now() + timedelta(seconds=max(delay_s, 2.0))
+    info('[{}] ⏳ 设置补单计划，将在 {} 后触发', dsym(context, symbol), state['_rehang_due_ts'].strftime('%H:%M:%S'))
+
+    context.mark_halted[symbol] = False
+    context.last_valid_price[symbol] = order.price
+    context.latest_data[symbol] = order.price
+    context.last_valid_ts[symbol] = context.current_dt
+
+    state.pop('_last_order_ts', None)
+    state.pop('_last_order_bp', None)
+    context.should_place_order_map[symbol] = True
+    
+    try:
+         state['_last_pos_seen'] = get_position(symbol).amount
+    except:
+         state['_last_pos_seen'] = None
+         
+    state['_oo_last'] = len([o for o in (get_open_orders(symbol) or []) if OrderUtils.is_active(OrderUtils.normalize(o))])
+    state['_oo_drop_seen_ts'] = None
+    state['_pos_jump_seen_ts'] = None
+    state['_pos_confirm_deadline'] = None
+    safe_save_state(symbol, state)
 
 # ---------------- FILL-RECOVER ----------------
 
@@ -1148,12 +1012,15 @@ def _fill_recover_watch(context, symbol, state):
 
     if not in_window:
         if state.get('_last_pos_seen') is None:
-            try: state['_last_pos_seen'] = get_position(symbol).amount
-            except Exception: pass
+            try:
+                state['_last_pos_seen'] = get_position(symbol).amount
+            except Exception:
+                pass
+
         if state.get('_oo_drop_seen_ts') or state.get('_pos_jump_seen_ts'):
-             state['_oo_drop_seen_ts'] = None
-             state['_pos_jump_seen_ts'] = None
-             state['_pos_confirm_deadline'] = None
+            state['_oo_drop_seen_ts'] = None
+            state['_pos_jump_seen_ts'] = None
+            state['_pos_confirm_deadline'] = None
         return
 
     try:
@@ -1247,19 +1114,10 @@ def patrol_and_correct_orders(context, symbol, state):
         
         buy_p, sell_p = _apply_price_guard(context, state, buy_p, sell_p, buy_sp, sell_sp)
 
-        # 巡检逻辑同步空间限制
-        up_limit = state.get('_up_limit')
-        down_limit = state.get('_down_limit')
-        
         should_have_buy_order = (pos + unit <= max_pos)
-        if is_valid_price(down_limit) and buy_p < down_limit:
-            should_have_buy_order = False # 跌停时，巡检不再认为缺失买单
-
         pending_frozen = context.pending_frozen.get(symbol, 0)
         real_enable = enable_amount - pending_frozen
         should_have_sell_order = (real_enable >= unit and pos - unit >= base_pos)
-        if is_valid_price(up_limit) and sell_p > up_limit:
-            should_have_sell_order = False # 涨停时，巡检不再认为缺失卖单
 
         orders_to_cancel = []
         valid_buy_orders = []
@@ -1346,7 +1204,8 @@ def handle_data(context, data):
                 _calculate_intraday_metrics(context)
                 generate_html_report(context)
                 context.last_report_time = now_dt
-            except Exception: pass
+            except Exception as e:
+                pass
 
     boot_grace = (now_dt - getattr(context, 'boot_dt', now_dt)).total_seconds() < StrategyConfig.BOOT.GRACE_SECONDS
     if not boot_grace:
@@ -1373,7 +1232,7 @@ def handle_data(context, data):
                     state = context.state[sym]
                     recover_window_seconds = 180 
                     state['_recover_until'] = now_dt + timedelta(seconds=recover_window_seconds)
-                    info('[{}]     监测到复牌/行情恢复，开启 {}s 补偿成交检测窗口。', dsym(context, symbol), recover_window_seconds)
+                    info('[{}]     监测到复牌/行情恢复，开启 {}s 补偿成交检测窗口。', dsym(context, sym), recover_window_seconds)
 
     for sym in context.symbol_list:
         if sym not in context.state: continue
@@ -1424,7 +1283,8 @@ def _calculate_intraday_metrics(context):
             daily_return = (curr_price - open_price) / open_price
             efficiency = rv / max(abs(daily_return), 0.0001)
             metrics[sym] = {'rv': rv, 'efficiency': efficiency, 'daily_return': daily_return}
-        except Exception: pass
+        except Exception as e:
+            pass
     context.intraday_metrics = metrics
 
 # ---------------- 监控输出 ----------------
@@ -1447,33 +1307,50 @@ def calculate_atr(context, symbol, atr_period=14):
         df = hist.get(symbol) if isinstance(hist, dict) else hist
         current_atr_rate = None
         if df is not None and not df.empty and len(df) > 1:
-            high, low, close = df['high'], df['low'], df['close']
+            high = df['high']
+            low = df['low']
+            close = df['close']
             tr1 = high - low
             tr2 = (high - close.shift(1)).abs()
             tr3 = (low - close.shift(1)).abs()
             tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
             atr_series = tr.ewm(span=atr_period, adjust=False).mean()
-            last_atr_val, last_price = atr_series.iloc[-1], close.iloc[-1]
+            last_atr_val = atr_series.iloc[-1]
+            last_price = close.iloc[-1]
             state['cached_atr_ema'] = float(last_atr_val)
-            if is_valid_price(last_price): current_atr_rate = last_atr_val / last_price
+            if is_valid_price(last_price):
+                current_atr_rate = last_atr_val / last_price
     except Exception as e:
-        if StrategyConfig.DEBUG.ENABLE: info('[{}] ATR计算异常: {} (将尝试使用缓存)', dsym(context, symbol), e)
+        if StrategyConfig.DEBUG.ENABLE:
+            info('[{}] ATR计算异常: {} (将尝试使用缓存)', dsym(context, symbol), e)
     used_rate = state.get('used_atr_rate')
     if current_atr_rate is not None and current_atr_rate > 0:
-        if used_rate is None or abs(current_atr_rate - used_rate) / used_rate > 0.10: state['used_atr_rate'] = current_atr_rate
+        if used_rate is None or abs(current_atr_rate - used_rate) / used_rate > 0.10:
+            state['used_atr_rate'] = current_atr_rate
         return state['used_atr_rate']
-    return used_rate
+    if used_rate is not None: return used_rate
+    return None
 
 def update_grid_spacing_final(context, symbol, state, curr_pos):
-    pos, unit, base_pos = curr_pos, state['grid_unit'], state['base_position']
+    pos = curr_pos 
+    unit, base_pos = state['grid_unit'], state['base_position']
     atr_pct = calculate_atr(context, symbol)
     base_spacing = 0.005
-    if atr_pct is not None and not math.isnan(atr_pct): base_spacing = max(atr_pct * 0.25, StrategyConfig.TRANSACTION_COST * 5)
+    if atr_pct is not None and not math.isnan(atr_pct):
+        atr_multiplier = 0.25
+        base_spacing = atr_pct * atr_multiplier
+    min_spacing = StrategyConfig.TRANSACTION_COST * 5
+    base_spacing = max(base_spacing, min_spacing)
     thresh_low, thresh_high = 5, 15
-    if pos <= base_pos + unit * thresh_low: new_buy, new_sell = base_spacing, base_spacing * 2
-    elif pos > base_pos + unit * thresh_high: new_buy, new_sell = base_spacing * 2, base_spacing
-    else: new_buy, new_sell = base_spacing, base_spacing
-    new_buy, new_sell = round(min(new_buy, 0.03), 4), round(min(new_sell, 0.03), 4)
+    if pos <= base_pos + unit * thresh_low:
+        new_buy, new_sell = base_spacing, base_spacing * 2
+    elif pos > base_pos + unit * thresh_high:
+        new_buy, new_sell = base_spacing * 2, base_spacing
+    else:
+        new_buy, new_sell = base_spacing, base_spacing
+    max_spacing = 0.03
+    new_buy  = round(min(new_buy,  max_spacing), 4)
+    new_sell = round(min(new_sell, max_spacing), 4)
     if new_buy != state.get('buy_grid_spacing') or new_sell != state.get('sell_grid_spacing'):
         state['buy_grid_spacing'], state['sell_grid_spacing'] = new_buy, new_sell
         info('[{}] 网格动态调整 (ATR={:.2%}) -> [买{:.2%},卖{:.2%}]', dsym(context, symbol), (atr_pct or 0.0), new_buy, new_sell)
@@ -1493,8 +1370,10 @@ def get_target_base_position(context, symbol, state, price, dt):
     try:
         weeks = get_trade_weeks(context, symbol, state, dt)
         accumulated_investment = sum(state['dingtou_base'] * (1 + state['dingtou_rate'])**w for w in range(1, weeks + 1))
-        target_val, current_val = state['initial_position_value'] + accumulated_investment, state['base_position'] * price
-        surplus, grid_value = current_val - target_val, state['grid_unit'] * price
+        target_val = state['initial_position_value'] + accumulated_investment
+        current_val = state['base_position'] * price
+        surplus = current_val - target_val
+        grid_value = state['grid_unit'] * price
         if surplus >= StrategyConfig.VA.THRESHOLD_K * grid_value:
             release_amt = state['grid_unit']
             if state['base_position'] - release_amt >= state['initial_base_position'] * 0.5:
@@ -1510,7 +1389,7 @@ def get_target_base_position(context, symbol, state, price, dt):
                 info('[{}] 📈 VA价值平均加仓: 底仓增加至 {}', dsym(context, symbol), final_pos)
                 state['base_position'] = final_pos
         state['max_position'] = state['base_position'] + state['grid_unit'] * 20
-    except Exception: pass
+    except: pass
     return state['base_position']
 
 def get_trade_weeks(context, symbol, state, dt):
@@ -1528,7 +1407,8 @@ def adjust_grid_unit(state):
         theoretical_unit = math.ceil(state['base_position'] / 20 / 100) * 100
         price = state.get('base_price', 1.0)
         capped_unit_val = math.floor(StrategyConfig.MAX_TRADE_AMOUNT / price / 100) * 100
-        new_unit = min(theoretical_unit, max(100, capped_unit_val))
+        capped_unit = max(100, capped_unit_val)
+        new_unit = min(theoretical_unit, capped_unit)
         if new_unit > state['grid_unit']:
             state['grid_unit'] = new_unit
             info(f"[{state.get('symbol')}] 🔧 网格单位放大至 {new_unit}")
@@ -1554,7 +1434,7 @@ def _calculate_local_pnl_lifo(context):
                 parts = line.strip().split(',')
                 if len(parts) < 6: continue
                 trades.append({'time': parts[0],'symbol': parts[1],'qty': float(parts[3]),'price': float(parts[4]),'base_pos_at_trade': int(parts[5]) if parts[5].isdigit() else 0})
-    except Exception: return
+    except: return
     trades.sort(key=lambda x: x['time'])
     pnl_metrics = getattr(context, 'pnl_metrics', {})
     for sym in context.symbol_list:
@@ -1566,18 +1446,27 @@ def _calculate_local_pnl_lifo(context):
         for t in sym_trades:
             qty, price, target_base = t['qty'], t['price'], (t['base_pos_at_trade'] if t['base_pos_at_trade'] > 0 else state.get('base_position', 0))
             if qty > 0:
-                rem = qty
+                remaining_buy = qty
                 if current_holding < target_base:
-                    fill = min(rem, target_base - current_holding)
-                    inventory.append([fill, price, 'base']); current_holding += fill; rem -= fill
-                if rem > 0: inventory.append([rem, price, 'grid']); current_holding += rem
+                    needed = target_base - current_holding
+                    fill_amt = min(remaining_buy, needed)
+                    inventory.append([fill_amt, price, 'base'])
+                    current_holding += fill_amt
+                    remaining_buy -= fill_amt
+                if remaining_buy > 0:
+                    inventory.append([remaining_buy, price, 'grid'])
+                    current_holding += remaining_buy
             elif qty < 0:
-                sell_q = abs(qty); current_holding -= sell_q
-                while sell_q > 0.001 and inventory:
-                    lot = inventory[-1]; matched = min(sell_q, lot[0]); profit = (price - lot[1]) * matched
+                sell_qty = abs(qty)
+                current_holding -= sell_qty
+                while sell_qty > 0.001 and inventory:
+                    lot = inventory[-1]
+                    matched = min(sell_qty, lot[0])
+                    profit = (price - lot[1]) * matched
                     if lot[2] == 'base': base_pnl += profit
                     else: grid_pnl += profit
-                    sell_q -= matched; lot[0] -= matched
+                    sell_qty -= matched
+                    lot[0] -= matched
                     if lot[0] <= 0.001: inventory.pop()
         if sym not in pnl_metrics: pnl_metrics[sym] = {}
         pnl_metrics[sym].update({'realized_grid_pnl': grid_pnl, 'realized_base_pnl': base_pnl, 'total_realized_pnl': grid_pnl + base_pnl})
@@ -1585,17 +1474,25 @@ def _calculate_local_pnl_lifo(context):
     _save_pnl_metrics(context)
 
 def after_trading_end(context, data):
-    if '回测' in context.env: return
+    if '回测' in context.env:
+        return
+
     info('🏁 盘后作业开始...')
-    try: _calculate_local_pnl_lifo(context)
-    except Exception: pass
+    try:
+        _calculate_local_pnl_lifo(context)
+    except Exception:
+        pass
+
     try:
         update_daily_reports(context, data)
         generate_html_report(context)
-    except Exception: pass
+    except Exception:
+        pass
+
     info('✅ 盘后作业结束')
 
 def reload_config_if_changed(context):
+    """【修正】修复热重载逻辑语法，确保标的增删状态正确初始化"""
     try:
         current_mod_time = context.config_file_path.stat().st_mtime
         if current_mod_time == context.last_config_mod_time: return
@@ -1605,6 +1502,7 @@ def reload_config_if_changed(context):
         StrategyConfig.load(context)
         old_symbols, new_symbols = set(context.symbol_list), set(new_config.keys())
         
+        # 1) 删除被移除的标的
         for sym in old_symbols - new_symbols:
             info('[{}] 标的已从配置中移除，将清理其状态和挂单...', dsym(context, sym))
             cancel_all_orders_by_symbol(context, sym)
@@ -1617,6 +1515,7 @@ def reload_config_if_changed(context):
             context.pending_frozen.pop(sym, None)
             context.should_place_order_map.pop(sym, None)
 
+        # 2) 新增标的
         for sym in new_symbols - old_symbols:
             info('[{}] 新增标的 (或重载)，正在初始化状态...', dsym(context, sym))
             cfg = new_config[sym]
@@ -1632,17 +1531,19 @@ def reload_config_if_changed(context):
                 'base_position': saved.get('base_position', cfg['initial_base_position']),
                 'last_week_position': saved.get('last_week_position', cfg['initial_base_position']),
                 'initial_position_value': cfg['initial_base_position'] * cfg['base_price'],
-                'buy_grid_spacing': 0.005, 'sell_grid_spacing': 0.005,
+                'buy_grid_spacing': 0.005,
+                'sell_grid_spacing': 0.005,
                 'max_position': saved.get('max_position', saved.get('base_position', cfg['initial_base_position']) + saved.get('grid_unit', cfg['grid_unit']) * 20),
-                'used_atr_rate': saved.get('used_atr_rate', None), 'cached_atr_ema': saved.get('cached_atr_ema', None),
-                'buy_stack': saved.get('buy_stack', []), 'sell_stack': saved.get('sell_stack', []),
+                'used_atr_rate': saved.get('used_atr_rate', None),
+                'cached_atr_ema': saved.get('cached_atr_ema', None),
+                'buy_stack': saved.get('buy_stack', []),
+                'sell_stack': saved.get('sell_stack', []),
                 'credit_limit': cfg.get('credit_limit', saved.get('credit_limit', StrategyConfig.CREDIT_LIMIT)),
                 '_pending_ignore_ids': [],
             })
             heapq.heapify(st['buy_stack'])
             heapq.heapify(st['sell_stack'])
             if 'scale_factor' in st: st.pop('scale_factor')
-            
             context.state[sym] = st
             context.latest_data[sym] = st['base_price']
             context.symbol_list.append(sym)
@@ -1652,10 +1553,16 @@ def reload_config_if_changed(context):
             context.pending_frozen[sym] = 0
             context.should_place_order_map[sym] = True
 
+        # 3) 旧标的参数更新
         for sym in old_symbols.intersection(new_symbols):
             if context.symbol_config[sym] != new_config[sym]:
                 state, new_params = context.state[sym], new_config[sym]
-                state.update({'grid_unit': new_params['grid_unit'], 'dingtou_base': new_params['dingtou_base'], 'dingtou_rate': new_params['dingtou_rate'], 'max_position': state['base_position'] + new_params['grid_unit'] * 20})
+                state.update({
+                    'grid_unit': new_params['grid_unit'],
+                    'dingtou_base': new_params['dingtou_base'],
+                    'dingtou_rate': new_params['dingtou_rate'],
+                    'max_position': state['base_position'] + new_params['grid_unit'] * 20
+                })
                 if 'credit_limit' in new_params:
                     new_limit = int(new_params['credit_limit'])
                     if state.get('credit_limit') != new_limit:
@@ -1673,9 +1580,9 @@ def log_trade_details(context, symbol, trade):
         is_new = not trade_log_path.exists()
         with open(trade_log_path, 'a', encoding='utf-8', newline='') as f:
             if is_new: f.write(",".join(["time", "symbol", "direction", "quantity", "price", "base_position_at_trade", "entrust_no"]) + "\n")
-            dir_str, base_pos = ("BUY" if trade['entrust_bs'] == '1' else "SELL"), context.state[symbol].get('base_position', 0)
-            f.write(",".join([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), symbol, dir_str, str(trade['business_amount']), f"{trade['business_price']:.3f}", str(base_pos), trade.get('entrust_no', 'N/A')]) + "\n")
-    except Exception: pass
+            direction, base_position = ("BUY" if trade['entrust_bs'] == '1' else "SELL"), context.state[symbol].get('base_position', 0)
+            f.write(",".join([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), symbol, direction, str(trade['business_amount']), f"{trade['business_price']:.3f}", str(base_position), trade.get('entrust_no', 'N/A')]) + "\n")
+    except: pass
 
 def update_daily_reports(context, data):
     reports_dir = research_path('reports')
@@ -1683,11 +1590,12 @@ def update_daily_reports(context, data):
     current_date = context.current_dt.strftime("%Y-%m-%d")
     for symbol in context.symbol_list:
         report_file, state, position = reports_dir / f"{symbol}.csv", context.state[symbol], get_position(symbol)
-        amount, close_price = position.amount, context.last_valid_price.get(symbol, state['base_price'])
+        amount, close_price = position.amount, context.last_valid_price.get(symbol, context.state[symbol]['base_price'])
         if not is_valid_price(close_price): close_price = state['base_price']
         weeks, d_base, d_rate = len(state.get('trade_week_set', [])), state['dingtou_base'], state['dingtou_rate']
         cumulative_invest = sum(d_base * (1 + d_rate) ** w for w in range(1, weeks+1))
-        row = [current_date, f"{close_price:.3f}", str(weeks), str(weeks), f"{(amount * close_price - state.get('last_week_position', 0) * close_price) / (state.get('last_week_position', 0) * close_price) if state.get('last_week_position', 0)>0 else 0.0:.2%}", f"{(amount * close_price - cumulative_invest) / cumulative_invest if cumulative_invest>0 else 0.0:.2%}", f"{state['initial_position_value'] + d_base * weeks:.2f}", f"{d_base:.0f}", f"{d_base * (1 + d_rate) ** weeks:.0f}", f"{cumulative_invest:.0f}", str(state['initial_base_position']), str(state['base_position']), f"{state['base_position'] * close_price:.0f}", f"{(state['base_position'] - state.get('last_week_position', 0)) * close_price:.0f}", f"{state['base_position'] * close_price - state['initial_position_value']:.0f}", str(state['base_position']), str(amount), str(state['grid_unit']), str(max(0, amount - state['base_position'])), str(state['base_position'] + state['grid_unit'] * 5), str(state['base_position'] + state['grid_unit'] * 15), str(state['max_position']), f"{getattr(position, 'cost_basis', state['base_price']):.3f}", f"{(state['base_position'] - state.get('last_week_position', 0)) * close_price:.3f}", f"{(close_price - getattr(position, 'cost_basis', state['base_price'])) * amount:.0f}"]
+        last_week_val, current_val = state.get('last_week_position', 0) * close_price, amount * close_price
+        row = [current_date, f"{close_price:.3f}", str(weeks), str(weeks), f"{(current_val - last_week_val) / last_week_val if last_week_val>0 else 0.0:.2%}", f"{(current_val - cumulative_invest) / cumulative_invest if cumulative_invest>0 else 0.0:.2%}", f"{state['initial_position_value'] + d_base * weeks:.2f}", f"{d_base:.0f}", f"{d_base * (1 + d_rate) ** weeks:.0f}", f"{cumulative_invest:.0f}", str(state['initial_base_position']), str(state['base_position']), f"{state['base_position'] * close_price:.0f}", f"{(state['base_position'] - state.get('last_week_position', 0)) * close_price:.0f}", f"{state['base_position'] * close_price - state['initial_position_value']:.0f}", str(state['base_position']), str(amount), str(state['grid_unit']), str(max(0, amount - state['base_position'])), str(state['base_position'] + state['grid_unit'] * 5), str(state['base_position'] + state['grid_unit'] * 15), str(state['max_position']), f"{getattr(position, 'cost_basis', state['base_price']):.3f}", f"{(state['base_position'] - state.get('last_week_position', 0)) * close_price:.3f}", f"{(close_price - getattr(position, 'cost_basis', state['base_price'])) * amount:.0f}"]
         is_new = not report_file.exists()
         with open(report_file, 'a', encoding='utf-8', newline='') as f:
             if is_new: f.write(",".join(["时间","市价","期数","次数","每期总收益率","盈亏比","应到价值","当周应投入金额","当周实际投入金额","实际累计投入金额","定投底仓份额","累计底仓份额","累计底仓价值","每期累计底仓盈利","总累计底仓盈利","底仓","股票余额","单次网格交易数量","可T数量","标准数量","中间数量","极限数量","成本价","对比定投成本","盈亏"]) + "\n")
@@ -1700,7 +1608,8 @@ def generate_html_report(context):
         if symbol not in context.state: continue
         state, position, price = context.state[symbol], get_position(symbol), context.last_valid_price.get(symbol, context.state[symbol]['base_price'])
         if not is_valid_price(price): price = state['base_price']
-        market_value = position.amount * price; unrealized_pnl = (price - position.cost_basis) * position.amount if position.cost_basis > 0 else 0
+        market_value = position.amount * price
+        unrealized_pnl = (price - position.cost_basis) * position.amount if position.cost_basis > 0 else 0
         total_market_value += market_value; total_unrealized_pnl += unrealized_pnl
         sym_pnl, rv_data = pnl_metrics.get(symbol, {}), intraday_metrics.get(symbol, {})
         total_real = sym_pnl.get('total_realized_pnl', 0); total_realized_pnl += total_real
@@ -1712,4 +1621,4 @@ def generate_html_report(context):
         for m in all_metrics:
             table_rows += f"<tr><td>{m['symbol_disp']}</td><td>{m['position']}</td><td>{m['cost_basis']}</td><td>{m['price']}</td><td>{m['market_value']}</td><td class=\"{'positive' if float(m['unrealized_pnl'].replace(',',''))>=0 else 'negative'}\">{m['unrealized_pnl']}</td><td class=\"{'positive' if float(m['unrealized_pnl'].replace(',',''))>=0 else 'negative'}\">{m['pnl_ratio']}</td><td class=\"{'positive' if float(m['realized_grid_pnl'].replace(',',''))>0 else ''}\">{m['realized_grid_pnl']}</td><td>{m['realized_base_pnl']}</td><td class=\"{'positive' if float(m['total_realized_pnl'].replace(',',''))>0 else ''}\">{m['total_realized_pnl']}</td><td class=\"{'positive' if float(m['total_pnl'].replace(',',''))>=0 else 'negative'}\">{m['total_pnl']}</td><td>{m['base_position']}</td><td>{m['grid_unit']}</td><td>{m['atr_str']}</td><td>{m['rv_str']}</td><td>{m['efficiency_str']}</td></tr>"
         research_path('reports', 'strategy_dashboard.html').write_text(html_template.format(update_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"), total_market_value=f"{total_market_value:,.2f}", total_unrealized_pnl=f"{total_unrealized_pnl:,.2f}", unrealized_pnl_class="positive" if total_unrealized_pnl >= 0 else "negative", total_realized_pnl=f"{total_realized_pnl:,.2f}", realized_pnl_class="positive" if total_realized_pnl >= 0 else "negative", account_total_pnl=f"{(total_realized_pnl + total_unrealized_pnl):,.2f}", total_pnl_class="positive" if (total_realized_pnl + total_unrealized_pnl) >= 0 else "negative", total_realized_grid_pnl="0.00", grid_pnl_class="", total_realized_base_pnl="0.00", base_pnl_class="", table_rows=table_rows), encoding='utf-8')
-    except Exception: pass
+    except: pass
