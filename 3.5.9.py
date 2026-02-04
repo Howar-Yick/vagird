@@ -1,14 +1,11 @@
 # event_driven_grid_strategy.py
-# 版本号：GEMINI-3.6.0
+# 版本号：GEMINI-3.5.9
 #
-# 更新日志 (v3.6.0):
-# 1. 【架构重构】废弃 pending_fill_amount 缓冲池机制，全面转向“逐笔对冲 (Trade-by-Trade)”模式。
-# 2. 【核心逻辑】新增 process_trade_logic 函数：
-#    - 只有当 (卖价 - 买价) > 0 时才执行配对抵扣。
-#    - 若无利润或无对手单，剩余部分自动作为新持仓入库。
-# 3. 【状态管理】init_symbol_state 移除过时字段，新增 history_pnl 统计累计对冲盈亏。
-# 4. 【成交入口】on_trade_response 不再累积余额，直接根据明确的买/卖方向驱动核心逻辑。
-# 5. 【防御机制】彻底修复了旧版本因余额符号隐式判断方向可能导致的数据错乱问题。
+#[v3.5.9] 修复: 重构 execute_stack_logic 以显式处理买卖方向
+#- 修复了依靠 pending_fill_amount 正负号隐式判断方向可能导致的逻辑倒错问题。
+#- 将买入处理 (Path A) 和卖出处理 (Path B) 物理隔离。
+#- 增加了明确的 [买入平空/开多] 和 [卖出平多/开空] 日志标签。
+#- 强制升级 execute_stack_logic 函数版本至 v2.0。
 
 import json
 import logging
@@ -28,7 +25,7 @@ import pandas as pd
 # ---------------- 全局句柄 ----------------
 LOG_FH = None
 LOG_DATE = None
-__version__ = 'GEMINI-3.6.0'
+__version__ = 'GEMINI-3.5.7-Release'
 
 # ---------------- 配置管理类 ----------------
 
@@ -306,7 +303,7 @@ def save_state(symbol, state):
     
     # 增加 pending_fill_amount 持久化
     store_keys = ['symbol', 'base_price', 'grid_unit', 'max_position', 'last_week_position', 'base_position', 
-                  'used_atr_rate', 'cached_atr_ema', 'buy_stack', 'sell_stack']
+                  'used_atr_rate', 'cached_atr_ema', 'buy_stack', 'sell_stack', 'credit_limit', 'pending_fill_amount']
     store = {k: state.get(k) for k in store_keys}
     
     store['filled_order_ids'] = ids[-StrategyConfig.MAX_SAVED_FILLED_IDS:]
@@ -383,14 +380,11 @@ def initialize(context):
 # ---------------- 初始化状态辅助函数 (3.5.7) ----------------
 
 def init_symbol_state(context, sym, cfg):
-    """
-    [Global Ver: v3.6.0] [Func Ver: 2.1]
-    [Change]: 移除 pending_fill_amount，全面转向逐笔对冲逻辑。
-    """
     state_file = research_path('state', f'{sym}.json')
     saved = json.loads(state_file.read_text(encoding='utf-8')) if state_file.exists() else get_saved_param(f'state_{sym}', {}) or {}
     
     st = {**cfg}
+    # 基础字段合并
     st.update({
         'symbol': sym, 
         'base_price': saved.get('base_price', cfg['base_price']),
@@ -408,8 +402,7 @@ def init_symbol_state(context, sym, cfg):
         'buy_stack': [],
         'sell_stack': [],
         'credit_limit': cfg.get('credit_limit', saved.get('credit_limit', StrategyConfig.CREDIT_LIMIT)),
-        # 'pending_fill_amount': 0,  <-- 已废弃
-        'history_pnl': saved.get('history_pnl', 0.0), # 新增：累计平仓盈亏
+        'pending_fill_amount': saved.get('pending_fill_amount', 0), # 3.5.7 新增
         'va_last_update_dt': None,
         '_halt_next_log_dt': None,
         '_oo_last': 0,
@@ -423,19 +416,17 @@ def init_symbol_state(context, sym, cfg):
         '_pending_ignore_ids': []
     })
 
-    # 堆栈数据结构升级
+    # 堆栈数据结构升级 (兼容旧版 [price] -> 新版 [(price, unit)])
     for key in ['buy_stack', 'sell_stack']:
         raw = saved.get(key, [])
         for item in raw:
             if isinstance(item, (list, tuple)):
-                st[key].append(tuple(item))
+                st[key].append(tuple(item)) # 已经是新格式
             else:
-                st[key].append((item, st['grid_unit']))
+                st[key].append((item, st['grid_unit'])) # 旧格式升级
         heapq.heapify(st[key])
 
-    # 清理废弃字段
-    for k in ['scale_factor', 'pending_fill_amount']:
-        if k in st: st.pop(k)
+    if 'scale_factor' in st: st.pop('scale_factor')
         
     context.state[sym] = st
     context.latest_data[sym] = st['base_price']
@@ -445,6 +436,7 @@ def init_symbol_state(context, sym, cfg):
     context.last_valid_ts[sym] = None
     context.pending_frozen[sym] = 0
     
+    # 执行启动审计
     audit_initial_consistency(context, sym)
 
 def audit_initial_consistency(context, symbol):
@@ -987,8 +979,7 @@ def place_limit_orders(context, symbol, state, ignore_cooldown=False, bypass_loc
 
 def on_trade_response(context, trade_list):
     """
-    [Global Ver: v3.6.0] [Func Ver: 2.1]
-    [Change]: 适配 v3.6.0 逐笔对冲逻辑，废弃 pending 计算，直接驱动 process_trade_logic。
+    3.5.7 重构：严格方向识别 + 余额结余法核销
     """
     for tr in trade_list:
         if str(tr.get('status')) != '8': continue
@@ -1003,26 +994,29 @@ def on_trade_response(context, trade_list):
         # 1. 严格方向识别
         bs = str(tr.get('entrust_bs')) # '1':买, '2':卖
         if bs == '1':
-            fill_amount = abs(tr['business_amount']) # 买入为正
+            amount = tr['business_amount']
             trade_dir = "买入"
         elif bs == '2':
-            fill_amount = -abs(tr['business_amount']) # 卖出为负
+            amount = -tr['business_amount']
             trade_dir = "卖出"
-        else: continue
+        else: 
+            # 未知方向，保守处理：不累加余额
+            continue
             
-        price = tr['business_price']
-        key = _make_fill_key(sym, fill_amount, price, context.current_dt)
+        price  = tr['business_price']
+        key = _make_fill_key(sym, amount, price, context.current_dt)
         if _is_dup_fill(context, key): continue
         _remember_fill(context, key)
 
         state['filled_order_ids'].add(entrust_no)
         
-        # 2. 调用核心逻辑 (逐笔对冲)
-        process_trade_logic(context, sym, price, fill_amount)
+        # 2. 余额结余法核心入口
+        state['pending_fill_amount'] += amount
+        execute_stack_logic(context, sym, price)
         
-        info('✅ [{}] 成交回报! 方向: {}, 数量: {}, 价格: {:.3f}', dsym(context, sym), trade_dir, abs(fill_amount), price)
+        info('✅ [{}] 成交回报! 方向: {}, 数量: {}, 价格: {:.3f}', dsym(context, sym), trade_dir, abs(amount), price)
 
-        # 3. 更新基准与状态
+        # 3. 更新基准
         state['_last_trade_ts'] = context.current_dt
         state['_last_fill_dt'] = context.current_dt
         state['last_fill_price'] = price
@@ -1048,120 +1042,101 @@ def on_trade_response(context, trade_list):
             
         safe_save_state(sym, state)
 
-def process_trade_logic(context, symbol, fill_price, fill_amount):
+def execute_stack_logic(context, symbol, fill_price):
     """
-    [Global Ver: v3.6.0] [Func Ver: 3.0]
-    [Change]: 全新核心。实现逐笔对冲 (Trade-by-Trade) 逻辑。
-              规则：
-              1. 循环匹配对手方堆栈(Sell for Buy, Buy for Sell)。
-              2. 只有当 (卖价-买价) > 0 时才执行配对抵扣。
-              3. 无法配对的剩余部分，作为新持仓入库。
+    [Global Ver: v3.5.9] [Func Ver: 2.0]
+    [Change]: 重构核销逻辑，显式分离买/卖处理路径，杜绝反向入库。
+              逻辑：
+              1. 余额 > 0 (买入积累) -> 优先平空(Pop Sell)，无空可平则开多(Push Buy)
+              2. 余额 < 0 (卖出积累) -> 优先平多(Pop Buy)，无多可平则开空(Push Sell)
     """
     state = context.state[symbol]
-    
-    # 方向判断
-    is_buy = (fill_amount > 0)
-    remaining_qty = abs(fill_amount)
+    unit = state['grid_unit']
     
     # -----------------------------------------------------------
-    # 对冲循环 (Pairing Loop)
+    # PATH A: 处理【买入】积累 (Pending Amount is POSITIVE)
     # -----------------------------------------------------------
-    while remaining_qty > 0:
-        target_stack = state['sell_stack'] if is_buy else state['buy_stack']
-        
-        # 1. 如果对手库为空，直接跳出 (无对手可平)
-        if not target_stack:
-            break
+    while state['pending_fill_amount'] >= unit * 0.95:
+        # 1. 优先平空 (Check Sell Stack)
+        if state['sell_stack']:
+            # 卖单堆栈存的是 (-price, unit)，Pop取出最高卖价
+            neg_price, s_unit = heapq.heappop(state['sell_stack'])
+            max_sell_p = -neg_price
             
-        # 2. 取出对手单 (Peek)
-        # SellStack存的是(-price, unit), BuyStack存的是(price, unit)
-        if is_buy:
-            top_record = target_stack[0] # peek
-            stack_price = -top_record[0] # 还原正数
-            stack_qty = top_record[1]
+            # 风控：亏损买回记录
+            if fill_price > max_sell_p:
+                credit = state.get('credit_limit', 0)
+                if credit > 0:
+                    state['credit_limit'] -= 1
+                    info('[{}] 📉 亏损买回: 现买{:.3f} > 原卖{:.3f} (剩余额度:{})', 
+                         dsym(context, symbol), fill_price, max_sell_p, state['credit_limit'])
+            
+            pnl = (max_sell_p - fill_price) * unit
+            state['history_pnl'] += pnl
+            info('[{}] ⚖️ [买入平空] 消耗 SellStack ({:.3f}), 获利: {:.2f}', dsym(context, symbol), max_sell_p, pnl)
+            
+        # 2. 无空可平 -> 开多 (Push to Buy Stack)
         else:
-            top_record = target_stack[0] # peek
-            stack_price = top_record[0]
-            stack_qty = top_record[1]
-            
-        # 3. 计算配对利润 (Pnl Check)
-        # 买入对冲: 利润 = (原卖出价 - 现买入价)
-        # 卖出对冲: 利润 = (现卖出价 - 原买入价)
-        trade_pnl = (stack_price - fill_price) if is_buy else (fill_price - stack_price)
-        
-        # 4. 利润门槛判断 (Profit Guard)
-        # 如果这笔配对是亏损的，或者是平价的(无利可图)，则停止配对！
-        # 逻辑：视为行情剧烈波动导致无法通过网格获利，直接转为新开仓。
-        if trade_pnl <= 0:
-            info('[{}] 🛑 停止配对: 对冲利润 {:.3f} <= 0 (Stack:{:.3f} vs Fill:{:.3f})', 
-                 dsym(context, symbol), trade_pnl, stack_price, fill_price)
-            break
-            
-        # 5. 执行抵扣 (Deduction)
-        match_qty = min(remaining_qty, stack_qty)
-        pnl_realized = trade_pnl * match_qty
-        state['history_pnl'] = state.get('history_pnl', 0.0) + pnl_realized
-        
-        info('[{}] ⚖️ [对冲成功] {} {:.3f} (Qty:{}) vs Stack {:.3f}, PnL: {:.2f}', 
-             dsym(context, symbol), "买入平空" if is_buy else "卖出平多", 
-             fill_price, match_qty, stack_price, pnl_realized)
-             
-        # 更新堆栈
-        heapq.heappop(target_stack) # 先弹出
-        if stack_qty > match_qty:
-            # 没吃完，把剩下的放回去
-            left_qty = stack_qty - match_qty
-            if is_buy:
-                heapq.heappush(target_stack, (-stack_price, left_qty))
+            # 查重：避免同价位重复
+            if not any(abs(item[0] - fill_price) < 1e-5 for item in state['buy_stack']):
+                heapq.heappush(state['buy_stack'], (fill_price, unit))
+                info('[{}] 📥 [买入开多] 入库 BuyStack ({:.3f})', dsym(context, symbol), fill_price)
             else:
-                heapq.heappush(target_stack, (stack_price, left_qty))
+                info('[{}] ⚠️ [买入忽略] BuyStack 已存在价位 {:.3f}', dsym(context, symbol), fill_price)
         
-        remaining_qty -= match_qty
-        
+        # 扣减处理完的份额
+        state['pending_fill_amount'] -= unit
+
     # -----------------------------------------------------------
-    # 余量入库 (Residual Push)
+    # PATH B: 处理【卖出】积累 (Pending Amount is NEGATIVE)
     # -----------------------------------------------------------
-    if remaining_qty > 0.01: # 忽略浮点微小误差
-        my_stack = state['buy_stack'] if is_buy else state['sell_stack']
-        
-        # 入库前查重 (避免同价位堆积)
-        # Buy: price, Sell: -price
-        check_val = fill_price if is_buy else -fill_price
-        
-        if not any(abs(item[0] - check_val) < 1e-5 for item in my_stack):
-            heapq.heappush(my_stack, (check_val, remaining_qty))
-            info('[{}] 📥 [新单入库] {} Qty:{} @ {:.3f}', 
-                 dsym(context, symbol), "买入开多" if is_buy else "卖出开空", remaining_qty, fill_price)
+    while state['pending_fill_amount'] <= -unit * 0.95:
+        # 1. 优先平多 (Check Buy Stack)
+        if state['buy_stack']:
+            # 买单堆栈存的是 (price, unit)，Pop取出最低买价
+            min_buy_p, b_unit = heapq.heappop(state['buy_stack'])
+            
+            # 风控：亏损卖出记录
+            if fill_price < min_buy_p:
+                credit = state.get('credit_limit', 0)
+                if credit > 0:
+                    state['credit_limit'] -= 1
+                    info('[{}] 📉 亏损卖出: 现卖{:.3f} < 原买{:.3f} (剩余额度:{})', 
+                         dsym(context, symbol), fill_price, min_buy_p, state['credit_limit'])
+            
+            pnl = (fill_price - min_buy_p) * unit
+            state['history_pnl'] += pnl
+            info('[{}] ⚖️ [卖出平多] 消耗 BuyStack ({:.3f}), 获利: {:.2f}', dsym(context, symbol), min_buy_p, pnl)
+            
+        # 2. 无多可平 -> 开空 (Push to Sell Stack)
         else:
-             # 如果价格完全一样，可以选择合并数量 (Merge)
-             # 这里为了简单稳健，我们选择合并到现有记录中
-             for i, item in enumerate(my_stack):
-                 if abs(item[0] - check_val) < 1e-5:
-                     my_stack[i] = (item[0], item[1] + remaining_qty)
-                     heapq.heapify(my_stack) # 重新堆化
-                     info('[{}] ➕ [加仓合并] {} Qty:{} 合并入 {:.3f}', 
-                          dsym(context, symbol), "买入" if is_buy else "卖出", remaining_qty, fill_price)
-                     break
+            # 查重：卖单存负数 (-price)
+            if not any(abs((-item[0]) - fill_price) < 1e-5 for item in state['sell_stack']):
+                heapq.heappush(state['sell_stack'], (-fill_price, unit))
+                info('[{}] 📤 [卖出开空] 入库 SellStack ({:.3f})', dsym(context, symbol), fill_price)
+            else:
+                info('[{}] ⚠️ [卖出忽略] SellStack 已存在价位 {:.3f}', dsym(context, symbol), fill_price)
+        
+        # 加回处理完的份额 (负数加正数 = 归零方向)
+        state['pending_fill_amount'] += unit
 
 def on_order_filled(context, symbol, order):
     """
-    [Global Ver: v3.6.0] [Func Ver: 2.1]
-    [Change]: 适配 v3.6.0，调用 process_trade_logic
+    3.5.7 适配：FILL-RECOVER 调用此函数时，重定向至 pending_fill_amount 逻辑
     """
     state = context.state[symbol]
     if order.filled == 0: return
     
-    # 更新冻结
     if order.amount < 0:
         current_frozen = context.pending_frozen.get(symbol, 0)
         context.pending_frozen[symbol] = max(0, current_frozen - abs(order.filled))
 
-    # 直接调用新核心
-    # 注意：order.amount 在 PTrade 回报里可能是正也可能是负，这里我们用 filled (正数) 配合 amount 符号
-    real_amount = order.filled if order.amount > 0 else -order.filled
-    process_trade_logic(context, symbol, order.price, real_amount)
+    state['pending_fill_amount'] += order.amount
+    execute_stack_logic(context, symbol, order.price)
     
-    # info('✅ [{}] 补录成交! 数量: {}, 价格: {:.3f}', dsym(context, symbol), real_amount, order.price)
+    trade_direction = "买入" if order.amount > 0 else "卖出"
+    # info('✅ [{}] 补录成交! 方向: {}, 数量: {}, 价格: {:.3f}', dsym(context, symbol), trade_direction, order.filled, order.price)
+
 # ---------------- FILL-RECOVER ----------------
 
 def _fill_recover_watch(context, symbol, state):
