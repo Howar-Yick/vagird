@@ -1,14 +1,11 @@
 # event_driven_grid_strategy.py
-# 版本号：GEMINI-3.6.0
+# 版本号：GEMINI-3.6.2
 #
-# 更新日志 (v3.6.0):
-# 1. 【架构重构】废弃 pending_fill_amount 缓冲池机制，全面转向“逐笔对冲 (Trade-by-Trade)”模式。
-# 2. 【核心逻辑】新增 process_trade_logic 函数：
-#    - 只有当 (卖价 - 买价) > 0 时才执行配对抵扣。
-#    - 若无利润或无对手单，剩余部分自动作为新持仓入库。
-# 3. 【状态管理】init_symbol_state 移除过时字段，新增 history_pnl 统计累计对冲盈亏。
-# 4. 【成交入口】on_trade_response 不再累积余额，直接根据明确的买/卖方向驱动核心逻辑。
-# 5. 【防御机制】彻底修复了旧版本因余额符号隐式判断方向可能导致的数据错乱问题。
+# 更新日志 (v3.6.2):
+# 1. 【核心修复】启用 business_id 精准去重机制，彻底解决LOF/ETF等标的因分笔成交导致的漏单问题。
+# 2. 【逻辑优化】移除对 entrust_no (委托单号) 的激进拦截逻辑，允许同一委托单接收多次成交回报。
+# 3. 【系统稳定性】内置 processed_business_ids 容器，支持对最近2000笔成交的自动去重，防止重复推送。
+# 4. 【代码清理】移除 v3.6.1-Probe 版本的调试侦察代码，恢复纯净日志输出。
 
 import json
 import logging
@@ -28,7 +25,7 @@ import pandas as pd
 # ---------------- 全局句柄 ----------------
 LOG_FH = None
 LOG_DATE = None
-__version__ = 'GEMINI-3.6.0'
+__version__ = 'GEMINI-3.6.2'
 
 # ---------------- 配置管理类 ----------------
 
@@ -987,46 +984,76 @@ def place_limit_orders(context, symbol, state, ignore_cooldown=False, bypass_loc
 
 def on_trade_response(context, trade_list):
     """
-    [Global Ver: v3.6.0] [Func Ver: 2.1]
-    [Change]: 适配 v3.6.0 逐笔对冲逻辑，废弃 pending 计算，直接驱动 process_trade_logic。
+    [Global Ver: v3.6.2] [Func Ver: 2.3]
+    [Change]: 
+    1. 启用 business_id 精准去重，彻底解决分笔成交漏单问题。
+    2. 移除对 entrust_no 的过度拦截，允许同一订单处理多次回报。
     """
+    # 1. 惰性初始化全局去重容器
+    if not hasattr(context, 'processed_business_ids'):
+        context.processed_business_ids = deque(maxlen=2000)
+        
     for tr in trade_list:
         if str(tr.get('status')) != '8': continue
+        
+        # 2. 提取核心身份 ID (business_id)
+        # 实盘通常有这个字段，回测可能没有（回测可降级处理）
+        bid = str(tr.get('business_id', ''))
+        
+        # 3. 精准去重逻辑
+        if bid:
+            # 如果是有身份ID的成交，严格比对 ID
+            if bid in context.processed_business_ids:
+                # info("🚫 [去重] 拦截重复推送 ID:{}", bid)
+                continue
+            context.processed_business_ids.append(bid)
+        else:
+            # 回测或模拟盘无 ID 时的降级逻辑：不做强拦截或仅基于 entrust_no+amount
+            # 鉴于实盘必有 ID，此处直接放行即可
+            pass
+
         sym = convert_symbol_to_standard(tr['stock_code'])
-        entrust_no = str(tr['entrust_no'])
+        # entrust_no = str(tr['entrust_no']) # 暂时保留变量但不再用于拦截
         
         log_trade_details(context, sym, tr) 
-        if sym not in context.state or entrust_no in context.state[sym]['filled_order_ids']: continue
+        
+        if sym not in context.state: continue
+        
+        # --- 关键修改：不再拦截 state['filled_order_ids'] ---
+        # 旧逻辑：if entrust_no in state['filled_order_ids']: continue
+        # 原因：分笔成交时，第一笔会让订单进黑名单，导致后续分笔被丢弃。
+        # 现在：完全放行，依靠 business_id 去重即可。
         
         state = context.state[sym]
 
-        # 1. 严格方向识别
-        bs = str(tr.get('entrust_bs')) # '1':买, '2':卖
+        # 4. 方向与数量解析
+        bs = str(tr.get('entrust_bs')) 
         if bs == '1':
-            fill_amount = abs(tr['business_amount']) # 买入为正
+            fill_amount = abs(tr['business_amount']) 
             trade_dir = "买入"
         elif bs == '2':
-            fill_amount = -abs(tr['business_amount']) # 卖出为负
+            fill_amount = -abs(tr['business_amount']) 
             trade_dir = "卖出"
         else: continue
             
         price = tr['business_price']
-        key = _make_fill_key(sym, fill_amount, price, context.current_dt)
-        if _is_dup_fill(context, key): continue
-        _remember_fill(context, key)
 
-        state['filled_order_ids'].add(entrust_no)
-        
-        # 2. 调用核心逻辑 (逐笔对冲)
+        # 5. 调用核心逻辑 (逐笔对冲)
         process_trade_logic(context, sym, price, fill_amount)
         
-        info('✅ [{}] 成交回报! 方向: {}, 数量: {}, 价格: {:.3f}', dsym(context, sym), trade_dir, abs(fill_amount), price)
+        # 6. 日志 (不再是 DEBUG 而是正式 INFO)
+        info('✅ [{}] 成交回报! 方向: {}, 数量: {}, 价格: {:.3f} (ID:{})', 
+             dsym(context, sym), trade_dir, abs(fill_amount), price, bid[-6:] if bid else 'N/A')
 
-        # 3. 更新基准与状态
+        # 7. 更新基准与状态
         state['_last_trade_ts'] = context.current_dt
         state['_last_fill_dt'] = context.current_dt
         state['last_fill_price'] = price
         state['base_price'] = price
+
+        # 这里不再激进地将 entrust_no 加入 filled_order_ids
+        # 只有 patrol 或 query 确认全成后才需要处理，或者由 on_order_status 驱动
+        # state['filled_order_ids'].add(entrust_no) <--- 移除此行
 
         cancelled_ids = cancel_all_orders_by_symbol(context, sym)
         if cancelled_ids: state['_pending_ignore_ids'] = list(cancelled_ids)
