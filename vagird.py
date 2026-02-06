@@ -1,11 +1,11 @@
 # event_driven_grid_strategy.py
-# 版本号：GEMINI-3.6.2
+# 版本号：GEMINI-3.6.3
 #
-# 更新日志 (v3.6.2):
-# 1. 【核心修复】启用 business_id 精准去重机制，彻底解决LOF/ETF等标的因分笔成交导致的漏单问题。
-# 2. 【逻辑优化】移除对 entrust_no (委托单号) 的激进拦截逻辑，允许同一委托单接收多次成交回报。
-# 3. 【系统稳定性】内置 processed_business_ids 容器，支持对最近2000笔成交的自动去重，防止重复推送。
-# 4. 【代码清理】移除 v3.6.1-Probe 版本的调试侦察代码，恢复纯净日志输出。
+# 更新日志 (v3.6.3):
+# 1. 【核心功能】新增“主动查单补录”机制 (Fill Patrol)，定时核对订单实际成交量，自动修复漏单。
+# 2. 【状态追踪】新增 _fill_tracker 状态字段，实时跟踪每个委托单的已处理数量。
+# 3. 【下单优化】place_limit_orders 现在会捕获委托编号并初始化追踪器，闭环了订单生命周期。
+# 4. 【系统健壮性】on_trade_response 与 Patrol 双向校验，彻底杜绝因网络丢包或合并回报导致的数据不一致。
 
 import json
 import logging
@@ -25,7 +25,7 @@ import pandas as pd
 # ---------------- 全局句柄 ----------------
 LOG_FH = None
 LOG_DATE = None
-__version__ = 'GEMINI-3.6.2'
+__version__ = 'GEMINI-3.6.3'
 
 # ---------------- 配置管理类 ----------------
 
@@ -381,8 +381,8 @@ def initialize(context):
 
 def init_symbol_state(context, sym, cfg):
     """
-    [Global Ver: v3.6.0] [Func Ver: 2.1]
-    [Change]: 移除 pending_fill_amount，全面转向逐笔对冲逻辑。
+    [Global Ver: v3.6.3] [Func Ver: 2.2]
+    [Change]: 新增 _fill_tracker 用于成交量核对
     """
     state_file = research_path('state', f'{sym}.json')
     saved = json.loads(state_file.read_text(encoding='utf-8')) if state_file.exists() else get_saved_param(f'state_{sym}', {}) or {}
@@ -405,8 +405,8 @@ def init_symbol_state(context, sym, cfg):
         'buy_stack': [],
         'sell_stack': [],
         'credit_limit': cfg.get('credit_limit', saved.get('credit_limit', StrategyConfig.CREDIT_LIMIT)),
-        # 'pending_fill_amount': 0,  <-- 已废弃
-        'history_pnl': saved.get('history_pnl', 0.0), # 新增：累计平仓盈亏
+        '_fill_tracker': saved.get('_fill_tracker', {}), # 新增：订单成交量追踪
+        'history_pnl': saved.get('history_pnl', 0.0),
         'va_last_update_dt': None,
         '_halt_next_log_dt': None,
         '_oo_last': 0,
@@ -420,7 +420,6 @@ def init_symbol_state(context, sym, cfg):
         '_pending_ignore_ids': []
     })
 
-    # 堆栈数据结构升级
     for key in ['buy_stack', 'sell_stack']:
         raw = saved.get(key, [])
         for item in raw:
@@ -430,7 +429,6 @@ def init_symbol_state(context, sym, cfg):
                 st[key].append((item, st['grid_unit']))
         heapq.heapify(st[key])
 
-    # 清理废弃字段
     for k in ['scale_factor', 'pending_fill_amount']:
         if k in st: st.pop(k)
         
@@ -872,10 +870,8 @@ def place_limit_orders(context, symbol, state, ignore_cooldown=False, bypass_loc
     buy_p, sell_p = round(base * (1 - buy_sp), 3), round(base * (1 + sell_sp), 3)
     if not is_valid_price(buy_p) or not is_valid_price(sell_p): return
 
-    # 1. 全双工风控应用
     buy_p, sell_p = _apply_price_guard(context, state, buy_p, sell_p, buy_sp, sell_sp)
 
-    # 2. 涨跌停物理空间过滤
     up_limit = state.get('_up_limit')
     down_limit = state.get('_down_limit')
     can_place_buy = True
@@ -945,10 +941,14 @@ def place_limit_orders(context, symbol, state, ignore_cooldown=False, bypass_loc
         state['_oo_last'] = len(open_orders)
         state['_last_pos_seen'] = pos 
 
-        # 发起买入 (增加空间检查和错误熔断)
+        # 初始化 tracker
+        if '_fill_tracker' not in state: state['_fill_tracker'] = {}
+
         if can_place_buy and not same_buy and pos + unit <= state['max_position']:
             try:
-                order(symbol, unit, limit_price=buy_p)
+                # 关键修改：捕获委托号并初始化追踪器
+                eid = order(symbol, unit, limit_price=buy_p)
+                if eid: state['_fill_tracker'][str(eid)] = 0.0
                 info('[{}] --> 发起买入委托: {}股 @ {:.3f}', dsym(context, symbol), unit, buy_p)
             except Exception as e:
                 err_str = str(e)
@@ -957,14 +957,15 @@ def place_limit_orders(context, symbol, state, ignore_cooldown=False, bypass_loc
                     state['_last_trade_ts'] = now_dt + timedelta(seconds=60)
                 else: raise e
 
-        # 发起卖出 (增加空间检查和错误熔断)
         can_sell = not same_sell
         pending_frozen = context.pending_frozen.get(symbol, 0)
         real_enable = enable_amount - pending_frozen
         
         if can_place_sell and can_sell and real_enable >= unit and pos - unit >= state['base_position']:
             try:
-                order(symbol, -unit, limit_price=sell_p)
+                # 关键修改：捕获委托号并初始化追踪器
+                eid = order(symbol, -unit, limit_price=sell_p)
+                if eid: state['_fill_tracker'][str(eid)] = 0.0
                 info('[{}] --> 发起卖出委托: {}股 @ {:.3f} (可用:{}, 冻结:{})', dsym(context, symbol), unit, sell_p, enable_amount, pending_frozen)
                 context.pending_frozen[symbol] = pending_frozen + unit
             except Exception as e:
@@ -984,49 +985,27 @@ def place_limit_orders(context, symbol, state, ignore_cooldown=False, bypass_loc
 
 def on_trade_response(context, trade_list):
     """
-    [Global Ver: v3.6.2] [Func Ver: 2.3]
-    [Change]: 
-    1. 启用 business_id 精准去重，彻底解决分笔成交漏单问题。
-    2. 移除对 entrust_no 的过度拦截，允许同一订单处理多次回报。
+    [Global Ver: v3.6.3] [Func Ver: 2.4]
+    [Change]: 配合 Fill Patrol 机制，更新 _fill_tracker 进度。
     """
-    # 1. 惰性初始化全局去重容器
     if not hasattr(context, 'processed_business_ids'):
         context.processed_business_ids = deque(maxlen=2000)
         
     for tr in trade_list:
         if str(tr.get('status')) != '8': continue
         
-        # 2. 提取核心身份 ID (business_id)
-        # 实盘通常有这个字段，回测可能没有（回测可降级处理）
         bid = str(tr.get('business_id', ''))
-        
-        # 3. 精准去重逻辑
         if bid:
-            # 如果是有身份ID的成交，严格比对 ID
-            if bid in context.processed_business_ids:
-                # info("🚫 [去重] 拦截重复推送 ID:{}", bid)
-                continue
+            if bid in context.processed_business_ids: continue
             context.processed_business_ids.append(bid)
-        else:
-            # 回测或模拟盘无 ID 时的降级逻辑：不做强拦截或仅基于 entrust_no+amount
-            # 鉴于实盘必有 ID，此处直接放行即可
-            pass
 
         sym = convert_symbol_to_standard(tr['stock_code'])
-        # entrust_no = str(tr['entrust_no']) # 暂时保留变量但不再用于拦截
-        
+        entrust_no = str(tr['entrust_no'])
         log_trade_details(context, sym, tr) 
         
         if sym not in context.state: continue
-        
-        # --- 关键修改：不再拦截 state['filled_order_ids'] ---
-        # 旧逻辑：if entrust_no in state['filled_order_ids']: continue
-        # 原因：分笔成交时，第一笔会让订单进黑名单，导致后续分笔被丢弃。
-        # 现在：完全放行，依靠 business_id 去重即可。
-        
         state = context.state[sym]
 
-        # 4. 方向与数量解析
         bs = str(tr.get('entrust_bs')) 
         if bs == '1':
             fill_amount = abs(tr['business_amount']) 
@@ -1038,22 +1017,21 @@ def on_trade_response(context, trade_list):
             
         price = tr['business_price']
 
-        # 5. 调用核心逻辑 (逐笔对冲)
+        # 1. 核心处理
         process_trade_logic(context, sym, price, fill_amount)
         
-        # 6. 日志 (不再是 DEBUG 而是正式 INFO)
+        # 2. 更新追踪器 (累计已处理数量)
+        if '_fill_tracker' not in state: state['_fill_tracker'] = {}
+        state['_fill_tracker'][entrust_no] = state['_fill_tracker'].get(entrust_no, 0.0) + abs(fill_amount)
+        
         info('✅ [{}] 成交回报! 方向: {}, 数量: {}, 价格: {:.3f} (ID:{})', 
              dsym(context, sym), trade_dir, abs(fill_amount), price, bid[-6:] if bid else 'N/A')
 
-        # 7. 更新基准与状态
+        # 3. 状态更新
         state['_last_trade_ts'] = context.current_dt
         state['_last_fill_dt'] = context.current_dt
         state['last_fill_price'] = price
         state['base_price'] = price
-
-        # 这里不再激进地将 entrust_no 加入 filled_order_ids
-        # 只有 patrol 或 query 确认全成后才需要处理，或者由 on_order_status 驱动
-        # state['filled_order_ids'].add(entrust_no) <--- 移除此行
 
         cancelled_ids = cancel_all_orders_by_symbol(context, sym)
         if cancelled_ids: state['_pending_ignore_ids'] = list(cancelled_ids)
@@ -1278,6 +1256,53 @@ def _fill_recover_watch(context, symbol, state):
 
 def patrol_and_correct_orders(context, symbol, state):
     now_dt = context.current_dt
+    # 主动补录逻辑 (Fill Patrol)
+    if is_main_trading_time():
+        try:
+            # 1. 获取该标的的所有当日委托 (包括已成交和未成交)
+            # 注意: PTrade get_orders 返回当日所有委托
+            all_orders = get_orders(symbol) or []
+            tracker = state.get('_fill_tracker', {})
+            
+            for o in all_orders:
+                o_info = OrderUtils.normalize(o)
+                eid = o_info['entrust_no']
+                filled_qty = o.filled # 实际成交量
+                
+                # 如果是废单或未成交，跳过
+                if filled_qty <= 0: continue
+                
+                # 检查是否存在记录
+                if eid not in tracker:
+                    # 这是一个新发现的单子 (可能是重启前下的，或者手动下的)
+                    # 稳妥起见，我们假设它已经是“旧账”，直接对齐，不触发逻辑，避免重复计算
+                    # 除非您非常确定重启会丢失状态，否则“认账”是安全的
+                    tracker[eid] = float(filled_qty)
+                    continue
+                    
+                processed_qty = tracker[eid]
+                delta = filled_qty - processed_qty
+                
+                # 发现漏单！(实际成交 > 已处理)
+                if delta > 0.9: # 忽略浮点误差
+                    trade_price = o.trade_price if o.trade_price > 0 else o.price
+                    direction = 1 if not OrderUtils.is_sell(o_info) else -1
+                    real_amount = delta * direction
+                    
+                    info('👮 [补录] 发现漏单! ID:{} 漏:{} (总成:{} vs 已记:{})', eid, delta, filled_qty, processed_qty)
+                    
+                    # 补录核心逻辑
+                    process_trade_logic(context, symbol, trade_price, real_amount)
+                    
+                    # 更新账本
+                    tracker[eid] = float(filled_qty)
+                    state['history_pnl'] = state.get('history_pnl', 0.0) # 触发保存
+                    
+            state['_fill_tracker'] = tracker
+        except Exception as e:
+            info('[{}] ⚠️ FillPatrol 异常: {}', dsym(context, symbol), e)
+
+    # ... (以下是原有的巡检逻辑，保持不变) ...
     if state.get('_last_trade_ts') and (now_dt - state['_last_trade_ts']).total_seconds() < 58: return
     if not (is_main_trading_time() and now_dt.time() < dtime(14, 55)): return 
     if context.mark_halted.get(symbol, False): return 
@@ -1305,13 +1330,13 @@ def patrol_and_correct_orders(context, symbol, state):
         
         should_have_buy_order = (pos + unit <= max_pos)
         if is_valid_price(down_limit) and buy_p < down_limit:
-            should_have_buy_order = False # 跌停时，巡检不再认为缺失买单
+            should_have_buy_order = False 
 
         pending_frozen = context.pending_frozen.get(symbol, 0)
         real_enable = enable_amount - pending_frozen
         should_have_sell_order = (real_enable >= unit and pos - unit >= base_pos)
         if is_valid_price(up_limit) and sell_p > up_limit:
-            should_have_sell_order = False # 涨停时，巡检不再认为缺失卖单
+            should_have_sell_order = False 
 
         orders_to_cancel = []
         valid_buy_orders = []
