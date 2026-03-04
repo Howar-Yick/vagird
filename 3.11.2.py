@@ -1,14 +1,13 @@
 # event_driven_grid_strategy.py
-# 版本号：GEMINI-3.11.3
+# 版本号：GEMINI-3.11.2
 #
-# 更新日志 (v3.11.3 Hotfix):
-# 1. 【实盘热修】根治影子棘轮触发后的“网格假死” (Ratchet Race Condition Fix): 
-#    - 痛点：影子棘轮触发并下达撤单指令后，由于券商API存在撤单状态延迟，紧随其后的挂单巡检会误认“盘口仍有旧单”从而放弃挂单；且由于基准价已更新，防刷屏机制导致策略陷入长期的“不撤不挂”假死状态。
-#    - 修复：重构棘轮触发后的执行流。在棘轮生效并撤单后，立即中断当前主干（强制 return），并将重新排布网格的任务移交给“异步补单状态机” (`_rehang_due_ts`)。通过硬性延迟2秒，完美避开 API 状态不同步期，确保新网格 100% 挂出。
-# 2. (v3.11.2 回顾): 重构部成逻辑，保护盘口排队优先级；修复撤单竞态异常报错。
-# 3. (v3.11.1 回顾): 拦截券商底层 API “幽灵 0 价格”脏数据污染。
-# 4. (v3.11.0 回顾): 创设 影子棘轮 (Ghost Ratchet) 机制。
-
+# 更新日志 (v3.11.2 订单流高级管理):
+# 1. 【排队优先级保护】重构部成逻辑 (Partial-Fill Retention):
+#    - 痛点：原逻辑在订单部分成交 (Status 7) 时会触发全局重算并撤单，导致剩余委托丧失盘口排队优先级。
+#    - 修复：现对部成单实行“静默消化”。部成回报仅更新本地筹码栈与 PnL，不移动网格基准价 (base_price)，亦不触发撤单，使得剩余委托能在盘口继续抢量成交，大幅减小滑点。
+# 2. 【API报错静音】根治撤单竞态异常 (Race Condition Fix):
+#    - 痛点：券商行情接口缓存延迟，导致订单全成后 `get_open_orders` 依然视其为存活，策略发起撤单触发 `[251020][委托状态错误]` 报错。
+#    - 修复：在接收到全成回报 (Status 8) 瞬间，通过内存级抢先注入 `filled_order_ids` 死亡名单，直接免疫 API 延迟带来的误判撤单。
 
 import json
 import logging
@@ -28,7 +27,7 @@ import pandas as pd
 # ---------------- 全局句柄 ----------------
 LOG_FH = None
 LOG_DATE = None
-__version__ = 'GEMINI-3.11.3'
+__version__ = 'GEMINI-3.11.2'
 
 # ---------------- 配置管理类 ----------------
 
@@ -1065,32 +1064,24 @@ def place_limit_orders(context, symbol, state, ignore_cooldown=False, bypass_loc
             if ratchet_up:
                 info('[{}] 🚀 影子棘轮上移(拦截/空仓): 触及理论卖价 {:.3f}，基准抬至 {:.3f}', dsym(context, symbol), theo_sell_p, theo_sell_p)
                 state['base_price'] = theo_sell_p
-                cancelled_ids = cancel_all_orders_by_symbol(context, symbol)
-                if cancelled_ids: state['_pending_ignore_ids'] = list(cancelled_ids)
+                cancel_all_orders_by_symbol(context, symbol)
                 
-                # 核心修复：把接力棒交给异步补单机制，延迟 2 秒让 API 消化撤单
-                delay_s = StrategyConfig.DEBUG.DELAY_AFTER_CANCEL
-                state['_rehang_due_ts'] = datetime.now() + timedelta(seconds=max(delay_s, 2.0))
-                
-                state.pop('_last_order_ts', None)
-                state.pop('_last_order_bp', None)
-                safe_save_state(symbol, state)
-                return  # 直接返回，不往下执行了
+                # 重算
+                buy_p = round(theo_sell_p * (1 - buy_sp), 3)
+                sell_p = round(theo_sell_p * (1 + sell_sp), 3)
+                # 再次守门，传入 VA 特权
+                buy_p, sell_p = _apply_price_guard(context, state, buy_p, sell_p, buy_sp, sell_sp, bypass_buy_block)
                 
             elif ratchet_down:
                 info('[{}] ⚓ 影子棘轮下移(拦截/满仓): 触及理论买价 {:.3f}，基准降至 {:.3f}', dsym(context, symbol), theo_buy_p, theo_buy_p)
                 state['base_price'] = theo_buy_p
-                cancelled_ids = cancel_all_orders_by_symbol(context, symbol)
-                if cancelled_ids: state['_pending_ignore_ids'] = list(cancelled_ids)
+                cancel_all_orders_by_symbol(context, symbol)
                 
-                # 核心修复：把接力棒交给异步补单机制
-                delay_s = StrategyConfig.DEBUG.DELAY_AFTER_CANCEL
-                state['_rehang_due_ts'] = datetime.now() + timedelta(seconds=max(delay_s, 2.0))
-                
-                state.pop('_last_order_ts', None)
-                state.pop('_last_order_bp', None)
-                safe_save_state(symbol, state)
-                return  # 直接返回，不往下执行了
+                # 重算
+                buy_p = round(theo_buy_p * (1 - buy_sp), 3)
+                sell_p = round(theo_buy_p * (1 + sell_sp), 3)
+                # 再次守门，传入 VA 特权
+                buy_p, sell_p = _apply_price_guard(context, state, buy_p, sell_p, buy_sp, sell_sp, bypass_buy_block)
 
     if not ignore_cooldown:
         last_ts = state.get('_last_order_ts')

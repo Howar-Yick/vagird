@@ -1,13 +1,16 @@
 # event_driven_grid_strategy.py
-# 版本号：GEMINI-3.11.3
+# 版本号：GEMINI-3.12.0
 #
-# 更新日志 (v3.11.3 Hotfix):
-# 1. 【实盘热修】根治影子棘轮触发后的“网格假死” (Ratchet Race Condition Fix): 
-#    - 痛点：影子棘轮触发并下达撤单指令后，由于券商API存在撤单状态延迟，紧随其后的挂单巡检会误认“盘口仍有旧单”从而放弃挂单；且由于基准价已更新，防刷屏机制导致策略陷入长期的“不撤不挂”假死状态。
-#    - 修复：重构棘轮触发后的执行流。在棘轮生效并撤单后，立即中断当前主干（强制 return），并将重新排布网格的任务移交给“异步补单状态机” (`_rehang_due_ts`)。通过硬性延迟2秒，完美避开 API 状态不同步期，确保新网格 100% 挂出。
-# 2. (v3.11.2 回顾): 重构部成逻辑，保护盘口排队优先级；修复撤单竞态异常报错。
-# 3. (v3.11.1 回顾): 拦截券商底层 API “幽灵 0 价格”脏数据污染。
-# 4. (v3.11.0 回顾): 创设 影子棘轮 (Ghost Ratchet) 机制。
+# 更新日志 (v3.12.0 终极收割者):
+# 1. 【宏观止盈】引入 三阶移动回撤止盈机制 (Tiered Trailing Stop):
+#    - 以券商系统持仓成本为基准，利用 ATR 动态测算大趋势股性。
+#    - 设定 10倍/20倍/30倍 ATR 为一/二/三阶激活阈值，配合从最高点回撤 5%/8%/10% 的扣动扳机，分别切断 1/3、1/2 和 100% 的底仓，实现“吃尽主升浪，次高点落袋”。
+# 2. 【资产配置】引入 VA 断代重置与 ATR 倒数滴灌周期 (Dynamic Drip Reinvestment):
+#    - 触发止盈后，立即将 VA（价值平均）目标线坍塌对齐至剩余底仓，清空定投记忆，彻底杜绝网格在止盈后“高位强行买回”的系统级冲突。
+#    - 止盈释放的现金，将基于 `0.5 / ATR` 的倒数公式计算动态周期（如科技股20周，红利股50周），平滑叠加至未来的每周定投额中，将利润化为下一次底位吸筹的猛烈火力。
+# 3. 【多空隔离】引入 止盈大单物理隔离机制:
+#    - 通过 `_macro_sell_ids` 单号记录，使止盈卖单对 `process_trade_logic` 隐身，防止其被当作网格空单压入堆栈，保障底层网格阵型的纯净。
+
 
 
 import json
@@ -28,7 +31,7 @@ import pandas as pd
 # ---------------- 全局句柄 ----------------
 LOG_FH = None
 LOG_DATE = None
-__version__ = 'GEMINI-3.11.3'
+__version__ = 'GEMINI-3.12.0'
 
 # ---------------- 配置管理类 ----------------
 
@@ -311,13 +314,18 @@ def is_valid_price(x):
 # ---------------- 状态保存 ----------------
 
 def save_state(symbol, state):
+    """
+    [Global Ver: v3.12.0] [Func Ver: 2.0]
+    [Change]: 添加宏观止盈及VA滴灌所需的核心持久化变量 (dingtou_base, _tp_hwm_ratio等)。
+    """
     ids = list(state.get('filled_order_ids', set()))
     state['filled_order_ids'] = set(ids[-StrategyConfig.MAX_SAVED_FILLED_IDS:])
     
-    # [v3.6.4 Fix]: 加入 _fill_tracker，确保补录进度持久化
+    # [V3.12.0 增补]: 添加宏观止盈所需的核心持久化变量
     store_keys = ['symbol', 'base_price', 'grid_unit', 'max_position', 'last_week_position', 'base_position', 
                   'used_atr_rate', 'cached_atr_ema', 'buy_stack', 'sell_stack', 'credit_limit', 
-                  'history_pnl', '_fill_tracker'] 
+                  'history_pnl', '_fill_tracker', 
+                  'dingtou_base', 'dingtou_rate', '_tp_hwm_ratio', '_tp_tier', '_macro_sell_ids'] 
     
     store = {k: state.get(k) for k in store_keys}
     
@@ -392,12 +400,12 @@ def initialize(context):
     
     info('✅ 初始化完成，版本:{}', __version__)
 
-# ---------------- 初始化状态辅助函数 (3.5.7) ----------------
+# ---------------- 初始化状态辅助函数 ----------------
 
 def init_symbol_state(context, sym, cfg):
     """
-    [Global Ver: v3.6.3] [Func Ver: 2.2]
-    [Change]: 新增 _fill_tracker 用于成交量核对
+    [Global Ver: v3.12.0] [Func Ver: 3.0]
+    [Change]: 新增 dingtou_base 暴露，以及 _tp_hwm_ratio, _tp_tier, _macro_sell_ids 状态初始化。
     """
     state_file = research_path('state', f'{sym}.json')
     saved = json.loads(state_file.read_text(encoding='utf-8')) if state_file.exists() else get_saved_param(f'state_{sym}', {}) or {}
@@ -405,6 +413,8 @@ def init_symbol_state(context, sym, cfg):
     st = {**cfg}
     st.update({
         'symbol': sym, 
+        'dingtou_base': saved.get('dingtou_base', cfg.get('dingtou_base', 0)), # [V3.12.0] 暴露定投基数
+        'dingtou_rate': saved.get('dingtou_rate', cfg.get('dingtou_rate', 0)), # [V3.12.0] 暴露定投比率
         'base_price': saved.get('base_price', cfg['base_price']),
         'grid_unit': saved.get('grid_unit', cfg['grid_unit']),
         'filled_order_ids': set(saved.get('filled_order_ids', [])),
@@ -420,8 +430,11 @@ def init_symbol_state(context, sym, cfg):
         'buy_stack': [],
         'sell_stack': [],
         'credit_limit': cfg.get('credit_limit', saved.get('credit_limit', StrategyConfig.CREDIT_LIMIT)),
-        '_fill_tracker': saved.get('_fill_tracker', {}), # 新增：订单成交量追踪
+        '_fill_tracker': saved.get('_fill_tracker', {}), 
         'history_pnl': saved.get('history_pnl', 0.0),
+        '_tp_hwm_ratio': saved.get('_tp_hwm_ratio', 0.0), # [V3.12.0] 宏观止盈: 最高盈利率
+        '_tp_tier': saved.get('_tp_tier', 0),             # [V3.12.0] 宏观止盈: 当前防线阶梯
+        '_macro_sell_ids': saved.get('_macro_sell_ids', []), # [V3.12.0] 宏观止盈: 被隔离的单号
         'va_last_update_dt': None,
         '_halt_next_log_dt': None,
         '_oo_last': 0,
@@ -1164,9 +1177,8 @@ def place_limit_orders(context, symbol, state, ignore_cooldown=False, bypass_loc
 
 def on_trade_response(context, trade_list):
     """
-    [Global Ver: v3.11.2]
-    1. 修复由于PTrade状态延迟导致“对已成订单发起撤单”报 [251020] 错误的问题。
-    2. 优化部成 (Status 7) 逻辑：部成时不再立刻撤单重排，保留剩余挂单继续排队成交。
+    [Global Ver: v3.12.0] [Func Ver: 3.0]
+    [Change]: 加入对宏观止盈大单的物理隔离(is_macro_sell)，防止其被误认为网格卖单压入堆栈。
     """
     if not hasattr(context, 'processed_business_ids'):
         context.processed_business_ids = deque(maxlen=2000)
@@ -1177,14 +1189,12 @@ def on_trade_response(context, trade_list):
         
         bid = str(tr.get('business_id', ''))
         
-        # 精准去重逻辑
         if bid:
             if bid in context.processed_business_ids: continue
             context.processed_business_ids.append(bid)
         else:
             pass 
 
-        # [Bug Fix] 拦截券商推送的 0 数量/ 0 价格的幽灵回报
         raw_amount = tr.get('business_amount', 0)
         raw_price = tr.get('business_price', 0)
         
@@ -1211,32 +1221,35 @@ def on_trade_response(context, trade_list):
         price = float(raw_price)
         entrust_no = str(tr.get('entrust_no', ''))
 
-        # 调用核心逻辑：记录筹码与 PnL (即使部成，筹码也会完美对齐)
-        process_trade_logic(context, sym, price, fill_amount)
+        # ==========================================
+        # [v3.12.0] 多空物理隔离：如果是宏观止盈单，不走网格对冲逻辑
+        # ==========================================
+        is_macro_sell = entrust_no in state.get('_macro_sell_ids', [])
         
-        # 更新追踪器
+        if not is_macro_sell:
+            process_trade_logic(context, sym, price, fill_amount)
+        else:
+            info('📦 [{}] 宏观止盈大单斩获成交! (ID:{}, 股数:{})，跳过底层网格堆栈记录。', dsym(context, sym), entrust_no[-6:], abs(fill_amount))
+
         if '_fill_tracker' not in state: state['_fill_tracker'] = {}
         if entrust_no:
             state['_fill_tracker'][entrust_no] = state['_fill_tracker'].get(entrust_no, 0.0) + abs(fill_amount)
         
-        info('✅ [{}] 成交回报! 方向: {}, 数量: {}, 价格: {:.3f} (ID:{}, Sts:{})', 
-             dsym(context, sym), trade_dir, abs(fill_amount), price, bid[-6:] if bid else 'N/A', status)
+        if not is_macro_sell:
+            info('✅ [{}] 成交回报! 方向: {}, 数量: {}, 价格: {:.3f} (ID:{}, Sts:{})', 
+                 dsym(context, sym), trade_dir, abs(fill_amount), price, bid[-6:] if bid else 'N/A', status)
 
-        # ==========================================
-        # [v3.11.2 核心升级] 区分全成与部成，保护排队优先级
-        # ==========================================
         is_fully_filled = (status == '8')
 
         if is_fully_filled:
-            # 【解决问题1】提前将已成单号加入免检集合，防止下方 cancel_all 时受 API 延迟影响引发 251020 报错
             if entrust_no:
                 state['filled_order_ids'].add(entrust_no)
 
-            # 更新状态：全成时才推移基准价
-            state['_last_trade_ts'] = context.current_dt
-            state['_last_fill_dt'] = context.current_dt
-            state['last_fill_price'] = price
-            state['base_price'] = price
+            if not is_macro_sell:
+                state['_last_trade_ts'] = context.current_dt
+                state['_last_fill_dt'] = context.current_dt
+                state['last_fill_price'] = price
+                state['base_price'] = price
 
             cancelled_ids = cancel_all_orders_by_symbol(context, sym)
             if cancelled_ids: state['_pending_ignore_ids'] = list(cancelled_ids)
@@ -1253,8 +1266,8 @@ def on_trade_response(context, trade_list):
             state.pop('_last_order_bp', None)
             context.should_place_order_map[sym] = True
         else:
-            # 【解决问题2】部成 (Status 7) 不撤单、不改基准价，让它继续在盘口抢占位置
-            info('⏳ [{}] 订单部成 (ID:{}), 仅记录筹码, 基准价保持不变, 剩余挂单继续排队...', dsym(context, sym), entrust_no)
+            if not is_macro_sell:
+                info('⏳ [{}] 订单部成 (ID:{}), 仅记录筹码, 基准价保持不变, 剩余挂单继续排队...', dsym(context, sym), entrust_no)
         
         try: state['_last_pos_seen'] = get_position(sym).amount
         except: state['_last_pos_seen'] = None
@@ -1493,26 +1506,22 @@ def _fill_recover_watch(context, symbol, state):
 
 def patrol_and_correct_orders(context, symbol, state):
     """
-    [Global Ver: v3.8.0]
-    主动巡检，同步接入 VA特权 判定，防止巡检机制误撤带有特权的买单。
+    [Global Ver: v3.12.0] [Func Ver: 3.0]
+    [Change]: 巡检漏单补录及废单清理逻辑中，增加对宏观大单(_macro_sell_ids)的免伤隔离。
     """
     now_dt = context.current_dt
-    # 主动补录逻辑 (Fill Patrol)
     if is_main_trading_time():
         try:
-            # 1. 获取该标的的所有当日委托 (包括已成交和未成交)
             all_orders = get_orders(symbol) or []
             tracker = state.get('_fill_tracker', {})
             
             for o in all_orders:
                 o_info = OrderUtils.normalize(o)
                 eid = o_info['entrust_no']
-                filled_qty = o.filled # 实际成交量
+                filled_qty = o.filled 
                 
-                # 如果是废单或未成交，跳过
                 if filled_qty <= 0: continue
                 
-                # 检查是否存在记录
                 if eid not in tracker:
                     tracker[eid] = float(filled_qty)
                     continue
@@ -1520,26 +1529,26 @@ def patrol_and_correct_orders(context, symbol, state):
                 processed_qty = tracker[eid]
                 delta = filled_qty - processed_qty
                 
-                # 发现漏单！(实际成交 > 已处理)
-                if delta > 0.9: # 忽略浮点误差
+                if delta > 0.9: 
                     trade_price = o.trade_price if o.trade_price > 0 else o.price
                     direction = 1 if not OrderUtils.is_sell(o_info) else -1
                     real_amount = delta * direction
                     
-                    info('🕵️ [补录] 发现漏单! ID:{} 漏:{} (总成:{} vs 已记:{})', eid, delta, filled_qty, processed_qty)
+                    info('🕵️ [{}] [补录] 发现漏单! 漏:{} (总成:{} vs 已记:{})', dsym(context, symbol), delta, filled_qty, processed_qty)
                     
-                    # 补录核心逻辑
-                    process_trade_logic(context, symbol, trade_price, real_amount)
+                    # [V3.12.0] 如果是宏观止盈单，漏单补录也不入网格账本
+                    if eid in state.get('_macro_sell_ids', []):
+                         info('📦 [{}] 补录判定为宏观止盈单，跳过入栈。', dsym(context, symbol))
+                    else:
+                         process_trade_logic(context, symbol, trade_price, real_amount)
                     
-                    # 更新账本
                     tracker[eid] = float(filled_qty)
-                    state['history_pnl'] = state.get('history_pnl', 0.0) # 触发保存
+                    state['history_pnl'] = state.get('history_pnl', 0.0) 
                     
             state['_fill_tracker'] = tracker
         except Exception as e:
             info('[{}] ⚠️ FillPatrol 异常: {}', dsym(context, symbol), e)
 
-    # 巡检冷却与状态检查
     if state.get('_last_trade_ts') and (now_dt - state['_last_trade_ts']).total_seconds() < 58: return
     if not (is_main_trading_time() and now_dt.time() < dtime(14, 55)): return 
     if context.mark_halted.get(symbol, False): return 
@@ -1559,13 +1568,9 @@ def patrol_and_correct_orders(context, symbol, state):
         buy_p = round(base_price * (1 - buy_sp), 3)
         sell_p = round(base_price * (1 + sell_sp), 3)
         
-        # [v3.8 同步升级] -----------------------------------------------
-        # 判定 VA 特权，防止巡检系统误撤特权单
         bypass_buy_block = (pos < base_pos + 5 * unit)
         buy_p, sell_p = _apply_price_guard(context, state, buy_p, sell_p, buy_sp, sell_sp, bypass_buy_block)
-        # ---------------------------------------------------------------
 
-        # 巡检逻辑同步空间限制
         up_limit = state.get('_up_limit')
         down_limit = state.get('_down_limit')
         
@@ -1595,6 +1600,9 @@ def patrol_and_correct_orders(context, symbol, state):
                 elif abs(o_price - buy_p) / (buy_p + 1e-9) >= 0.002: is_wrong = True 
                 else: valid_buy_orders.append(o)
             else: 
+                # [V3.12.0] 宏观大单不属于被巡检撤销的范围，直接无视
+                if entrust_no in state.get('_macro_sell_ids', []): continue
+                
                 if not should_have_sell_order: is_wrong = True 
                 elif abs(o_price - sell_p) / (sell_p + 1e-9) >= 0.002: is_wrong = True 
                 else: valid_sell_orders.append(o)
@@ -1643,15 +1651,127 @@ def patrol_and_correct_orders(context, symbol, state):
 
         if (should_have_buy_order and not has_correct_buy_order) or \
            (should_have_sell_order and not has_correct_sell_order):
-            info('[{}] 🛡️ PATROL: 发现缺失订单，准备补挂...', dsym(context, symbol))
             place_limit_orders(context, symbol, state, ignore_cooldown=True)
 
     except Exception as e:
         info('[{}] ⚠️ PATROL 巡检失败: {}', dsym(context, symbol), e)
 
+# ---------------- 【核心】宏观止盈引擎 ----------------
+
+def _check_macro_take_profit(context, symbol, state, price):
+    """
+    [Global Ver: v3.12.0] [Func Ver: 1.0]
+    [New]: 三阶移动回撤止盈引擎。基于券商持仓成本与动态ATR探测趋势，在次高点锁定利润；
+           执行VA断代重置，并计算ATR倒数实行资金滴灌。
+    """
+    if not is_main_trading_time(): return
+    
+    position = get_position(symbol)
+    if not position or position.amount <= 0: return
+    
+    cost = position.cost_basis
+    if cost <= 0: return
+    
+    # 绝对利润率
+    profit_ratio = (price - cost) / cost
+    
+    # 获取ATR (动态股性探测)
+    atr = calculate_atr(context, symbol)
+    if not atr or atr <= 0: atr = 0.02
+    
+    # 获取状态
+    hwm = state.get('_tp_hwm_ratio', 0.0)
+    tier = state.get('_tp_tier', 0)
+    
+    # 推高水位线
+    if profit_ratio > hwm:
+        state['_tp_hwm_ratio'] = profit_ratio
+        hwm = profit_ratio
+        
+    # 阶梯晋升判定 (只升不降)
+    if profit_ratio >= 30 * atr:
+        state['_tp_tier'] = 3
+    elif profit_ratio >= 20 * atr and tier < 3:
+        state['_tp_tier'] = 2
+    elif profit_ratio >= 10 * atr and tier < 2:
+        state['_tp_tier'] = 1
+        
+    current_tier = state.get('_tp_tier', 0)
+    
+    # 如果未激活，仅保存水位线后退出
+    if current_tier == 0: 
+        if hwm > 0 and profit_ratio == hwm: safe_save_state(symbol, state)
+        return 
+    
+    # 计算当前回撤
+    drawdown = hwm - profit_ratio
+    sell_ratio = 0.0
+    
+    # 扣动扳机判定
+    if current_tier == 3 and drawdown >= 0.10: 
+        sell_ratio = 1.0     # 跌破 10%，底仓全清
+    elif current_tier == 2 and drawdown >= 0.08: 
+        sell_ratio = 0.5     # 跌破 8%，切一半
+    elif current_tier == 1 and drawdown >= 0.05: 
+        sell_ratio = 0.333   # 跌破 5%，切三分之一
+    
+    if sell_ratio > 0:
+        base_pos = state.get('base_position', 0)
+        ideal_sell_amount = int((base_pos * sell_ratio) / 100) * 100
+        if ideal_sell_amount <= 0: return
+        
+        # 破冰机制：防止网格卖单冻结了所需的筹码
+        available = int(position.enable_amount / 100) * 100
+        if available < ideal_sell_amount:
+            info('[{}] ⏳ 宏观止盈准备就绪，但可用头寸不足。正在撤销网格挂单以释放筹码...', dsym(context, symbol))
+            cancel_all_orders_by_symbol(context, symbol)
+            state['_rehang_due_ts'] = datetime.now() + timedelta(seconds=5)
+            return # 下一个 Tick 解冻后再执行卖出
+            
+        sell_amount = ideal_sell_amount
+        exec_price = round(price * 0.98, 3) # 类市价单确保秒成
+        
+        try:
+            eid = order(symbol, -sell_amount, limit_price=exec_price)
+            if eid:
+                if '_macro_sell_ids' not in state: state['_macro_sell_ids'] = []
+                state['_macro_sell_ids'].append(str(eid))
+                
+                info('[{}] 🚨 宏观止盈爆发! 阶梯: {}, 最高利润: {:.2%}, 回撤: {:.2%}. 卖出底仓: {} 股', 
+                     dsym(context, symbol), current_tier, hwm, drawdown, sell_amount)
+                
+                # ==== 核心：断代重置与滴灌 ====
+                cash_freed = sell_amount * price
+                N = max(10, min(100, int(0.5 / atr))) # ATR 倒数算期数
+                
+                state['dingtou_base'] = state.get('dingtou_base', 0) + (cash_freed / N)
+                
+                # 战略缩表
+                state['base_position'] = max(0, base_pos - sell_amount)
+                state['initial_base_position'] = state['base_position']
+                state['initial_position_value'] = state['base_position'] * price
+                state['trade_week_set'] = set() 
+                state['last_week_position'] = state['base_position']
+                
+                state['_tp_hwm_ratio'] = 0.0
+                state['_tp_tier'] = 0
+                
+                info('[{}] ♻️ VA 断代重置！释放现金 {:.0f} 分 {} 周滴灌，新的周定投额升至 {:.0f}', 
+                     dsym(context, symbol), cash_freed, N, state['dingtou_base'])
+                
+                cancel_all_orders_by_symbol(context, symbol)
+                state['_rehang_due_ts'] = datetime.now() + timedelta(seconds=3)
+                safe_save_state(symbol, state)
+        except Exception as e:
+            info('[{}] ⚠️ 宏观止盈单发送失败: {}', dsym(context, symbol), e)
+
 # ---------------- 行情主循环 ----------------
 
 def handle_data(context, data):
+    """
+    [Global Ver: v3.12.0] [Func Ver: 2.0]
+    [Change]: 在标的状态轮询中注入 _check_macro_take_profit 宏观止盈检查。
+    """
     now_dt = context.current_dt
     now = now_dt.time()
     _fetch_quotes_via_snapshot(context)
@@ -1691,13 +1811,15 @@ def handle_data(context, data):
                     state = context.state[sym]
                     recover_window_seconds = 180 
                     state['_recover_until'] = now_dt + timedelta(seconds=recover_window_seconds)
-                    info('[{}]     监测到复牌/行情恢复，开启 {}s 补偿成交检测窗口。', dsym(context, symbol), recover_window_seconds)
 
     for sym in context.symbol_list:
         if sym not in context.state: continue
         st = context.state[sym]
         price = context.latest_data.get(sym)
         if is_valid_price(price):
+            # [V3.12.0 注入]: 宏观止盈检查
+            _check_macro_take_profit(context, sym, st, price)
+            
             get_target_base_position(context, sym, st, price, now_dt)
             adjust_grid_unit(st)
             if now_dt.minute % 30 == 0 and now_dt.second < 5:
@@ -1715,7 +1837,6 @@ def handle_data(context, data):
         _fill_recover_watch(context, sym, st)
 
     if is_patrol_time:
-        info('🧐 每30分钟状态巡检...')
         for sym in context.symbol_list:
             if sym in context.state:
                 patrol_and_correct_orders(context, sym, context.state[sym])

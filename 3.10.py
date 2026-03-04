@@ -1,14 +1,12 @@
 # event_driven_grid_strategy.py
-# 版本号：GEMINI-3.11.3
+# 版本号：GEMINI-3.10.0
 #
-# 更新日志 (v3.11.3 Hotfix):
-# 1. 【实盘热修】根治影子棘轮触发后的“网格假死” (Ratchet Race Condition Fix): 
-#    - 痛点：影子棘轮触发并下达撤单指令后，由于券商API存在撤单状态延迟，紧随其后的挂单巡检会误认“盘口仍有旧单”从而放弃挂单；且由于基准价已更新，防刷屏机制导致策略陷入长期的“不撤不挂”假死状态。
-#    - 修复：重构棘轮触发后的执行流。在棘轮生效并撤单后，立即中断当前主干（强制 return），并将重新排布网格的任务移交给“异步补单状态机” (`_rehang_due_ts`)。通过硬性延迟2秒，完美避开 API 状态不同步期，确保新网格 100% 挂出。
-# 2. (v3.11.2 回顾): 重构部成逻辑，保护盘口排队优先级；修复撤单竞态异常报错。
-# 3. (v3.11.1 回顾): 拦截券商底层 API “幽灵 0 价格”脏数据污染。
-# 4. (v3.11.0 回顾): 创设 影子棘轮 (Ghost Ratchet) 机制。
-
+# 更新日志 (v3.10.0):
+# 1. 【双向防死锁】引入 堆栈容量上限 (Max Stack Size) 空间融合机制: 
+#    - 除了原有的 ATR 绝对空间破锁外，新增基于容量的“慢速降维”机制。
+#    - 默认单边堆栈容量上限为 30。当震荡碎片或单边慢牛/慢熊导致订单数量超过上限时，系统自动触发“贪吃蛇”机制，将最极端的两笔订单进行空间加权融合，使堆栈永远保持轻量，防止网格“粉末化”。
+# 2. 【热重载支持】支持通过 market.json 热更新 `max_stack_size`，适应不同资金体量的网格层数设计。
+# 3. (v3.9.0 回顾): 引入 空间加权融合机制 替代武断剔除，筹码绝对守恒。
 
 import json
 import logging
@@ -28,7 +26,7 @@ import pandas as pd
 # ---------------- 全局句柄 ----------------
 LOG_FH = None
 LOG_DATE = None
-__version__ = 'GEMINI-3.11.3'
+__version__ = 'GEMINI-3.10.0'
 
 # ---------------- 配置管理类 ----------------
 
@@ -888,8 +886,8 @@ def _apply_price_guard(context, state, buy_p, sell_p, buy_sp, sell_sp, bypass_bu
 
 def place_limit_orders(context, symbol, state, ignore_cooldown=False, bypass_lock=False, ignore_entrust_nos=None):
     """
-    [Global Ver: v3.11.0]
-    增加 影子棘轮机制 (Ghost Ratchet)，在守门员拦截时基准价依然如影随形。
+    [Global Ver: v3.9.0]
+    增加 VA特权判定 以及 ATR时空加权破锁机制 (软化极值防线)。
     """
     if context.current_dt.time() >= dtime(14, 55): return
 
@@ -952,7 +950,7 @@ def place_limit_orders(context, symbol, state, ignore_cooldown=False, bypass_loc
     buy_p, sell_p = _apply_price_guard(context, state, buy_p, sell_p, buy_sp, sell_sp, bypass_buy_block)
 
     # ==========================================
-    # v3.9/v3.10 模块 B: ATR 天地锁破锁机制 (纯空间加权融合)
+    # v3.9 模块 B: ATR 天地锁破锁机制 (纯空间加权融合)
     # ==========================================
     if buy_p > 0 and sell_p > 0:
         gap_pct = (sell_p - buy_p) / buy_p
@@ -976,6 +974,7 @@ def place_limit_orders(context, symbol, state, ignore_cooldown=False, bypass_loc
             if distortion_buy > distortion_sell and state['sell_stack']:
                 # 买盘扭曲严重，说明是历史卖飞单惹的祸 (处理 sell_stack)
                 if len(state['sell_stack']) >= 2:
+                    # 找出实际价格最低的两个空单进行融合 (存的是 -price，找 -price 最大的两个)
                     sorted_sells = sorted(state['sell_stack'], key=lambda x: x[0], reverse=True)
                     o1, o2 = sorted_sells[0], sorted_sells[1]
                     
@@ -994,6 +993,7 @@ def place_limit_orders(context, symbol, state, ignore_cooldown=False, bypass_loc
                     info('[{}] 🧬 空间融合(软化空头): 极低卖飞单 {:.3f}({}股) 与 {:.3f}({}股) 融合为新防线: {:.3f}({}股)', 
                          dsym(context, symbol), p1, v1, p2, v2, p_merge, v_merge)
                 else:
+                    # 兜底：如果栈里只剩最后 1 笔单，无法融合，执行原有的剔除逻辑
                     removed_record = state['sell_stack'].pop(0)
                     info('[{}] 🔪 破锁(清空头): 仅剩单笔极值，直接剔除极低卖飞单: 价:{:.3f} 量:{}', 
                          dsym(context, symbol), -removed_record[0], removed_record[1])
@@ -1001,6 +1001,7 @@ def place_limit_orders(context, symbol, state, ignore_cooldown=False, bypass_loc
             elif distortion_sell > distortion_buy and state['buy_stack']:
                 # 卖盘扭曲严重，说明是历史套牢单惹的祸 (处理 buy_stack)
                 if len(state['buy_stack']) >= 2:
+                    # 找出实际价格最高的两个多单进行融合 (存的是 price，找 price 最大的两个)
                     sorted_buys = sorted(state['buy_stack'], key=lambda x: x[0], reverse=True)
                     o1, o2 = sorted_buys[0], sorted_buys[1]
                     
@@ -1018,6 +1019,7 @@ def place_limit_orders(context, symbol, state, ignore_cooldown=False, bypass_loc
                     info('[{}] 🧬 空间融合(软化多头): 极高套牢单 {:.3f}({}股) 与 {:.3f}({}股) 融合为新防线: {:.3f}({}股)', 
                          dsym(context, symbol), p1, v1, p2, v2, p_merge, v_merge)
                 else:
+                    # 兜底：如果栈里只剩最后 1 笔单，无法融合，移交底仓
                     removed_record = state['buy_stack'].pop(0)
                     info('[{}] 🔪 破锁(清多头): 仅剩单笔极值，移交极高套牢单至VA底仓: 价:{:.3f} 量:{}', 
                          dsym(context, symbol), removed_record[0], removed_record[1])
@@ -1043,9 +1045,7 @@ def place_limit_orders(context, symbol, state, ignore_cooldown=False, bypass_loc
             info('[{}] 🛡️ 空间封锁：卖价 {:.3f} 高于涨停线 {:.3f}，暂停挂卖。', dsym(context, symbol), sell_p, up_limit)
             can_place_sell = False
 
-    # ==========================================
-    # v3.11 模块 C: 影子棘轮机制 (Ghost Ratchet)
-    # ==========================================
+    # 棘轮机制 (Ratchet)
     price = context.latest_data.get(symbol)
     ratchet_enabled = (not allow_tickless) and is_valid_price(price)
 
@@ -1054,43 +1054,33 @@ def place_limit_orders(context, symbol, state, ignore_cooldown=False, bypass_loc
             is_in_low_pos_range = (pos - unit <= state['base_position'])
             is_in_high_pos_range = (pos + unit >= state['max_position'])
             
-            # 判定理论网格价是否被守门员强制扭曲拦截
-            is_sell_blocked_by_guard = (sell_p > theo_sell_p)
-            is_buy_blocked_by_guard = (buy_p < theo_buy_p)
+            sell_p_curr = round(base * (1 + sell_sp), 3)
+            buy_p_curr = round(base * (1 - buy_sp), 3)
             
-            # 触发条件：不仅在极限仓位时跟随，在被守门员拦截时也如影随形地跟随
-            ratchet_up = (price >= theo_sell_p) and (is_in_low_pos_range or is_sell_blocked_by_guard)
-            ratchet_down = (price <= theo_buy_p) and (is_in_high_pos_range or is_buy_blocked_by_guard)
+            ratchet_up = is_in_low_pos_range and price >= sell_p_curr
+            ratchet_down = is_in_high_pos_range and price <= buy_p_curr
             
             if ratchet_up:
-                info('[{}] 🚀 影子棘轮上移(拦截/空仓): 触及理论卖价 {:.3f}，基准抬至 {:.3f}', dsym(context, symbol), theo_sell_p, theo_sell_p)
-                state['base_price'] = theo_sell_p
-                cancelled_ids = cancel_all_orders_by_symbol(context, symbol)
-                if cancelled_ids: state['_pending_ignore_ids'] = list(cancelled_ids)
+                info('[{}] 🚀 棘轮上移(pos={}): 触及卖价，基准抬至 {:.3f}', dsym(context, symbol), pos, sell_p_curr)
+                state['base_price'] = sell_p_curr
+                cancel_all_orders_by_symbol(context, symbol)
                 
-                # 核心修复：把接力棒交给异步补单机制，延迟 2 秒让 API 消化撤单
-                delay_s = StrategyConfig.DEBUG.DELAY_AFTER_CANCEL
-                state['_rehang_due_ts'] = datetime.now() + timedelta(seconds=max(delay_s, 2.0))
-                
-                state.pop('_last_order_ts', None)
-                state.pop('_last_order_bp', None)
-                safe_save_state(symbol, state)
-                return  # 直接返回，不往下执行了
+                # 重算
+                buy_p = round(sell_p_curr * (1 - buy_sp), 3)
+                sell_p = round(sell_p_curr * (1 + sell_sp), 3)
+                # 再次守门，传入 VA 特权
+                buy_p, sell_p = _apply_price_guard(context, state, buy_p, sell_p, buy_sp, sell_sp, bypass_buy_block)
                 
             elif ratchet_down:
-                info('[{}] ⚓ 影子棘轮下移(拦截/满仓): 触及理论买价 {:.3f}，基准降至 {:.3f}', dsym(context, symbol), theo_buy_p, theo_buy_p)
-                state['base_price'] = theo_buy_p
-                cancelled_ids = cancel_all_orders_by_symbol(context, symbol)
-                if cancelled_ids: state['_pending_ignore_ids'] = list(cancelled_ids)
+                info('[{}] ⚓ 棘轮下移(pos={}): 触及买价，基准降至 {:.3f}', dsym(context, symbol), pos, buy_p_curr)
+                state['base_price'] = buy_p_curr
+                cancel_all_orders_by_symbol(context, symbol)
                 
-                # 核心修复：把接力棒交给异步补单机制
-                delay_s = StrategyConfig.DEBUG.DELAY_AFTER_CANCEL
-                state['_rehang_due_ts'] = datetime.now() + timedelta(seconds=max(delay_s, 2.0))
-                
-                state.pop('_last_order_ts', None)
-                state.pop('_last_order_bp', None)
-                safe_save_state(symbol, state)
-                return  # 直接返回，不往下执行了
+                # 重算
+                buy_p = round(buy_p_curr * (1 - buy_sp), 3)
+                sell_p = round(buy_p_curr * (1 + sell_sp), 3)
+                # 再次守门，传入 VA 特权
+                buy_p, sell_p = _apply_price_guard(context, state, buy_p, sell_p, buy_sp, sell_sp, bypass_buy_block)
 
     if not ignore_cooldown:
         last_ts = state.get('_last_order_ts')
@@ -1164,34 +1154,25 @@ def place_limit_orders(context, symbol, state, ignore_cooldown=False, bypass_loc
 
 def on_trade_response(context, trade_list):
     """
-    [Global Ver: v3.11.2]
-    1. 修复由于PTrade状态延迟导致“对已成订单发起撤单”报 [251020] 错误的问题。
-    2. 优化部成 (Status 7) 逻辑：部成时不再立刻撤单重排，保留剩余挂单继续排队成交。
+    [Global Ver: v3.6.4] [Func Ver: 2.5]
+    [Change]: 放行 status='7' (部成) 的回报，防止分笔成交被过滤。
     """
     if not hasattr(context, 'processed_business_ids'):
         context.processed_business_ids = deque(maxlen=2000)
         
     for tr in trade_list:
+        # [v3.6.4 Fix]: 放行 '7'(部成) 和 '8'(已成)
         status = str(tr.get('status'))
         if status not in ['7', '8']: continue
         
         bid = str(tr.get('business_id', ''))
         
-        # 精准去重逻辑
+        # 3. 精准去重逻辑 (Business ID 是分笔成交的唯一标识)
         if bid:
             if bid in context.processed_business_ids: continue
             context.processed_business_ids.append(bid)
         else:
             pass 
-
-        # [Bug Fix] 拦截券商推送的 0 数量/ 0 价格的幽灵回报
-        raw_amount = tr.get('business_amount', 0)
-        raw_price = tr.get('business_price', 0)
-        
-        if abs(float(raw_amount)) <= 1e-5:
-            continue
-        if not is_valid_price(float(raw_price)):
-            continue
 
         sym = convert_symbol_to_standard(tr['stock_code'])
         log_trade_details(context, sym, tr) 
@@ -1201,60 +1182,46 @@ def on_trade_response(context, trade_list):
 
         bs = str(tr.get('entrust_bs')) 
         if bs == '1':
-            fill_amount = abs(raw_amount) 
+            fill_amount = abs(tr['business_amount']) 
             trade_dir = "买入"
         elif bs == '2':
-            fill_amount = -abs(raw_amount) 
+            fill_amount = -abs(tr['business_amount']) 
             trade_dir = "卖出"
         else: continue
             
-        price = float(raw_price)
-        entrust_no = str(tr.get('entrust_no', ''))
+        price = tr['business_price']
 
-        # 调用核心逻辑：记录筹码与 PnL (即使部成，筹码也会完美对齐)
+        # 5. 调用核心逻辑
         process_trade_logic(context, sym, price, fill_amount)
         
-        # 更新追踪器
+        # 6. 更新追踪器
         if '_fill_tracker' not in state: state['_fill_tracker'] = {}
-        if entrust_no:
-            state['_fill_tracker'][entrust_no] = state['_fill_tracker'].get(entrust_no, 0.0) + abs(fill_amount)
+        entrust_no = str(tr['entrust_no'])
+        state['_fill_tracker'][entrust_no] = state['_fill_tracker'].get(entrust_no, 0.0) + abs(fill_amount)
         
         info('✅ [{}] 成交回报! 方向: {}, 数量: {}, 价格: {:.3f} (ID:{}, Sts:{})', 
              dsym(context, sym), trade_dir, abs(fill_amount), price, bid[-6:] if bid else 'N/A', status)
 
-        # ==========================================
-        # [v3.11.2 核心升级] 区分全成与部成，保护排队优先级
-        # ==========================================
-        is_fully_filled = (status == '8')
+        # 7. 更新状态
+        state['_last_trade_ts'] = context.current_dt
+        state['_last_fill_dt'] = context.current_dt
+        state['last_fill_price'] = price
+        state['base_price'] = price
 
-        if is_fully_filled:
-            # 【解决问题1】提前将已成单号加入免检集合，防止下方 cancel_all 时受 API 延迟影响引发 251020 报错
-            if entrust_no:
-                state['filled_order_ids'].add(entrust_no)
+        cancelled_ids = cancel_all_orders_by_symbol(context, sym)
+        if cancelled_ids: state['_pending_ignore_ids'] = list(cancelled_ids)
 
-            # 更新状态：全成时才推移基准价
-            state['_last_trade_ts'] = context.current_dt
-            state['_last_fill_dt'] = context.current_dt
-            state['last_fill_price'] = price
-            state['base_price'] = price
+        delay_s = StrategyConfig.DEBUG.DELAY_AFTER_CANCEL
+        state['_rehang_due_ts'] = datetime.now() + timedelta(seconds=max(delay_s, 2.0))
+        
+        context.mark_halted[sym] = False
+        context.last_valid_price[sym] = price
+        context.latest_data[sym] = price
+        context.last_valid_ts[sym] = context.current_dt
 
-            cancelled_ids = cancel_all_orders_by_symbol(context, sym)
-            if cancelled_ids: state['_pending_ignore_ids'] = list(cancelled_ids)
-
-            delay_s = StrategyConfig.DEBUG.DELAY_AFTER_CANCEL
-            state['_rehang_due_ts'] = datetime.now() + timedelta(seconds=max(delay_s, 2.0))
-            
-            context.mark_halted[sym] = False
-            context.last_valid_price[sym] = price
-            context.latest_data[sym] = price
-            context.last_valid_ts[sym] = context.current_dt
-
-            state.pop('_last_order_ts', None)
-            state.pop('_last_order_bp', None)
-            context.should_place_order_map[sym] = True
-        else:
-            # 【解决问题2】部成 (Status 7) 不撤单、不改基准价，让它继续在盘口抢占位置
-            info('⏳ [{}] 订单部成 (ID:{}), 仅记录筹码, 基准价保持不变, 剩余挂单继续排队...', dsym(context, sym), entrust_no)
+        state.pop('_last_order_ts', None)
+        state.pop('_last_order_bp', None)
+        context.should_place_order_map[sym] = True
         
         try: state['_last_pos_seen'] = get_position(sym).amount
         except: state['_last_pos_seen'] = None
