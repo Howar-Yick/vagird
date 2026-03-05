@@ -980,10 +980,10 @@ def place_limit_orders(context, symbol, state, ignore_cooldown=False, bypass_loc
     if buy_p > 0 and sell_p > 0:
         gap_pct = (sell_p - buy_p) / buy_p
         
-        # 复用计算 ATR 
-        atr_pct = calculate_atr(context, symbol)
+        # [V3.12.5 紧急修复] 破锁机制属于微观网格防御，对接高敏 Grid_ATR
+        atr_pct = calculate_grid_atr(context, symbol, atr_period=14)
         if atr_pct is None or math.isnan(atr_pct) or atr_pct <= 0:
-            atr_pct = 0.02 
+            atr_pct = 0.02
             
         UNLOCK_MULTIPLIER = StrategyConfig.MARKET.UNLOCK_ATR_MULTIPLIER 
         
@@ -2231,8 +2231,8 @@ def update_daily_reports(context, data):
 
 def generate_html_report(context):
     """
-    [Global Ver: v3.12.5] [Func Ver: 4.0]
-    [Change]: 精简看板，移除不准的网格/底仓分离收益，合并显示总收益；新增双轨 ATR (微观/宏观) 对比。
+    [Global Ver: v3.12.5] [Func Ver: 4.1]
+    [Change]: 彻底剔除网格/底仓分离收益，强制输出 15 列，解决前端 HTML 错位问题。
     """
     all_metrics, total_market_value, total_unrealized_pnl, total_realized_pnl, pnl_metrics, intraday_metrics = [], 0, 0, 0, getattr(context, 'pnl_metrics', {}), getattr(context, 'intraday_metrics', {})
     
@@ -2250,7 +2250,7 @@ def generate_html_report(context):
         total_real = sym_pnl.get('total_realized_pnl', 0)
         total_realized_pnl += total_real
         
-        # 组装标的看板数据
+        # 组装标的看板数据 (严格 15 个字段)
         all_metrics.append({
             "symbol": symbol, 
             "symbol_disp": dsym(context, symbol, style='long'), 
@@ -2259,13 +2259,13 @@ def generate_html_report(context):
             "price": f"{price:.3f}", 
             "market_value": f"{market_value:,.2f}", 
             "unrealized_pnl": f"{unrealized_pnl:,.2f}", 
+            "pnl_ratio": f"{(unrealized_pnl / (position.cost_basis * position.amount) * 100) if position.cost_basis * position.amount != 0 else 0:.2f}%", 
             "total_realized_pnl": f"{total_real:,.2f}", 
             "total_pnl": f"{(total_real + unrealized_pnl):,.2f}", 
-            "pnl_ratio": f"{(unrealized_pnl / (position.cost_basis * position.amount) * 100) if position.cost_basis * position.amount != 0 else 0:.2f}%", 
             "base_position": state['base_position'], 
             "grid_unit": state['grid_unit'], 
-            "grid_atr_str": f"{state.get('grid_atr_rate'):.2%}" if state.get('grid_atr_rate') else "N/A",   # 微观ATR
-            "macro_atr_str": f"{state.get('macro_atr_rate'):.2%}" if state.get('macro_atr_rate') else "N/A", # 宏观ATR
+            "grid_atr_str": f"{state.get('grid_atr_rate'):.2%}" if state.get('grid_atr_rate') else "N/A",
+            "macro_atr_str": f"{state.get('macro_atr_rate'):.2%}" if state.get('macro_atr_rate') else "N/A",
             "rv_str": f"{rv_data.get('rv', 0):.2%}", 
             "efficiency_str": f"{rv_data.get('efficiency', 0):.1f}"
         })
@@ -2276,7 +2276,7 @@ def generate_html_report(context):
         
         table_rows = ""
         for m in all_metrics:
-            # 重新排版表格列，剔除老网格/底仓收益，插入新双轨ATR
+            # 这里的 <td> 数量必须是绝对的 15 个！
             table_rows += f"<tr><td>{m['symbol_disp']}</td><td>{m['position']}</td><td>{m['cost_basis']}</td><td>{m['price']}</td><td>{m['market_value']}</td><td class=\"{'positive' if float(m['unrealized_pnl'].replace(',',''))>=0 else 'negative'}\">{m['unrealized_pnl']}</td><td class=\"{'positive' if float(m['unrealized_pnl'].replace(',',''))>=0 else 'negative'}\">{m['pnl_ratio']}</td><td class=\"{'positive' if float(m['total_realized_pnl'].replace(',',''))>0 else ''}\">{m['total_realized_pnl']}</td><td class=\"{'positive' if float(m['total_pnl'].replace(',',''))>=0 else 'negative'}\">{m['total_pnl']}</td><td>{m['base_position']}</td><td>{m['grid_unit']}</td><td>{m['grid_atr_str']}</td><td>{m['macro_atr_str']}</td><td>{m['rv_str']}</td><td>{m['efficiency_str']}</td></tr>"
             
         research_path('reports', 'strategy_dashboard.html').write_text(
@@ -2289,10 +2289,9 @@ def generate_html_report(context):
                 realized_pnl_class="positive" if total_realized_pnl >= 0 else "negative", 
                 account_total_pnl=f"{(total_realized_pnl + total_unrealized_pnl):,.2f}", 
                 total_pnl_class="positive" if (total_realized_pnl + total_unrealized_pnl) >= 0 else "negative", 
-                # 给模板里的旧变量赋兜底空值，防止 HTML 模板报错
-                total_realized_grid_pnl="0.00", 
+                total_realized_grid_pnl="--", 
                 grid_pnl_class="", 
-                total_realized_base_pnl="0.00", 
+                total_realized_base_pnl="--", 
                 base_pnl_class="", 
                 table_rows=table_rows
             ), 
