@@ -1,5 +1,10 @@
 # event_driven_grid_strategy.py
-# 版本号：GEMINI-3.13.15
+# 版本号：GEMINI-3.13.16
+#
+# 更新日志 (v3.13.16):
+# 1. 【口径统一】修复宏观止盈引擎与 HTML 看板对 tp_cool_weeks / tp_min_weeks / tp_min_value 的读取口径不一致问题，统一为 state 优先、config 兜底，确保热重载后的展示与执行完全一致。
+# 2. 【状态净化】修复热重载删除标的时仅清理内存、未清理持久化状态的问题。现在删除标的会同步清理 state 文件与持久化参数，彻底杜绝旧状态“诈尸”。
+# 3. 【冻结量校准】增强 PATROL 巡检前的冻结量同步，避免使用过期 pending_frozen 导致卖单可用数量判断失真。
 #
 # 更新日志 (v3.13.15):
 # 1. 【终极守护】修复数值型字段 (history_pnl, wm_pnl, _tp_tier 等) 在 JSON 中为 null 时，被读取为 NoneType 进而引发盘中数学运算 `float + None` 崩溃的致命漏洞。全面应用严格的 `is not None` 兜底护航，实现真正意义上的无懈可击。
@@ -50,7 +55,7 @@ import pandas as pd
 # ---------------- 全局句柄 ----------------
 LOG_FH = None
 LOG_DATE = None
-__version__ = 'GEMINI-3.13.15'
+__version__ = 'GEMINI-3.13.16'
 
 # ---------------- 配置管理类 ----------------
 
@@ -308,6 +313,33 @@ def set_saved_param(key, value):
         set_parameter(key, value)
     except:
         pass
+
+def purge_symbol_state(symbol):
+    try:
+        state_file = research_path('state', f'{symbol}.json')
+        if state_file.exists():
+            state_file.unlink()
+    except Exception as e:
+        info('[{}] ⚠️ 清理 state 文件失败: {}', symbol, e)
+    try:
+        set_saved_param(f'state_{symbol}', None)
+        info('[{}] 🧹 已清理持久化状态(state文件 + state参数)', symbol)
+    except Exception as e:
+        info('[{}] ⚠️ 清理持久化参数失败: {}', symbol, e)
+
+def _get_runtime_tp_params(context, symbol, state):
+    cfg = getattr(context, 'symbol_config', {}).get(symbol, {}) or {}
+    safe_state = state or {}
+    tp_cool_weeks = safe_state.get('tp_cool_weeks')
+    if tp_cool_weeks is None:
+        tp_cool_weeks = cfg.get('tp_cool_weeks', StrategyConfig.VA.TP_COOL_WEEKS)
+    min_weeks = safe_state.get('tp_min_weeks')
+    if min_weeks is None:
+        min_weeks = cfg.get('tp_min_weeks', StrategyConfig.VA.TP_MIN_WEEKS)
+    min_val = safe_state.get('tp_min_value')
+    if min_val is None:
+        min_val = cfg.get('tp_min_value', StrategyConfig.VA.TP_MIN_VALUE)
+    return tp_cool_weeks, min_weeks, min_val
 
 def check_environment():
     try:
@@ -1237,6 +1269,8 @@ def place_limit_orders(context, symbol, state, ignore_cooldown=False, bypass_loc
                 else: raise e
 
         can_sell = not same_sell
+        _recalc_pending_frozen(context, symbol)
+        _recalc_pending_frozen(context, symbol)
         pending_frozen = context.pending_frozen.get(symbol, 0)
         real_enable = enable_amount - pending_frozen
         
@@ -1670,6 +1704,7 @@ def patrol_and_correct_orders(context, symbol, state):
         if is_valid_price(down_limit) and buy_p < down_limit:
             should_have_buy_order = False 
 
+        _recalc_pending_frozen(context, symbol)
         pending_frozen = context.pending_frozen.get(symbol, 0)
         real_enable = enable_amount - pending_frozen
         should_have_sell_order = (real_enable >= unit and pos - unit >= base_pos)
@@ -1759,7 +1794,7 @@ def _check_macro_take_profit(context, symbol, state, price, dt):
         pos = get_position(symbol)
         if pos.amount == 0 or pos.cost_basis <= 0: return
         config = getattr(context, 'symbol_config', {}).get(symbol, {})
-        tp_cool_weeks, min_weeks, min_val = config.get('tp_cool_weeks', 4), config.get('tp_min_weeks', 12), config.get('tp_min_value', 30000)
+        tp_cool_weeks, min_weeks, min_val = _get_runtime_tp_params(context, symbol, state)
 
         if len(state.get('trade_week_set', set())) < tp_cool_weeks: return
         if len(state.get('trade_week_set', set())) < min_weeks or (pos.amount * price) < min_val: return
@@ -2223,6 +2258,7 @@ def reload_config_if_changed(context):
             context.last_valid_ts.pop(sym, None)
             context.pending_frozen.pop(sym, None)
             context.should_place_order_map.pop(sym, None)
+            purge_symbol_state(sym)
 
         for sym in new_symbols - old_symbols:
             info('[{}] 新增标的 (或重载)，正在初始化状态...', dsym(context, sym))
@@ -2393,10 +2429,7 @@ def generate_html_report(context):
             elif any(k in name_str for k in ['红利', '低波', '收息']): portfolio_val['dividend'] += market_value
             else: portfolio_val['other'] += market_value
             
-            config = getattr(context, 'symbol_config', {}).get(symbol, {})
-            tp_cool_weeks = state.get('tp_cool_weeks', config.get('tp_cool_weeks', 4))
-            min_weeks = state.get('tp_min_weeks', config.get('tp_min_weeks', 12))
-            min_val = state.get('tp_min_value', config.get('tp_min_value', 30000))
+            tp_cool_weeks, min_weeks, min_val = _get_runtime_tp_params(context, symbol, state)
             
             trade_weeks = state.get('trade_week_set', set())
             current_weeks = len(trade_weeks)
