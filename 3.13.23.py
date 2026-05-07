@@ -685,7 +685,6 @@ def before_trading_start(context, data):
         except Exception as e:
             info('⚠️ PnL 补算遇到轻微错误: {} (后续会重试)', e)
         generate_html_report(context)
-        generate_symbol_profile_report(context)
         context.last_report_time = context.current_dt
 
     if context.initial_cleanup_done: return
@@ -2375,7 +2374,10 @@ def _safe_float(v, default=None):
     try:
         if v is None:
             return default
-        return float(v)
+        x = float(v)
+        if math.isnan(x) or math.isinf(x):
+            return default
+        return x
     except Exception:
         return default
 
@@ -2487,33 +2489,33 @@ def generate_symbol_profile_report(context):
             try:
                 bar = get_price(security=symbol,count=250,frequency='1d',fields=['open','high','low','close','volume','money'],fq='post')
                 if bar is None or len(bar)==0 or ('close' not in bar):
-                    payload['symbols'][symbol]={'name':getattr(context,'symbol_names',{}).get(symbol,symbol),'data_status':'error','history_count':0,'metrics':{},'scores':{},'strategy_snapshot':{},'profile_type':'balanced','suggestion':{},'explain':'历史行情不可用，未生成评分。'}
+                    payload['symbols'][symbol]={'name':dsym(context, symbol, style='short'),'data_status':'error','history_count':0,'metrics':{},'scores':{},'strategy_snapshot':{},'profile_type':'balanced','suggestion':{},'explain':'历史行情不可用，未生成评分。'}
                     continue
                 closes=np.array([_safe_float(x) for x in bar['close'] if _safe_float(x) is not None],dtype=float)
                 highs=np.array([_safe_float(x,_safe_float(c,0)) for x,c in zip(bar['high'],bar['close'])],dtype=float)
                 lows=np.array([_safe_float(x,_safe_float(c,0)) for x,c in zip(bar['low'],bar['close'])],dtype=float)
                 if len(closes)<60:
-                    payload['symbols'][symbol]={'name':getattr(context,'symbol_names',{}).get(symbol,symbol),'data_status':'insufficient_data','history_count':int(len(closes)),'metrics':{},'scores':{},'strategy_snapshot':{},'profile_type':'balanced','suggestion':{},'explain':'历史数据不足60根，跳过画像评分。'}
+                    payload['symbols'][symbol]={'name':dsym(context, symbol, style='short'),'data_status':'insufficient_data','history_count':int(len(closes)),'metrics':{},'scores':{},'strategy_snapshot':{},'profile_type':'balanced','suggestion':{},'explain':'历史数据不足60根，跳过画像评分。'}
                     continue
                 rets=np.diff(closes)/closes[:-1]
                 ma20=float(np.mean(closes[-20:]));ma60=float(np.mean(closes[-60:]));ma120=float(np.mean(closes[-120:])) if len(closes)>=120 else None
                 m={}
                 m.update(_calc_returns(closes));m.update(_calc_recovery_metrics(closes));m.update(_calc_mean_reversion_metrics(closes))
-                m.update({'ma20':ma20,'ma60':ma60,'ma120':ma120,'ma20_slope':(ma20/np.mean(closes[-25:-5])-1.0) if len(closes)>=25 else None,'ma60_slope':(ma60/np.mean(closes[-70:-10])-1.0) if len(closes)>=70 else None,'near_120d_high':(closes[-1]/np.max(closes[-120:])*100.0) if len(closes)>=120 else None,'vol_20d':_calc_volatility(rets,20),'vol_60d':_calc_volatility(rets,60),'atr14_pct':_calc_atr_percent(highs,lows,closes,14),'max_daily_drop_20d':float(np.min(rets[-20:])*100.0),'max_daily_drop_60d':float(np.min(rets[-60:])*100.0),'mdd_20d':_calc_max_drawdown(closes[-20:]),'mdd_60d':_calc_max_drawdown(closes[-60:]),'mdd_120d':_calc_max_drawdown(closes[-120:]) if len(closes)>=120 else None,'current_dd_60d':(1.0-closes[-1]/np.max(closes[-60:]))*100.0,'current_dd_120d':(1.0-closes[-1]/np.max(closes[-120:]))*100.0 if len(closes)>=120 else None,'close_vs_ma20':(closes[-1]/ma20-1.0)*100.0 if ma20>0 else None,'close_vs_ma60':(closes[-1]/ma60-1.0)*100.0 if ma60>0 else None})
+                m.update({'ma20':ma20,'ma60':ma60,'ma120':ma120,'ma20_slope':((ma20/np.mean(closes[-25:-5])-1.0)*100.0) if len(closes)>=25 else None,'ma60_slope':((ma60/np.mean(closes[-70:-10])-1.0)*100.0) if len(closes)>=70 else None,'near_120d_high':((closes[-1]/np.max(closes[-120:])-1.0)*100.0) if len(closes)>=120 else None,'vol_20d':_calc_volatility(rets,20),'vol_60d':_calc_volatility(rets,60),'atr14_pct':_calc_atr_percent(highs,lows,closes,14),'max_daily_drop_20d':float(np.min(rets[-20:])*100.0),'max_daily_drop_60d':float(np.min(rets[-60:])*100.0),'mdd_20d':_calc_max_drawdown(closes[-20:]),'mdd_60d':_calc_max_drawdown(closes[-60:]),'mdd_120d':_calc_max_drawdown(closes[-120:]) if len(closes)>=120 else None,'current_dd_60d':(1.0-closes[-1]/np.max(closes[-60:]))*100.0,'current_dd_120d':(1.0-closes[-1]/np.max(closes[-120:]))*100.0 if len(closes)>=120 else None,'close_vs_ma20':(closes[-1]/ma20-1.0)*100.0 if ma20>0 else None,'close_vs_ma60':(closes[-1]/ma60-1.0)*100.0 if ma60>0 else None})
                 st=getattr(context,'state',{}).get(symbol,{})
-                snap={'pos':_safe_float(getattr(get_position(symbol),'amount',None),None),'base_position':st.get('base_position'),'grid_unit':st.get('grid_unit'),'buy_stack_count':len(st.get('buy_stack',[]) or []),'sell_stack_count':len(st.get('sell_stack',[]) or []),'isolated_anchor_count':len(st.get('buy_stack_isolated',[]) or [])+len(st.get('sell_stack_isolated',[]) or []),'history_pnl':st.get('history_pnl'),'wm_pnl':st.get('wm_pnl'),'grid_pnl':st.get('grid_pnl'),'_drip_amount':st.get('_drip_amount'),'_drip_remain_weeks':st.get('_drip_remain_weeks'),'_tp_tier':st.get('_tp_tier')}
+                snap={'pos':_safe_float(getattr(get_position(symbol),'amount',None),None),'base_position':st.get('base_position'),'grid_unit':st.get('grid_unit'),'buy_stack_count':len(st.get('buy_stack',[]) or []),'sell_stack_count':len(st.get('sell_stack',[]) or []),'isolated_anchor_count':int(st.get('archived_buy_anchor') is not None)+int(st.get('archived_sell_anchor') is not None),'history_pnl':st.get('history_pnl'),'wm_pnl':st.get('wm_pnl'),'grid_pnl':st.get('grid_pnl'),'_drip_amount':st.get('_drip_amount'),'_drip_remain_weeks':st.get('_drip_remain_weeks'),'_tp_tier':st.get('_tp_tier')}
                 m.update({k:snap.get(k) for k in ['buy_stack_count','sell_stack_count','history_pnl']})
                 scores=_calc_score_from_metrics(m)
                 pt,sug,exp=_build_symbol_parameter_suggestion(scores)
-                payload['symbols'][symbol]={'name':getattr(context,'symbol_names',{}).get(symbol,symbol),'data_status':'ok','history_count':int(len(closes)),'metrics':m,'scores':scores,'strategy_snapshot':snap,'profile_type':pt,'suggestion':sug,'explain':exp}
+                payload['symbols'][symbol]={'name':dsym(context, symbol, style='short'),'data_status':'ok','history_count':int(len(closes)),'metrics':m,'scores':scores,'strategy_snapshot':snap,'profile_type':pt,'suggestion':sug,'explain':exp}
             except Exception as e:
-                warning('[%s] 标的画像失败: %s', symbol, e)
+                info('[%s] 标的画像失败: %s', symbol, e)
                 payload['symbols'][symbol]={'name':symbol,'data_status':'error','history_count':0,'metrics':{},'scores':{},'strategy_snapshot':{},'profile_type':'balanced','suggestion':{},'explain':'单标的分析异常，已跳过。'}
         out_file = reports_dir / f'symbol_profile_{date_str}.json'
         out_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
         info('📊 标的画像报告已生成: {}', out_file)
     except Exception as e:
-        warning('⚠️ 标的画像报告生成失败: %s', e)
+        info('⚠️ 标的画像报告生成失败: %s', e)
 
 
 def after_trading_end(context, data):
