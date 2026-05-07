@@ -2271,6 +2271,196 @@ def log_trade_details(context, symbol, trade):
             f.write(",".join([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), symbol, dir_str, str(trade['business_amount']), f"{trade['business_price']:.3f}", str(base_pos), trade.get('entrust_no', 'N/A')]) + "\n")
     except Exception: pass
 
+def _safe_float(val, default=None):
+    try:
+        if val is None:
+            return default
+        x = float(val)
+        if math.isnan(x) or math.isinf(x):
+            return default
+        return x
+    except Exception:
+        return default
+
+def _clamp_score(v):
+    if v is None:
+        return None
+    return int(max(0, min(100, round(v))))
+
+def _calc_returns(close_series):
+    n = len(close_series)
+    def _ret(back):
+        return (close_series[-1] / close_series[-1 - back] - 1.0) if n > back else None
+    return {
+        'ret_20d': _ret(20),
+        'ret_60d': _ret(60),
+        'ret_120d': _ret(120),
+        'ret_250d': (close_series[-1] / close_series[0] - 1.0) if n >= 250 else None
+    }
+
+def _calc_volatility(close_series):
+    daily_ret = close_series.pct_change().dropna()
+    vol_20d = (daily_ret.tail(20).std() * math.sqrt(252)) if len(daily_ret) >= 20 else None
+    vol_60d = (daily_ret.tail(60).std() * math.sqrt(252)) if len(daily_ret) >= 60 else None
+    max_drop_20 = daily_ret.tail(20).min() if len(daily_ret) >= 20 else None
+    max_drop_60 = daily_ret.tail(60).min() if len(daily_ret) >= 60 else None
+    return {
+        'vol_20d': vol_20d,
+        'vol_60d': vol_60d,
+        'max_daily_drop_20d': max_drop_20,
+        'max_daily_drop_60d': max_drop_60,
+    }
+
+def _calc_atr_percent(high_series, low_series, close_series, window=14):
+    if len(close_series) < window + 1:
+        return None
+    prev_close = close_series.shift(1)
+    tr = pd.concat([(high_series - low_series), (high_series - prev_close).abs(), (low_series - prev_close).abs()], axis=1).max(axis=1)
+    atr = tr.rolling(window=window).mean().iloc[-1]
+    last_close = close_series.iloc[-1]
+    if last_close <= 0:
+        return None
+    return atr / last_close
+
+def _calc_max_drawdown(close_series, window):
+    if len(close_series) < window:
+        return None
+    s = close_series.tail(window)
+    roll_max = s.cummax()
+    dd = s / roll_max - 1.0
+    return dd.min()
+
+def _calc_recovery_metrics(close_series):
+    n = len(close_series)
+    if n < 60:
+        return {}
+    tail60 = close_series.tail(60)
+    low60_idx = int(np.argmin(tail60.values))
+    days_since_60d_low = 59 - low60_idx
+    out = {
+        'rebound_from_60d_low': close_series.iloc[-1] / tail60.min() - 1.0,
+        'days_since_60d_low': days_since_60d_low,
+    }
+    if n >= 120:
+        tail120 = close_series.tail(120)
+        low120_idx = int(np.argmin(tail120.values))
+        out['rebound_from_120d_low'] = close_series.iloc[-1] / tail120.min() - 1.0
+        out['days_since_120d_low'] = 119 - low120_idx
+    else:
+        out['rebound_from_120d_low'] = None
+        out['days_since_120d_low'] = None
+    return out
+
+def _calc_mean_reversion_metrics(close_series):
+    if len(close_series) < 126:
+        return {'big_up_next5_avg': None, 'big_down_next5_avg': None}
+    daily_ret = close_series.pct_change().dropna()
+    sample = daily_ret.tail(120)
+    up_th = sample.quantile(0.8)
+    down_th = sample.quantile(0.2)
+    future5 = close_series.shift(-5) / close_series - 1.0
+    up_vals = future5[(daily_ret >= up_th).reindex(future5.index, fill_value=False)].dropna()
+    down_vals = future5[(daily_ret <= down_th).reindex(future5.index, fill_value=False)].dropna()
+    return {
+        'big_up_threshold': up_th,
+        'big_down_threshold': down_th,
+        'big_up_next5_avg': up_vals.mean() if len(up_vals) >= 3 else None,
+        'big_down_next5_avg': down_vals.mean() if len(down_vals) >= 3 else None
+    }
+
+def _calc_score_from_metrics(metrics):
+    trend = 50
+    trend += 25 if (metrics.get('ret_120d') or 0) > 0.2 else 0
+    trend += 20 if (metrics.get('ret_60d') or 0) > 0.1 else 0
+    trend += 10 if (metrics.get('ma20_slope') or 0) > 0 else 0
+    trend += 10 if (metrics.get('ma60_slope') or 0) > 0 else 0
+    trend += max(0, 15 + 100 * (metrics.get('near_120d_high') or -0.3))
+    vol = ((metrics.get('vol_20d') or 0) * 120 + (metrics.get('vol_60d') or 0) * 80 + (metrics.get('atr14_pct') or 0) * 900 + abs(min(0, metrics.get('max_daily_drop_60d') or 0)) * 500)
+    dd = abs(min(0, metrics.get('mdd_60d') or 0)) * 150 + abs(min(0, metrics.get('mdd_120d') or 0)) * 180 + abs(min(0, metrics.get('current_dd_120d') or 0)) * 120
+    rec = 30 + (metrics.get('rebound_from_60d_low') or 0) * 80 + (metrics.get('rebound_from_120d_low') or 0) * 50 + (metrics.get('ret_20d') or 0) * 60 + (metrics.get('ret_60d') or 0) * 60
+    d60 = metrics.get('days_since_60d_low')
+    if d60 is not None:
+        rec += max(0, (30 - d60) * 1.2)
+    mr = 40 + max(0, -(metrics.get('big_up_next5_avg') or 0) * 500) + max(0, (metrics.get('big_down_next5_avg') or 0) * 500) + (abs(metrics.get('close_vs_ma20') or 0) + abs(metrics.get('close_vs_ma60') or 0)) * 120
+    ge = metrics.get('grid_efficiency')
+    ge_score = None if ge is None else _clamp_score(50 + ge * 1500)
+    return {
+        'trend_score': _clamp_score(trend),
+        'volatility_score': _clamp_score(vol),
+        'drawdown_score': _clamp_score(dd),
+        'recovery_score': _clamp_score(rec),
+        'mean_reversion_score': _clamp_score(mr),
+        'grid_efficiency_score': ge_score
+    }
+
+def _build_symbol_parameter_suggestion(scores, metrics, state):
+    default = {"take_profit_threshold":"normal","drawdown_confirm":"normal","tier1_sell_ratio":"normal","drip_weeks":"normal","grid_activity":"normal","cash_buffer":"normal"}
+    trend, rec, mr = scores.get('trend_score', 0) or 0, scores.get('recovery_score', 0) or 0, scores.get('mean_reversion_score', 0) or 0
+    vol, dd, ge = scores.get('volatility_score', 0) or 0, scores.get('drawdown_score', 0) or 0, scores.get('grid_efficiency_score')
+    if trend >= 75 and rec >= 65 and mr < 60:
+        return "trend_dominant", dict(default, take_profit_threshold="higher", drawdown_confirm="wider", tier1_sell_ratio="lower", drip_weeks="shorter", grid_activity="conservative"), "趋势强、恢复较快，止盈应克制。"
+    if mr >= 65 and ge is not None and ge >= 60:
+        return "grid_swing", dict(default, tier1_sell_ratio="higher", grid_activity="active"), "均值回归明显，网格适配度高。"
+    if vol >= 70 and dd >= 70 and rec < 50:
+        return "high_vol_slow_recovery", dict(default, take_profit_threshold="lower", drawdown_confirm="tighter", tier1_sell_ratio="higher", drip_weeks="longer", grid_activity="conservative", cash_buffer="higher"), "波动大回撤深恢复慢，建议更保守。"
+    return "balanced", default, "特征均衡，维持中性策略倾向。"
+
+def generate_symbol_profile_report(context):
+    try:
+        report = {"version": "3.13.23-SYMBOL-PROFILE-REPORT", "date": context.current_dt.strftime("%Y-%m-%d"), "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "note": "analysis only; no trading parameter changed", "symbols": {}}
+        for symbol in list(getattr(context, 'symbol_list', []) or []):
+            try:
+                state = (getattr(context, 'state', {}) or {}).get(symbol, {})
+                df = get_price(security=symbol, count=250, frequency='1d', fields=['open', 'high', 'low', 'close', 'volume', 'money'], fq='post')
+                if df is None or len(df) < 1 or 'close' not in getattr(df, 'columns', []):
+                    report["symbols"][symbol] = {"data_status": "insufficient_data", "history_count": 0}
+                    info('[Profile] {} 数据不足，跳过评分', symbol)
+                    continue
+                df = df.dropna(subset=['close'])
+                if len(df) < 60:
+                    report["symbols"][symbol] = {"data_status": "insufficient_data", "history_count": int(len(df))}
+                    info('[Profile] {} 数据不足({})，跳过评分', symbol, len(df))
+                    continue
+                close, high, low = df['close'], df['high'], df['low']
+                metrics = {}
+                metrics.update(_calc_returns(close))
+                metrics.update(_calc_volatility(close))
+                metrics['atr14_pct'] = _calc_atr_percent(high, low, close, window=14)
+                metrics['mdd_20d'] = _calc_max_drawdown(close, 20)
+                metrics['mdd_60d'] = _calc_max_drawdown(close, 60)
+                metrics['mdd_120d'] = _calc_max_drawdown(close, 120)
+                metrics['current_dd_60d'] = close.iloc[-1] / close.tail(60).max() - 1.0 if len(close) >= 60 else None
+                metrics['current_dd_120d'] = close.iloc[-1] / close.tail(120).max() - 1.0 if len(close) >= 120 else None
+                metrics.update(_calc_recovery_metrics(close))
+                metrics['ma20'] = close.tail(20).mean() if len(close) >= 20 else None
+                metrics['ma60'] = close.tail(60).mean() if len(close) >= 60 else None
+                metrics['ma120'] = close.tail(120).mean() if len(close) >= 120 else None
+                ma20_s = close.rolling(20).mean().dropna()
+                ma60_s = close.rolling(60).mean().dropna()
+                metrics['ma20_slope'] = (ma20_s.iloc[-1] / ma20_s.iloc[-21] - 1.0) if len(ma20_s) > 20 else None
+                metrics['ma60_slope'] = (ma60_s.iloc[-1] / ma60_s.iloc[-61] - 1.0) if len(ma60_s) > 60 else None
+                metrics['near_120d_high'] = close.iloc[-1] / close.tail(120).max() - 1.0 if len(close) >= 120 else None
+                metrics.update(_calc_mean_reversion_metrics(close))
+                metrics['close_vs_ma20'] = (close.iloc[-1] / metrics['ma20'] - 1.0) if metrics.get('ma20') else None
+                metrics['close_vs_ma60'] = (close.iloc[-1] / metrics['ma60'] - 1.0) if metrics.get('ma60') else None
+                pos = _safe_float(state.get('position', get_position(symbol).amount), 0.0)
+                grid_profit = _safe_float(state.get('wm_pnl', state.get('grid_pnl', state.get('history_pnl'))))
+                market_value = pos * close.iloc[-1] if pos is not None else None
+                metrics['grid_efficiency'] = (grid_profit / market_value) if (grid_profit is not None and market_value and market_value > 0) else None
+                scores = _calc_score_from_metrics(metrics)
+                profile_type, suggestion, explain = _build_symbol_parameter_suggestion(scores, metrics, state)
+                snap = {"pos": pos, "base_position": state.get('base_position'), "grid_unit": state.get('grid_unit'), "buy_stack_count": len(state.get('buy_stack', []) or []), "sell_stack_count": len(state.get('sell_stack', []) or []), "isolated_anchor_count": len(state.get('isolated_stack', state.get('quarantine_stack', [])) or []), "history_pnl": state.get('history_pnl'), "drip_active": (state.get('_drip_remain_weeks', 0) or 0) > 0, "drip_remain_weeks": state.get('_drip_remain_weeks', 0), "take_profit_tier": state.get('_tp_tier')}
+                report["symbols"][symbol] = {"name": dsym(context, symbol, style='short'), "data_status": "ok", "history_count": int(len(df)), "metrics": {k: _safe_float(v, v) for k, v in metrics.items()}, "scores": scores, "strategy_snapshot": snap, "profile_type": profile_type, "suggestion": suggestion, "explain": explain}
+                info('[Profile] {} trend={} vol={} recovery={} mr={} grid={} type={}', symbol, scores.get('trend_score'), scores.get('volatility_score'), scores.get('recovery_score'), scores.get('mean_reversion_score'), scores.get('grid_efficiency_score'), profile_type)
+            except Exception as e:
+                report["symbols"][symbol] = {"data_status": "error", "error": str(e)[:200]}
+                info('[Profile] {} 分析异常: {}', symbol, e)
+        p = research_path('reports', 'symbol_profile_{}.json'.format(context.current_dt.strftime("%Y-%m-%d")))
+        p.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
+        info('[Profile] 标的特性报告已生成: {}', str(p))
+    except Exception as e:
+        info('[Profile] 报告生成失败(忽略，不影响交易): {}', e)
+
 def update_daily_reports(context, data):
     reports_dir = research_path('reports')
     reports_dir.mkdir(parents=True, exist_ok=True)
@@ -2309,6 +2499,7 @@ def update_daily_reports(context, data):
             if is_new: f.write(",".join(["时间","市价","期数","次数","每期总收益率","盈亏比","应到价值","当周应投入金额","当周实际投入金额","实际累计投入金额","定投底仓份额","累计底仓份额","累计底仓价值","每期累计底仓盈利","总累计底仓盈利","底仓","股票余额","单次网格交易数量","可T数量","标准数量","中间数量","极限数量","成本价","对比定投成本","盈亏"]) + "\n")
             f.write(",".join(map(str, row)) + "\n")
         info('✅ [{}] 已更新每日CSV报表', dsym(context, symbol))
+    generate_symbol_profile_report(context)
 
 # ---------------- 【新增】水位线网格利润重构引擎 ----------------
 
