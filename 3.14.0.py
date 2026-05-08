@@ -432,7 +432,7 @@ def save_state(symbol, state):
                   'initial_base_position', 'initial_position_value',
                   'grid_atr_rate', 'macro_atr_rate', 'buy_stack', 'sell_stack', 'credit_limit', 
                   'history_pnl', '_fill_tracker', 'buy_grid_spacing', 'sell_grid_spacing',
-                  'dingtou_base', 'dingtou_rate', '_tp_hwm_ratio', '_tp_tier', '_macro_sell_ids',
+                  'dingtou_base', 'dingtou_rate', '_tp_hwm_ratio', '_tp_tier', '_macro_sell_ids', '_macro_tp_task', '_last_macro_tp_task',
                   'tp_cool_weeks', 'tp_min_weeks', 'tp_min_value', 'wm_map', 'wm_pnl',
                   'max_grid_count', '_drip_amount', '_drip_remain_weeks',
                   'archived_buy_anchor', 'archived_sell_anchor', '_pending_ignore_ids'] # 🌟 V3.13.22 补丁：持久化撤单后待忽略ID白名单
@@ -519,6 +519,12 @@ def init_symbol_state(context, sym, cfg):
     """
     state_file = research_path('state', f'{sym}.json')
     saved = json.loads(state_file.read_text(encoding='utf-8')) if state_file.exists() else get_saved_param(f'state_{sym}', {}) or {}
+    if isinstance(saved, dict) and saved.get('_macro_tp_pending') and not saved.get('_macro_tp_task'):
+        legacy = saved.get('_macro_tp_pending')
+        if isinstance(legacy, dict):
+            legacy_task = dict(legacy)
+            legacy_task['status'] = legacy_task.get('status') or 'pending'
+            saved['_macro_tp_task'] = legacy_task
     
     st = {**cfg}
     
@@ -573,6 +579,8 @@ def init_symbol_state(context, sym, cfg):
         '_tp_tier': saved.get('_tp_tier') if saved.get('_tp_tier') is not None else 0,
         
         '_macro_sell_ids': saved.get('_macro_sell_ids') or [],
+        '_macro_tp_task': saved.get('_macro_tp_task'),
+        '_last_macro_tp_task': saved.get('_last_macro_tp_task'),
         
         '_drip_amount': saved.get('_drip_amount') if saved.get('_drip_amount') is not None else 0.0,
         '_drip_remain_weeks': saved.get('_drip_remain_weeks') if saved.get('_drip_remain_weeks') is not None else 0,
@@ -636,6 +644,7 @@ def audit_initial_consistency(context, symbol):
 
 def _repair_state_logic(context):
     info('🛠️ [Data Repair] 开始检查并修复潜在的底仓数据异常...')
+    macro_tp_symbols = set()
     for sym in context.symbol_list:
         state = context.state[sym]
         weeks = len(state.get('trade_week_set', []))
@@ -715,6 +724,10 @@ def after_initialize_cleanup(context):
             order_info = OrderUtils.normalize(o)
             if order_info['std_symbol'] not in context.symbol_list: continue
             if OrderUtils.is_active(order_info): 
+                st = context.state.get(order_info['std_symbol'])
+                if st and _has_active_macro_tp_task(st):
+                    info('[{}] ⏭ 启动清理跳过：存在 active 宏观止盈任务，请人工确认。', dsym(context, order_info['std_symbol']))
+                    continue
                 to_cancel.append(order_info)
         
         if not to_cancel:
@@ -736,7 +749,11 @@ def after_initialize_cleanup(context):
         info('❌ 启动清理主流程异常: {}', e)
     
     for sym in context.symbol_list:
-        context.pending_frozen[sym] = 0
+        st = context.state.get(sym)
+        if st and _has_active_macro_tp_task(st):
+            _recalc_pending_frozen(context, sym)
+        else:
+            context.pending_frozen[sym] = 0
     info('✅ 全局清理完成')
 
 def _fast_cancel_all_orders_global(context):
@@ -979,6 +996,8 @@ def check_pending_rehangs(context):
 
             # 避让窗口：rehang 刚补单后短暂跳过 patrol，避免半点巡检+柜台回显延迟导致同标的重复补单
             state['_patrol_skip_until'] = context.current_dt + timedelta(seconds=5)
+            if _has_active_macro_tp_task(state):
+                continue
             place_limit_orders(context, sym, state, ignore_cooldown=True, ignore_entrust_nos=ignore_ids)
             safe_save_state(sym, state)
 
@@ -1486,23 +1505,16 @@ def on_trade_response(context, trade_list):
         price = float(raw_price)
         entrust_no = str(tr.get('entrust_no', ''))
 
-        # ==========================================
-        # [v3.12.0] 多空物理隔离：如果是宏观止盈单，不走网格对冲逻辑
-        # ==========================================
-        is_macro_sell = entrust_no in state.get('_macro_sell_ids', [])
-        
-        if not is_macro_sell:
-            process_trade_logic(context, sym, price, fill_amount)
-        else:
-            info('📦 [{}] 宏观止盈大单斩获成交! (ID:{}, 股数:{})，跳过底层网格堆栈记录。', dsym(context, sym), entrust_no[-6:], abs(fill_amount))
+        process_trade_logic(context, sym, price, fill_amount)
+        if _is_macro_tp_trade(context, sym, state, tr, fill_amount, price):
+            _record_macro_tp_fill(context, sym, state, fill_amount, price, status=status, source='trade_response')
 
         if '_fill_tracker' not in state: state['_fill_tracker'] = {}
         if entrust_no:
             state['_fill_tracker'][entrust_no] = state['_fill_tracker'].get(entrust_no, 0.0) + abs(fill_amount)
         
-        if not is_macro_sell:
-            info('✅ [{}] 成交回报! 方向: {}, 数量: {}, 价格: {:.3f} (ID:{}, Sts:{})', 
-                 dsym(context, sym), trade_dir, abs(fill_amount), price, bid[-6:] if bid else 'N/A', status)
+        info('✅ [{}] 成交回报! 方向: {}, 数量: {}, 价格: {:.3f} (ID:{}, Sts:{})', 
+             dsym(context, sym), trade_dir, abs(fill_amount), price, bid[-6:] if bid else 'N/A', status)
 
         is_fully_filled = (status == '8')
 
@@ -1510,17 +1522,18 @@ def on_trade_response(context, trade_list):
             if entrust_no:
                 state['filled_order_ids'].add(entrust_no)
 
-            if not is_macro_sell:
-                state['_last_trade_ts'] = context.current_dt
-                state['_last_fill_dt'] = context.current_dt
-                state['last_fill_price'] = price
-                state['base_price'] = price
+            state['_last_trade_ts'] = context.current_dt
+            state['_last_fill_dt'] = context.current_dt
+            state['last_fill_price'] = price
+            state['base_price'] = price
 
-            cancelled_ids = cancel_all_orders_by_symbol(context, sym)
-            if cancelled_ids: state['_pending_ignore_ids'] = list(cancelled_ids)
-
-            delay_s = StrategyConfig.DEBUG.DELAY_AFTER_CANCEL
-            state['_rehang_due_ts'] = datetime.now() + timedelta(seconds=max(delay_s, 2.0))
+            if _has_active_macro_tp_task(state):
+                info('[{}] ⏭ 宏观止盈任务未完成，跳过普通撤单/rehang。', dsym(context, sym))
+            else:
+                cancelled_ids = cancel_all_orders_by_symbol(context, sym)
+                if cancelled_ids: state['_pending_ignore_ids'] = list(cancelled_ids)
+                delay_s = StrategyConfig.DEBUG.DELAY_AFTER_CANCEL
+                state['_rehang_due_ts'] = datetime.now() + timedelta(seconds=max(delay_s, 2.0))
             
             context.mark_halted[sym] = False
             context.last_valid_price[sym] = price
@@ -1531,8 +1544,7 @@ def on_trade_response(context, trade_list):
             state.pop('_last_order_bp', None)
             context.should_place_order_map[sym] = True
         else:
-            if not is_macro_sell:
-                info('⏳ [{}] 订单部成 (ID:{}), 仅记录筹码, 基准价保持不变, 剩余挂单继续排队...', dsym(context, sym), entrust_no)
+            info('⏳ [{}] 订单部成 (ID:{}), 仅记录筹码, 基准价保持不变, 剩余挂单继续排队...', dsym(context, sym), entrust_no)
         
         try: state['_last_pos_seen'] = get_position(sym).amount
         except: state['_last_pos_seen'] = None
@@ -1676,15 +1688,11 @@ def on_order_filled(context, symbol, order):
         current_frozen = context.pending_frozen.get(symbol, 0)
         context.pending_frozen[symbol] = max(0, current_frozen - abs(order.filled))
 
-    # 🌟 修复点：物理隔离宏观止盈单
-    entrust_no = str(getattr(order, 'entrust_no', ''))
-    if entrust_no and entrust_no in state.get('_macro_sell_ids', []):
-        # 已经被 on_trade_response 处理过或属于宏观单，直接跳过
-        return
-
     # 直接调用新核心
     real_amount = order.filled if order.amount > 0 else -order.filled
     process_trade_logic(context, symbol, order.price, real_amount)
+    if _has_active_macro_tp_task(state) and real_amount < 0:
+        _record_macro_tp_fill(context, symbol, state, real_amount, order.price, status=None, source='fill_recover')
     
 def _fill_recover_watch(context, symbol, state):
     now_dt = context.current_dt
@@ -1797,10 +1805,13 @@ def patrol_and_correct_orders(context, symbol, state):
                 if filled_qty <= 0: continue
                 
                 if eid not in tracker:
-                    tracker[eid] = float(filled_qty)
-                    continue
-                    
-                processed_qty = tracker[eid]
+                    if _has_active_macro_tp_task(state) and OrderUtils.is_sell(o_info):
+                        processed_qty = 0.0
+                    else:
+                        tracker[eid] = float(filled_qty)
+                        continue
+                else:
+                    processed_qty = tracker[eid]
                 delta = filled_qty - processed_qty
                 
                 if delta > 0.9: 
@@ -1810,11 +1821,9 @@ def patrol_and_correct_orders(context, symbol, state):
                     
                     info('🕵️ [{}] [补录] 发现漏单! 漏:{} (总成:{} vs 已记:{})', dsym(context, symbol), delta, filled_qty, processed_qty)
                     
-                    # [V3.12.0] 如果是宏观止盈单，漏单补录也不入网格账本
-                    if eid in state.get('_macro_sell_ids', []):
-                         info('📦 [{}] 补录判定为宏观止盈单，跳过入栈。', dsym(context, symbol))
-                    else:
-                         process_trade_logic(context, symbol, trade_price, real_amount)
+                    process_trade_logic(context, symbol, trade_price, real_amount)
+                    if _has_active_macro_tp_task(state):
+                        _record_macro_tp_fill(context, symbol, state, real_amount, trade_price, status=None, source='fill_patrol')
                     
                     tracker[eid] = float(filled_qty)
                     state['history_pnl'] = state.get('history_pnl', 0.0) 
@@ -1882,7 +1891,6 @@ def patrol_and_correct_orders(context, symbol, state):
                 else: valid_buy_orders.append(o)
             else: 
                 # [V3.12.0] 宏观大单不属于被巡检撤销的范围，直接无视
-                if entrust_no in state.get('_macro_sell_ids', []): continue
                 
                 if not should_have_sell_order: is_wrong = True 
                 elif abs(o_price - sell_p) / (sell_p + 1e-9) >= 0.002: is_wrong = True 
@@ -1927,6 +1935,8 @@ def patrol_and_correct_orders(context, symbol, state):
             
             state.pop('_last_order_ts', None)
             state.pop('_last_order_bp', None)
+            if _has_active_macro_tp_task(state):
+                return
             place_limit_orders(context, symbol, state, ignore_cooldown=True, bypass_lock=True, ignore_entrust_nos=cancelled_ids)
             return 
 
@@ -1978,22 +1988,34 @@ def _mark_macro_tp_task_abnormal(context, symbol, state, reason):
     task['status']='abnormal'; task['abnormal_reason']=str(reason); task['updated_at']=context.current_dt.strftime('%Y-%m-%d %H:%M:%S')
 
 def _calc_grid_unit_for_base(base_position, price, max_grids):
-    price=max(0.01,float(price));max_grids=max(1,int(max_grids))
-    return max(100, int(math.floor((base_position/max_grids)/100.0)*100))
+    price = max(0.01, float(price))
+    max_grids = max(1, int(max_grids))
+    scale_multiplier = max_grids * 2
+    theoretical_unit = int(math.ceil(float(base_position) / scale_multiplier / 100.0) * 100)
+    floor_unit_val = max(100, int(math.ceil(1000.0 / price / 100.0) * 100))
+    capped_unit_val = max(floor_unit_val, int(math.floor(MAX_TRADE_AMOUNT / price / 100.0) * 100))
+    unit = min(max(theoretical_unit, floor_unit_val), capped_unit_val)
+    return max(100, int(unit))
 
 def _reanchor_base_after_macro_tp(context, symbol, state, remaining_pos, price):
-    max_grids=int(state.get('max_grid_count',12)); ratio=float(state.get('tp_reanchor_grid_ratio',0.6))
-    target=max_grids*ratio
-    best=None
-    for unit in [100,200,300,500,800,1000,1500,2000,3000,5000]:
-        base=max(0,int(math.floor((remaining_pos-target*unit)/100.0)*100))
-        water=(remaining_pos-base)/max(unit,1)
-        err=abs(water-target)
-        if best is None or err<best[0]: best=(err,base,unit)
-    _,base,unit=best
-    state['base_position']=base; state['initial_base_position']=base; state['last_week_position']=base
-    state['grid_unit']=max(100,int(unit)); state['max_position']=base+state['grid_unit']*max_grids
-    state['initial_position_value']=base*float(price)
+    max_grids = int(state.get('max_grid_count', 12))
+    ratio = float(state.get('tp_reanchor_grid_ratio', 0.6))
+    target_grid_count = max_grids * ratio
+    rem = max(0, int(math.floor(float(remaining_pos) / 100.0) * 100))
+    best = None
+    for candidate_base in range(0, rem + 100, 100):
+        unit = _calc_grid_unit_for_base(candidate_base, price, max_grids)
+        water = (float(remaining_pos) - candidate_base) / max(unit, 1)
+        score = abs(water - target_grid_count)
+        if (best is None) or (score < best[0]) or (abs(score - best[0]) <= 1e-12 and candidate_base > best[1]):
+            best = (score, candidate_base, unit)
+    _, base, unit = best
+    state['base_position'] = int(base)
+    state['initial_base_position'] = int(base)
+    state['last_week_position'] = int(base)
+    state['grid_unit'] = int(unit)
+    state['max_position'] = int(base) + int(unit) * max_grids
+    state['initial_position_value'] = float(base) * float(price)
 
 def _finalize_macro_tp_task(context, symbol, state, final_price):
     task=_get_macro_tp_task(state)
@@ -2020,29 +2042,36 @@ def _record_macro_tp_fill(context, symbol, state, fill_qty, fill_price, status=N
 # ---------------- 【核心】宏观止盈引擎 ----------------
 
 def _check_macro_take_profit(context, symbol, state, price, dt):
-    """
-    [Global Ver: v3.13.11] [Func Ver: 4.2]
-    [Change]: 修复连续止盈导致的滴灌池资金被覆盖遗忘的漏洞，引入资金滚存机制。
-    """
     try:
-        pos = get_position(symbol)
-        if pos.amount == 0 or pos.cost_basis <= 0: return
-        config = getattr(context, 'symbol_config', {}).get(symbol, {})
-        tp_cool_weeks, min_weeks, min_val = _get_runtime_tp_params(context, symbol, state)
+        task = _get_macro_tp_task(state)
+        if _has_active_macro_tp_task(state):
+            if task and task.get('status') in ['pending', 'partial_filled']:
+                info('[{}] ⏭ 宏观止盈任务进行中(status={})，本轮跳过普通网格动作。', dsym(context, symbol), task.get('status'))
+            else:
+                info('[{}] ⏭ 宏观止盈任务异常(status={})，等待人工处理。', dsym(context, symbol), task.get('status') if task else 'unknown')
+            return True
 
-        if len(state.get('trade_week_set', set())) < tp_cool_weeks: return
-        if len(state.get('trade_week_set', set())) < min_weeks or (pos.amount * price) < min_val: return
+        pos = get_position(symbol)
+        if pos.amount == 0 or pos.cost_basis <= 0:
+            return False
+
+        tp_cool_weeks, min_weeks, min_val = _get_runtime_tp_params(context, symbol, state)
+        if len(state.get('trade_week_set', set())) < tp_cool_weeks:
+            return False
+        if len(state.get('trade_week_set', set())) < min_weeks or (pos.amount * price) < min_val:
+            return False
 
         atr = calculate_macro_atr(context, symbol, atr_period=60) or 0.02
-        state['macro_atr_rate'] = atr  
+        state['macro_atr_rate'] = atr
         profit_ratio = (price - pos.cost_basis) / pos.cost_basis
         hwm = max(state.get('_tp_hwm_ratio', 0.0), profit_ratio)
         state['_tp_hwm_ratio'] = hwm
 
         tier = 0
         for t, thresh in {3: 30.0*atr, 2: 20.0*atr, 1: 10.0*atr}.items():
-            if profit_ratio >= thresh: 
-                tier = max(state.get('_tp_tier', 0), t); break
+            if profit_ratio >= thresh:
+                tier = max(state.get('_tp_tier', 0), t)
+                break
         if tier > state.get('_tp_tier', 0):
             state['_tp_tier'] = tier
             info('[{}] 🚀 宏观止盈警报升级: Tier {}', dsym(context, symbol), tier)
@@ -2050,48 +2079,21 @@ def _check_macro_take_profit(context, symbol, state, price, dt):
         if tier > 0 and (hwm - profit_ratio) >= {1: 3.0*atr, 2: 5.0*atr, 3: 8.0*atr}.get(tier, 0.05):
             sell_ratio = {1: 0.33, 2: 0.50, 3: 1.0}.get(tier, 0.33)
             sell_amount = pos.amount if tier == 3 else math.floor(pos.amount * sell_ratio / 100) * 100
-            
             if sell_amount > 0:
+                drip_weeks = {1: 16, 2: 24, 3: 52}.get(tier, 16)
+                cancelled_ids = cancel_all_orders_by_symbol(context, symbol)
                 eid = order(symbol, -sell_amount, price)
                 if eid:
-                    state.setdefault('_macro_sell_ids', []).append(str(eid))
-                    total_cash = sell_amount * price
-                    
-                    drip_weeks = {1: 16, 2: 24, 3: 52}.get(tier, 16)
-                    
-                    # 🌟 V3.13.11 核心修复：核算并融合上一轮未释放的旧滴灌资金 (滚存机制)
-                    unreleased_cash = state.get('_drip_amount', 0.0) * state.get('_drip_remain_weeks', 0)
-                    total_drip_pool = total_cash + unreleased_cash
-                    
-                    state['_drip_amount'] = total_drip_pool / drip_weeks
-                    state['_drip_remain_weeks'] = drip_weeks
-                    
-                    # 强行清洗被污染的基数
-                    state['dingtou_base'] = config.get('dingtou_base', 0)
-                    
-                    unit = state['grid_unit']
-                    max_grids = state.get('max_grid_count', 12)
-                    remaining_pos = pos.amount - sell_amount
-                    
-                    new_base = max(state['initial_base_position'], remaining_pos - max_grids * unit)
-                    new_base = math.floor(new_base / 100) * 100
-                    
-                    state['base_position'] = new_base
-                    state['last_week_position'] = new_base
-                    state['initial_base_position'] = new_base
-                    state['initial_position_value'] = new_base * price
-                    
-                    adjust_grid_unit(state)
-                    
-                    state['trade_week_set'] = set() 
-                    state['_tp_hwm_ratio'], state['_tp_tier'] = 0.0, 0
-                    
-                    info('[{}] ♻️ 止盈重置成功：锁定新底仓 {} 股，新增及滚存现金共 {:.2f} 元，将分 {} 周平滑滴灌。', dsym(context, symbol), new_base, total_drip_pool, drip_weeks)
+                    state.setdefault('_fill_tracker', {})[str(eid)] = 0.0
+                    context.pending_frozen[symbol] = context.pending_frozen.get(symbol, 0) + sell_amount
+                    state['_ignore_place_until'] = datetime.now() + timedelta(seconds=60)
+                    _create_macro_tp_task(context, symbol, state, eid, sell_amount, price, tier, drip_weeks, pos.amount, cancelled_ids)
                     safe_save_state(symbol, state)
-                    
+                    return True
+        return False
     except Exception as e:
         log.error(f"[{symbol}] 宏观止盈引擎执行异常: {e}")
-                    
+        return False
 
 # ---------------- 行情主循环 ----------------
 
@@ -2146,8 +2148,11 @@ def handle_data(context, data):
         price = context.latest_data.get(sym)
         if is_valid_price(price):
             # [V3.12.11 热修复]: 补齐 now_dt 参数
-            _check_macro_take_profit(context, sym, st, price, now_dt)
-            
+            macro_tp_triggered = _check_macro_take_profit(context, sym, st, price, now_dt)
+            if macro_tp_triggered:
+                macro_tp_symbols.add(sym)
+                continue
+
             get_target_base_position(context, sym, st, price, now_dt)
             adjust_grid_unit(st)
             if now_dt.minute % 30 == 0 and now_dt.second < 5:
@@ -2156,7 +2161,7 @@ def handle_data(context, data):
     is_patrol_time = (now_dt.minute % 30 == 0 and now_dt.second < 5)
     if not is_patrol_time and (is_auction_time() or (is_main_trading_time() and now < dtime(14, 55))):
         for sym in context.symbol_list:
-            if sym in context.state:
+            if sym in context.state and sym not in macro_tp_symbols:
                 place_limit_orders(context, sym, context.state[sym], ignore_cooldown=False)
 
     for sym in context.symbol_list:
@@ -2309,9 +2314,16 @@ def update_grid_spacing_final(context, symbol, state, curr_pos):
 
 def end_of_day(context):
     info('✅ 日终处理 (Start @ 14:55) [GLOBAL BATCH CANCEL]')
-    _fast_cancel_all_orders_global(context)
     for sym in context.symbol_list:
-        if sym in context.state: safe_save_state(sym, context.state[sym])
+        st = context.state.get(sym)
+        if not st:
+            continue
+        if _has_active_macro_tp_task(st):
+            info('[{}] ⏭ 日终跳过撤单：存在 active 宏观止盈任务，请人工关注。', dsym(context, sym))
+            safe_save_state(sym, st)
+            continue
+        cancel_all_orders_by_symbol(context, sym)
+        safe_save_state(sym, st)
     info('✅ 日终作业完成，PnL计算已推迟至盘后。')
 
 # ---------------- VA & Tools ----------------
