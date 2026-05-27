@@ -92,7 +92,7 @@ import pandas as pd
 # ---------------- 全局句柄 ----------------
 LOG_FH = None
 LOG_DATE = None
-__version__ = 'CHATGPT-3.14.8-STACK-CLOSEST-PROFITABLE-MATCH'
+__version__ = 'CHATGPT-3.14.9-INTRADAY-EDGE-PRESSURE-GRID'
 
 # ---------------- 配置管理类 ----------------
 
@@ -859,19 +859,19 @@ def place_auction_orders(context):
         context.latest_data[sym] = state['base_price']
         
         base = state['base_price']
-        unit = state['grid_unit']
-        
-        update_grid_spacing_final(context, sym, state, pos)
 
-        # 1. 原始计算
-        buy_sp, sell_sp = state['buy_grid_spacing'], state['sell_grid_spacing']
-        buy_p = round(base * (1 - buy_sp), 3)
-        sell_p = round(base * (1 + sell_sp), 3)
-        
         # [v3.8 同步升级] -----------------------------------------------
         # 提前获取持仓数据，判定 VA 建仓特权
         position = get_position(sym)
         pos = position.amount
+        _ensure_intraday_edge_state(context, sym, state, pos)
+        update_grid_spacing_final(context, sym, state, pos)
+
+        unit = state['grid_unit']
+        # 1. 原始计算
+        buy_sp, sell_sp = state['buy_grid_spacing'], state['sell_grid_spacing']
+        buy_p = round(base * (1 - buy_sp), 3)
+        sell_p = round(base * (1 + sell_sp), 3)
         enable = position.enable_amount - context.pending_frozen.get(sym, 0)
         
         target_base_pos = state.get('base_position', 0)
@@ -1283,13 +1283,15 @@ def place_limit_orders(context, symbol, state, ignore_cooldown=False, bypass_loc
     allow_tickless = boot_grace or is_auction_time()
 
     base = state['base_price']
-    unit, buy_sp, sell_sp = state['grid_unit'], state['buy_grid_spacing'], state['sell_grid_spacing']
-    
+
     # 提前获取持仓与缺口信息
     position = get_position(symbol)
     pos = position.amount 
     _ensure_intraday_edge_state(context, symbol, state, pos)
     update_grid_spacing_final(context, symbol, state, pos)
+    unit = state['grid_unit']
+    buy_sp = state['buy_grid_spacing']
+    sell_sp = state['sell_grid_spacing']
     target_base_pos = state.get('base_position', 0)
     
     # 1. 原始计算 (网格理论挂单价)
