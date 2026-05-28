@@ -1565,7 +1565,7 @@ def place_limit_orders(context, symbol, state, ignore_cooldown=False, bypass_loc
                 if eid:
                     _mark_order_submit_guard(context, symbol, unit, buy_p)
                     state['_fill_tracker'][str(eid)] = 0.0
-                info('[{}] --> 发起买入委托: {}股 @ {:.3f}', dsym(context, symbol), unit, buy_p)
+                    info('[{}] --> 发起买入委托: {}股 @ {:.3f}', dsym(context, symbol), unit, buy_p)
             except Exception as e:
                 err_str = str(e)
                 if "超过涨跌停范围" in err_str or "120162" in err_str:
@@ -1603,8 +1603,8 @@ def place_limit_orders(context, symbol, state, ignore_cooldown=False, bypass_loc
                 if eid:
                     _mark_order_submit_guard(context, symbol, -unit, sell_p)
                     state['_fill_tracker'][str(eid)] = 0.0
-                info('[{}] --> 发起卖出委托: {}股 @ {:.3f} (可用:{}, 冻结:{})', dsym(context, symbol), unit, sell_p, enable_amount, pending_frozen)
-                context.pending_frozen[symbol] = pending_frozen + unit
+                    info('[{}] --> 发起卖出委托: {}股 @ {:.3f} (可用:{}, 冻结:{})', dsym(context, symbol), unit, sell_p, enable_amount, pending_frozen)
+                    context.pending_frozen[symbol] = pending_frozen + unit
             except Exception as e:
                 err_str = str(e)
                 if "超过涨跌停范围" in err_str or "120162" in err_str:
