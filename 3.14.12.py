@@ -1,5 +1,10 @@
 # event_driven_grid_strategy.py
-# 版本号：CHATGPT-3.14.11-DUPLICATE-ORDER-GUARD
+# 版本号：CHATGPT-3.14.12-MACRO-TP-HWM-UPDATE-BEFORE-SKIP
+# [v3.14.12 更新]
+# - 修复宏观止盈 HWM / Tier 更新被 tp_min_value、tp_min_weeks 等跳过条件提前拦截的问题。
+# - HWM / Tier 现在先更新并保存，低于 tp_min_value 时只禁止真正下止盈卖单，不禁止记录新高点和抬高回撤防线。
+# - 不修改 3.14.11 重复发单保护、3.14.10 armed_tier、3.14.9 水位压力模型、stack、VA、滴灌、FillPatrol、守门员和天地锁逻辑。
+#
 # [v3.14.11 更新]
 # - 新增短时间重复发单保护，拦截3秒内完全相同的重复委托。
 # - 仅对 symbol+side+price+amount 全一致的短时重复提交做拦截。
