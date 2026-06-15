@@ -1,5 +1,11 @@
 # event_driven_grid_strategy.py
-# 版本号：CHATGPT-3.14.14-CONTINUOUS-EDGE-RATIO-CONTROLLER
+# 版本号：CHATGPT-3.14.15-MACRO-TP-COOLDOWN-HWM-GUARD
+# [v3.14.15 更新]
+# - 修复宏观止盈 HWM / Tier 在断代保护期、止盈定投期限未达标、止盈金额未达标期间仍被记录的问题。
+# - 断代保护期、止盈定投期限内、止盈金额内均禁止记录 HWM / Tier；如发现残留 HWM / Tier，立即清除。
+# - 滴灌期不作为禁止宏观止盈条件；断代保护结束且定投期限、金额达标后，即使仍在滴灌期，也允许重新记录 HWM / Tier 并触发宏观止盈。
+# - 不修改 3.14.14 连续水位比例控制器、普通网格、VA、滴灌、FillPatrol、守门员、天地锁、stack 最近盈利配对和重复发单保护。
+#
 # [v3.14.14 更新]
 # - 将 3.14.13 的阶梯倍率地板升级为连续水位比例控制器。
 # - 水位决定基础倍率，日内单边推进增加倍率，买卖配对质量降低倍率，极端边缘保留普通网格硬刹车。
@@ -396,35 +402,64 @@ def _get_macro_tp_cooldown_info(context, symbol, state):
     返回宏观止盈断代保护期状态。
     注意：这里只读取 trade_week_set，不调用 get_trade_weeks()，避免触发滴灌释放或改变周数。
     """
+    guard = _get_macro_tp_tracking_guard(context, symbol, state)
+    return {
+        'active': guard['cool_active'],
+        'weeks': guard['weeks'],
+        'tp_cool_weeks': guard['tp_cool_weeks'],
+        'remain': max(0, guard['tp_cool_weeks'] - guard['weeks']) if guard['cool_active'] else 0,
+        'min_weeks': guard['min_weeks'],
+        'min_val': guard['min_val'],
+    }
+
+def _get_macro_tp_tracking_guard(context, symbol, state, pos=None, price=None):
+    """
+    统一判断宏观止盈 HWM / Tier 是否允许记录。
+    只读取 trade_week_set，不调用 get_trade_weeks()，避免改变周数或触发滴灌释放。
+    """
     tp_cool_weeks, min_weeks, min_val = _get_runtime_tp_params(context, symbol, state)
     weeks = len((state or {}).get('trade_week_set', set()) or set())
 
-    if min_weeks >= 999:
-        return {
-            'active': False,
-            'weeks': weeks,
-            'tp_cool_weeks': tp_cool_weeks,
-            'remain': 0,
-            'min_weeks': min_weeks,
-            'min_val': min_val,
-        }
+    amount = getattr(pos, 'amount', None) if pos is not None else None
+    market_value = None
+    if amount is not None and price is not None and is_valid_price(price):
+        market_value = float(amount) * float(price)
 
-    active = (tp_cool_weeks > 0 and weeks <= tp_cool_weeks)
-    remain = max(0, tp_cool_weeks - weeks)
+    disabled = min_weeks >= 999
+    cool_active = (not disabled and tp_cool_weeks > 0 and weeks <= tp_cool_weeks)
+    min_weeks_block = (not disabled and weeks < min_weeks)
+    min_value_block = (not disabled and market_value is not None and market_value < min_val)
 
+    if disabled:
+        reason = 'disabled'
+    elif cool_active:
+        reason = 'tp_cool_weeks'
+    elif min_weeks_block:
+        reason = 'tp_min_weeks'
+    elif min_value_block:
+        reason = 'tp_min_value'
+    else:
+        reason = 'allow'
+
+    allow_tracking = (reason == 'allow')
     return {
-        'active': active,
+        'allow_tracking': allow_tracking,
+        'reason': reason,
         'weeks': weeks,
         'tp_cool_weeks': tp_cool_weeks,
-        'remain': remain,
         'min_weeks': min_weeks,
         'min_val': min_val,
+        'market_value': market_value,
+        'cool_active': cool_active,
+        'min_weeks_block': min_weeks_block,
+        'min_value_block': min_value_block,
+        'disabled': disabled,
     }
 
-def _clear_macro_tp_tracking_if_cooling(context, symbol, state, reason='cooldown'):
+def _clear_macro_tp_tracking_if_blocked(context, symbol, state, reason='blocked'):
     """
-    断代保护期内清除宏观止盈追踪状态。
-    只清除 HWM / Tier，不清除滴灌、trade_week_set、stack、VA 或宏观任务记录。
+    宏观止盈追踪关闭时清除 HWM / Tier。
+    只清除 HWM / Tier，不清除滴灌、trade_week_set、宏观任务、stack、VA 或普通网格字段。
     """
     changed = False
 
@@ -437,11 +472,14 @@ def _clear_macro_tp_tracking_if_cooling(context, symbol, state, reason='cooldown
         changed = True
 
     if changed:
-        info('[{}] ❄️ 断代保护期：清除宏观止盈 HWM/Tier，reason={}',
+        info('[{}] ❄️ 宏观止盈追踪关闭：清除 HWM/Tier，reason={}',
              dsym(context, symbol), reason)
         safe_save_state(symbol, state)
 
     return changed
+
+def _clear_macro_tp_tracking_if_cooling(context, symbol, state, reason='cooldown'):
+    return _clear_macro_tp_tracking_if_blocked(context, symbol, state, reason=reason)
 
 def check_environment():
     try:
@@ -736,9 +774,16 @@ def _repair_state_logic(context):
     info('🛠️ [Data Repair] 开始检查并修复潜在的底仓数据异常...')
     for sym in context.symbol_list:
         state = context.state[sym]
-        cool = _get_macro_tp_cooldown_info(context, sym, state)
-        if cool['active']:
-            _clear_macro_tp_tracking_if_cooling(context, sym, state, reason='startup_repair')
+        try:
+            position = get_position(sym)
+        except Exception:
+            position = None
+        price = context.latest_data.get(sym, state.get('base_price')) if hasattr(context, 'latest_data') else state.get('base_price')
+        if not is_valid_price(price):
+            price = state.get('base_price')
+        guard = _get_macro_tp_tracking_guard(context, sym, state, pos=position, price=price)
+        if not guard['allow_tracking']:
+            _clear_macro_tp_tracking_if_blocked(context, sym, state, reason='startup_' + guard['reason'])
 
         weeks = len(state.get('trade_week_set', []))
         if weeks <= 0: continue
@@ -2543,11 +2588,12 @@ def _check_macro_take_profit(context, symbol, state, price, dt):
                 info('[{}] ⏭ 宏观止盈任务异常(status={})，等待人工处理。', dsym(context, symbol), task.get('status') if task else 'unknown')
             return True
 
-        cool = _get_macro_tp_cooldown_info(context, symbol, state)
-        if cool['active']:
-            _clear_macro_tp_tracking_if_cooling(context, symbol, state, reason='tp_cool_weeks')
-            info('[{}] ❄️ 宏观止盈断代保护中: weeks={}/{} remain={}，跳过 HWM/Tier 记录与止盈检查',
-                 dsym(context, symbol), cool['weeks'], cool['tp_cool_weeks'], cool['remain'])
+        guard = _get_macro_tp_tracking_guard(context, symbol, state, pos=pos, price=price)
+        if not guard['allow_tracking']:
+            _clear_macro_tp_tracking_if_blocked(context, symbol, state, reason=guard['reason'])
+            market_value = guard['market_value'] if guard['market_value'] is not None else 0.0
+            info('[{}] ❄️ 宏观止盈追踪关闭: reason={}, weeks={}, cool={}, min_weeks={}, market_value={:.2f}, min_val={:.2f}，跳过 HWM/Tier 记录与止盈检查',
+                 dsym(context, symbol), guard['reason'], guard['weeks'], guard['cool_active'], guard['min_weeks'], market_value, guard['min_val'])
             return False
 
         atr = calculate_macro_atr(context, symbol, atr_period=60) or 0.02
@@ -2580,11 +2626,6 @@ def _check_macro_take_profit(context, symbol, state, price, dt):
 
         if hwm_updated or tier_updated:
             safe_save_state(symbol, state)
-
-        min_weeks = cool['min_weeks']
-        min_val = cool['min_val']
-        if len(state.get('trade_week_set', set())) < min_weeks or (pos.amount * price) < min_val:
-            return False
 
         tier = int(state.get('_tp_tier', 0) or 0)
         hwm = float(state.get('_tp_hwm_ratio', profit_ratio) or profit_ratio)
@@ -3224,9 +3265,9 @@ def generate_html_report(context):
             elif any(k in name_str for k in ['红利', '低波', '收息']): portfolio_val['dividend'] += market_value
             else: portfolio_val['other'] += market_value
             
-            cool = _get_macro_tp_cooldown_info(context, symbol, state)
-            min_weeks = cool['min_weeks']
-            min_val = cool['min_val']
+            guard = _get_macro_tp_tracking_guard(context, symbol, state, pos=position, price=price)
+            min_weeks = guard['min_weeks']
+            min_val = guard['min_val']
             
             trade_weeks = state.get('trade_week_set', set())
             current_weeks = len(trade_weeks)
@@ -3239,18 +3280,19 @@ def generate_html_report(context):
             
             status_html = ""
             radar_html = ""
-            if min_weeks >= 999:
+            if min_weeks >= 999 or guard['reason'] == 'disabled':
                 status_html = '<span class="badge badge-safe">🟢 信仰长拿</span>'
                 radar_html = '<div style="width:110px;"><span class="text-dim">🔒 防线关闭</span></div>'
-            elif cool['active']:
+            elif guard['reason'] == 'tp_cool_weeks':
                 status_html = '<span class="badge badge-cooldown">❄️ 物理冷却期</span>'
-                if cool['remain'] > 0:
-                    radar_html = f'<div style="width:110px;"><span class="text-dim">静默断代 (余 {cool["remain"]} 周)</span></div>'
+                remain = max(0, guard['tp_cool_weeks'] - guard['weeks'])
+                if remain > 0:
+                    radar_html = f'<div style="width:110px;"><span class="text-dim">静默断代 (余 {remain} 周)</span></div>'
                 else:
                     radar_html = '<div style="width:110px;"><span class="text-dim">静默断代 (本周保护)</span></div>'
-            elif current_weeks < min_weeks and market_value < min_val:
+            elif guard['reason'] in ['tp_min_weeks', 'tp_min_value']:
                 status_html = '<span class="badge badge-seed">🌱 幼苗保护期</span>'
-                progress = min(100, int((current_weeks / min_weeks) * 100))
+                progress = min(100, int((current_weeks / min_weeks) * 100)) if min_weeks > 0 else 100
                 radar_html = f'<div style="width:110px;"><div class="progress-bg"><div class="progress-fill fill-seed" style="width: {progress}%;"></div></div><div class="text-dim" style="margin-top:4px;">养肥中 ({current_weeks}/{min_weeks}周)</div></div>'
             elif tier > 0:
                 status_html = f'<span class="badge badge-alert">🔥 Tier {tier} 警戒!</span>'
