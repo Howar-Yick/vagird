@@ -553,7 +553,7 @@ def save_state(symbol, state):
                   'history_pnl', '_fill_tracker', 'buy_grid_spacing', 'sell_grid_spacing',
                   'dingtou_base', 'dingtou_rate', '_tp_hwm_ratio', '_tp_tier', '_macro_sell_ids', '_macro_tp_task', '_last_macro_tp_task',
                   'tp_cool_weeks', 'tp_min_weeks', 'tp_min_value', 'wm_map', 'wm_pnl',
-                  'max_grid_count', '_drip_amount', '_drip_remain_weeks',
+                  'max_grid_count', '_drip_amount', '_drip_remain_weeks', 'va_enabled',
                   'archived_buy_anchor', 'archived_sell_anchor', '_pending_ignore_ids',
                   '_edge_day', '_edge_start_water', '_edge_buy_qty', '_edge_sell_qty', '_edge_buy_count', '_edge_sell_count'] # 🌟 V3.13.22 补丁：持久化撤单后待忽略ID白名单
     
@@ -666,6 +666,7 @@ def init_symbol_state(context, sym, cfg):
         
         'dingtou_base': saved.get('dingtou_base') if saved.get('dingtou_base') is not None else cfg.get('dingtou_base', 0),
         'dingtou_rate': saved.get('dingtou_rate') if saved.get('dingtou_rate') is not None else cfg.get('dingtou_rate', 0),
+        'va_enabled': saved.get('va_enabled') if saved.get('va_enabled') is not None else cfg.get('va_enabled', True),
         
         'base_price': saved.get('base_price', cfg.get('base_price', 1.0)),
         'grid_unit': saved.get('grid_unit', cfg.get('grid_unit', 100)),
@@ -784,6 +785,9 @@ def _repair_state_logic(context):
         guard = _get_macro_tp_tracking_guard(context, sym, state, pos=position, price=price)
         if not guard['allow_tracking']:
             _clear_macro_tp_tracking_if_blocked(context, sym, state, reason='startup_' + guard['reason'])
+
+        if not bool(state.get('va_enabled', True)):
+            continue
 
         weeks = len(state.get('trade_week_set', []))
         if weeks <= 0: continue
@@ -2921,6 +2925,9 @@ def end_of_day(context):
 def get_target_base_position(context, symbol, state, price, dt):
     try:
         weeks = get_trade_weeks(context, symbol, state, dt)
+        if not bool(state.get('va_enabled', True)):
+            state['max_position'] = state['base_position'] + state['grid_unit'] * state.get('max_grid_count', 12)
+            return state['base_position']
         accumulated_investment = sum(state['dingtou_base'] * (1 + state['dingtou_rate'])**w for w in range(1, weeks + 1))
         target_val, current_val = state['initial_position_value'] + accumulated_investment, state['base_position'] * price
         surplus, grid_value = current_val - target_val, state['grid_unit'] * price
@@ -3108,6 +3115,10 @@ def reload_config_if_changed(context):
                 
                 if 'max_grid_count' in new_params:
                     state['max_grid_count'] = new_params['max_grid_count']
+
+                if 'va_enabled' in new_params:
+                    state['va_enabled'] = bool(new_params['va_enabled'])
+                    info('[{}] 🔧 VA开关更新: va_enabled={}', dsym(context, sym), state['va_enabled'])
                 
                 max_grids = state.get('max_grid_count', 12)
                 
@@ -3332,7 +3343,8 @@ def generate_html_report(context):
             symbol_name = dsym(context, symbol, style='long')
             sym_id_js = symbol.replace('.', '_')
             
-            symbol_html = f"<div style=\"cursor:pointer; color:#7aa2f7; font-weight:bold; font-size:14px; white-space:nowrap;\" onclick=\"toggleDrawer('{sym_id_js}')\">🔽 {symbol_name}</div><div style=\"color:#9aa5ce; font-size:11px; margin-left:22px; margin-top:2px; white-space:nowrap;\">定投: {current_weeks}周 | 网格: {int(state.get('grid_unit',0))}股</div>"
+            va_line = '定投: 关闭' if not bool(state.get('va_enabled', True)) else f'定投: {current_weeks}周'
+            symbol_html = f"<div style=\"cursor:pointer; color:#7aa2f7; font-weight:bold; font-size:14px; white-space:nowrap;\" onclick=\"toggleDrawer('{sym_id_js}')\">🔽 {symbol_name}</div><div style=\"color:#9aa5ce; font-size:11px; margin-left:22px; margin-top:2px; white-space:nowrap;\">{va_line} | 网格: {int(state.get('grid_unit',0))}股</div>"
 
             broker_total_pnl = getattr(position, 'total_pnl', None)
             if broker_total_pnl is None:
