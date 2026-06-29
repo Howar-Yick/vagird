@@ -4,6 +4,7 @@
 # - 修复宏观止盈 HWM / Tier 在断代保护期、止盈定投期限未达标、止盈金额未达标期间仍被记录的问题。
 # - 断代保护期、止盈定投期限内、止盈金额内均禁止记录 HWM / Tier；如发现残留 HWM / Tier，立即清除。
 # - 滴灌期不作为禁止宏观止盈条件；断代保护结束且定投期限、金额达标后，即使仍在滴灌期，也允许重新记录 HWM / Tier 并触发宏观止盈。
+# - 新增 va_enabled 标的级 VA 开关；symbols.json 缺省默认开启，显式 false 关闭 VA 加仓/盈余释放，但不影响普通网格、滴灌、宏观止盈和 stack。
 # - 不修改 3.14.14 连续水位比例控制器、普通网格、VA、滴灌、FillPatrol、守门员、天地锁、stack 最近盈利配对和重复发单保护。
 #
 # [v3.14.14 更新]
@@ -528,6 +529,30 @@ def dsym(context, symbol, style='short'):
 
 # ---------------- HALT-GUARD ----------------
 
+def _as_bool(value, default=True):
+    """
+    将配置值安全解析为 bool。
+    None 使用 default。
+    支持 bool、int、float、str。
+    字符串 false / 0 / no / off / n 解析为 False。
+    字符串 true / 1 / yes / on / y 解析为 True。
+    其他未知值回退 default。
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in ['1', 'true', 'yes', 'y', 'on']:
+            return True
+        if s in ['0', 'false', 'no', 'n', 'off']:
+            return False
+        return default
+    return default
+
 def is_valid_price(x):
     try:
         if x is None: return False
@@ -666,7 +691,7 @@ def init_symbol_state(context, sym, cfg):
         
         'dingtou_base': saved.get('dingtou_base') if saved.get('dingtou_base') is not None else cfg.get('dingtou_base', 0),
         'dingtou_rate': saved.get('dingtou_rate') if saved.get('dingtou_rate') is not None else cfg.get('dingtou_rate', 0),
-        'va_enabled': saved.get('va_enabled') if saved.get('va_enabled') is not None else cfg.get('va_enabled', True),
+        'va_enabled': _as_bool(cfg.get('va_enabled', True), True),
         
         'base_price': saved.get('base_price', cfg.get('base_price', 1.0)),
         'grid_unit': saved.get('grid_unit', cfg.get('grid_unit', 100)),
@@ -786,7 +811,7 @@ def _repair_state_logic(context):
         if not guard['allow_tracking']:
             _clear_macro_tp_tracking_if_blocked(context, sym, state, reason='startup_' + guard['reason'])
 
-        if not bool(state.get('va_enabled', True)):
+        if not _as_bool(state.get('va_enabled', True), True):
             continue
 
         weeks = len(state.get('trade_week_set', []))
@@ -2925,7 +2950,7 @@ def end_of_day(context):
 def get_target_base_position(context, symbol, state, price, dt):
     try:
         weeks = get_trade_weeks(context, symbol, state, dt)
-        if not bool(state.get('va_enabled', True)):
+        if not _as_bool(state.get('va_enabled', True), True):
             state['max_position'] = state['base_position'] + state['grid_unit'] * state.get('max_grid_count', 12)
             return state['base_position']
         accumulated_investment = sum(state['dingtou_base'] * (1 + state['dingtou_rate'])**w for w in range(1, weeks + 1))
@@ -3116,8 +3141,12 @@ def reload_config_if_changed(context):
                 if 'max_grid_count' in new_params:
                     state['max_grid_count'] = new_params['max_grid_count']
 
-                if 'va_enabled' in new_params:
-                    state['va_enabled'] = bool(new_params['va_enabled'])
+                old_va = _as_bool(state.get('va_enabled', True), True)
+                new_va = _as_bool(new_params.get('va_enabled', True), True)
+
+                state['va_enabled'] = new_va
+
+                if old_va != new_va:
                     info('[{}] 🔧 VA开关更新: va_enabled={}', dsym(context, sym), state['va_enabled'])
                 
                 max_grids = state.get('max_grid_count', 12)
@@ -3343,7 +3372,7 @@ def generate_html_report(context):
             symbol_name = dsym(context, symbol, style='long')
             sym_id_js = symbol.replace('.', '_')
             
-            va_line = '定投: 关闭' if not bool(state.get('va_enabled', True)) else f'定投: {current_weeks}周'
+            va_line = '定投: 关闭' if not _as_bool(state.get('va_enabled', True), True) else f'定投: {current_weeks}周'
             symbol_html = f"<div style=\"cursor:pointer; color:#7aa2f7; font-weight:bold; font-size:14px; white-space:nowrap;\" onclick=\"toggleDrawer('{sym_id_js}')\">🔽 {symbol_name}</div><div style=\"color:#9aa5ce; font-size:11px; margin-left:22px; margin-top:2px; white-space:nowrap;\">{va_line} | 网格: {int(state.get('grid_unit',0))}股</div>"
 
             broker_total_pnl = getattr(position, 'total_pnl', None)
