@@ -3157,7 +3157,7 @@ def _archive_daily_snapshot(context):
             return False
 
     if len(symbols) != 12:
-        validation_errors.append('现行标的数量应为12，实际为{}'.format(len(symbols)))
+        warnings.append('当前标的数量非常规12只，实际为{}'.format(len(symbols)))
 
     symbols_path = research_path('config', 'symbols.json')
     config_symbols = None
@@ -3221,9 +3221,11 @@ def _archive_daily_snapshot(context):
     for name in ['strategy.json', 'va.json', 'market.json', 'names.json', 'debug.json']:
         copy_one(research_path('config', name), 'config/' + name)
 
+    expected_count = len(config_symbols or [])
     hard_ok = (
-        len(symbols) == 12 and config_symbols == symbols and state_ok_count == 12
-        and len(copied_states) == 12 and log_copied and symbols_copied
+        expected_count > 0 and config_symbols == symbols
+        and state_ok_count == expected_count
+        and len(copied_states) == expected_count and log_copied and symbols_copied
         and not validation_errors
     )
     status = 'SUCCESS' if hard_ok else 'INCOMPLETE'
@@ -3244,11 +3246,12 @@ def _archive_daily_snapshot(context):
 
     if hard_ok:
         success_marker.write_text(manifest_text, encoding='utf-8')
-        info('✅ 日终自动归档完成 {} state=12/12 path={}', trade_date, snapshot)
+        info('✅ 日终自动归档完成 {} state={}/{} path={}',
+             trade_date, state_ok_count, expected_count, snapshot)
     else:
         (snapshot / '_INCOMPLETE.json').write_text(manifest_text, encoding='utf-8')
-        info('⚠️ 日终自动归档不完整 {} state={}/12 errors={}',
-             trade_date, state_ok_count, '; '.join(validation_errors))
+        info('⚠️ 日终自动归档不完整 {} state={}/{} errors={}',
+             trade_date, state_ok_count, expected_count, '; '.join(validation_errors))
     return manifest
 
 def reload_config_if_changed(context):
