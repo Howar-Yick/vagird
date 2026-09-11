@@ -6,6 +6,7 @@
 # - 滴灌期不作为禁止宏观止盈条件；断代保护结束且定投期限、金额达标后，即使仍在滴灌期，也允许重新记录 HWM / Tier 并触发宏观止盈。
 # - 新增 va_enabled 标的级 VA 开关；symbols.json 缺省默认开启，显式 false 关闭 VA 加仓/盈余释放，但不影响普通网格、滴灌、宏观止盈和 stack。
 # - 不修改 3.14.14 连续水位比例控制器、普通网格、VA、滴灌、FillPatrol、守门员、天地锁、stack 最近盈利配对和重复发单保护。
+# - 新增盘后自动日终快照归档；在原盘后作业完成后只读冻结现行state、日报、日志和配置，不修改交易逻辑。
 #
 # [v3.14.14 更新]
 # - 将 3.14.13 的阶梯倍率地板升级为连续水位比例控制器。
@@ -3099,6 +3100,156 @@ def after_trading_end(context, data):
         generate_html_report(context)
     except Exception: pass
     info('✅ 盘后作业结束')
+
+    try:
+        _archive_daily_snapshot(context)
+    except Exception as e:
+        info('❌ 日终自动归档异常: {}', e)
+
+def _copy_archive_file(src, dst):
+    """二进制只读复制归档文件，不改动源文件。"""
+    data = src.read_bytes()
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_bytes(data)
+    return len(data)
+
+def _archive_daily_snapshot(context):
+    """冻结当日实盘原始 state 及核心日终资料；不读取历史副本。"""
+    now = datetime.now()
+    current_dt = getattr(context, 'current_dt', None)
+    trade_date = (current_dt.date() if current_dt is not None else now.date()).strftime('%Y-%m-%d')
+    archive_day = research_path('eod_archive', trade_date)
+    success_marker = archive_day / '_SUCCESS.json'
+    if success_marker.exists():
+        info('⏭️ 当日日终归档已存在，跳过重复归档 {}', trade_date)
+        return {'status': 'SKIPPED', 'trade_date': trade_date, 'path': str(archive_day)}
+
+    archive_day.mkdir(parents=True, exist_ok=True)
+    snapshot = archive_day / ('snapshot_' + now.strftime('%Y%m%d_%H%M%S_%f'))
+    for dirname in ['state', 'reports', 'logs', 'config']:
+        (snapshot / dirname).mkdir(parents=True, exist_ok=True)
+
+    symbols = list(getattr(context, 'symbol_list', []) or [])
+    validation_errors = []
+    warnings = []
+    files = []
+    state_ok_count = 0
+    copied_states = set()
+    required_state_fields = [
+        'symbol', 'base_position', 'grid_unit', 'base_price', 'va_enabled',
+        '_pending_ignore_ids', '_edge_day', '_edge_buy_qty', '_edge_sell_qty',
+        'buy_stack', 'sell_stack', 'archived_buy_anchor',
+        'archived_sell_anchor', 'history_pnl', 'wm_pnl'
+    ]
+
+    def copy_one(src, relative_path, required=False):
+        try:
+            if not src.exists():
+                message = '缺少文件: ' + str(src)
+                (validation_errors if required else warnings).append(message)
+                return False
+            size = _copy_archive_file(src, snapshot / relative_path)
+            files.append({'relative_path': relative_path, 'size': size})
+            return True
+        except Exception as e:
+            message = '复制失败 {}: {}'.format(src, e)
+            (validation_errors if required else warnings).append(message)
+            return False
+
+    if len(symbols) != 12:
+        validation_errors.append('现行标的数量应为12，实际为{}'.format(len(symbols)))
+
+    symbols_path = research_path('config', 'symbols.json')
+    config_symbols = None
+    try:
+        if not symbols_path.exists():
+            validation_errors.append('缺少文件: ' + str(symbols_path))
+        else:
+            parsed_symbols = json.loads(symbols_path.read_text(encoding='utf-8'))
+            if not isinstance(parsed_symbols, dict):
+                validation_errors.append('symbols.json顶层必须为对象')
+            else:
+                config_symbols = list(parsed_symbols.keys())
+                if symbols != config_symbols:
+                    validation_errors.append('context.symbol_list与symbols.json不一致')
+    except Exception as e:
+        validation_errors.append('symbols.json解析失败: {}'.format(e))
+
+    for symbol in symbols:
+        state_path = research_path('state', '{}.json'.format(symbol))
+        state_valid = True
+        try:
+            if not state_path.exists():
+                validation_errors.append('[{}] state文件不存在'.format(symbol))
+                state_valid = False
+            else:
+                raw_state = state_path.read_text(encoding='utf-8')
+                parsed_state = json.loads(raw_state)
+                if not isinstance(parsed_state, dict):
+                    validation_errors.append('[{}] state JSON顶层不是对象'.format(symbol))
+                    state_valid = False
+                else:
+                    for field in required_state_fields:
+                        if field not in parsed_state:
+                            validation_errors.append('[{}] state缺少字段: {}'.format(symbol, field))
+                            state_valid = False
+                    if parsed_state.get('symbol') != symbol:
+                        validation_errors.append('[{}] state.symbol不匹配: {}'.format(symbol, parsed_state.get('symbol')))
+                        state_valid = False
+        except Exception as e:
+            validation_errors.append('[{}] state JSON解析失败: {}'.format(symbol, e))
+            state_valid = False
+
+        if copy_one(state_path, 'state/{}.json'.format(symbol), required=True):
+            copied_states.add(symbol)
+        if state_valid and symbol in copied_states:
+            state_ok_count += 1
+
+    copy_one(research_path('state', 'pnl_metrics.json'), 'state/pnl_metrics.json')
+
+    report_names = ['{}.csv'.format(symbol) for symbol in symbols]
+    report_names += [
+        'a_trade_details.csv', 'attribution_by_symbol.csv', 'attribution_daily.csv',
+        'dashboard_data.json', 'strategy_dashboard.html'
+    ]
+    for name in report_names:
+        copy_one(research_path('reports', name), 'reports/' + name)
+
+    log_name = trade_date + '_strategy.log'
+    log_copied = copy_one(research_path('logs', log_name), 'logs/' + log_name, required=True)
+    symbols_copied = copy_one(symbols_path, 'config/symbols.json', required=True)
+    for name in ['strategy.json', 'va.json', 'market.json', 'names.json', 'debug.json']:
+        copy_one(research_path('config', name), 'config/' + name)
+
+    hard_ok = (
+        len(symbols) == 12 and config_symbols == symbols and state_ok_count == 12
+        and len(copied_states) == 12 and log_copied and symbols_copied
+        and not validation_errors
+    )
+    status = 'SUCCESS' if hard_ok else 'INCOMPLETE'
+    manifest = {
+        'status': status,
+        'trade_date': trade_date,
+        'created_at': now.strftime('%Y-%m-%d %H:%M:%S.%f'),
+        'strategy_version': __version__,
+        'symbols': symbols,
+        'symbol_count': len(symbols),
+        'state_ok_count': state_ok_count,
+        'validation_errors': validation_errors,
+        'warnings': warnings,
+        'files': files
+    }
+    manifest_text = json.dumps(manifest, ensure_ascii=False, indent=2)
+    (snapshot / 'manifest.json').write_text(manifest_text, encoding='utf-8')
+
+    if hard_ok:
+        success_marker.write_text(manifest_text, encoding='utf-8')
+        info('✅ 日终自动归档完成 {} state=12/12 path={}', trade_date, snapshot)
+    else:
+        (snapshot / '_INCOMPLETE.json').write_text(manifest_text, encoding='utf-8')
+        info('⚠️ 日终自动归档不完整 {} state={}/12 errors={}',
+             trade_date, state_ok_count, '; '.join(validation_errors))
+    return manifest
 
 def reload_config_if_changed(context):
     """
