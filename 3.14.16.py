@@ -4,6 +4,7 @@
 # - VA schema=2：正常旧state连续兼容；前瞻暂停审计；显式恢复接续或建立独立VA锚。
 # - 目标、启动修复与新版本报表统一 VA 预算口径；宏观止盈成交确认后重置 VA 周期。
 # - 动态网格容量与账户共享买单资金检查分离；参数需显式确认启用，不改实盘配置。
+# - 周编号校验兼容不提供 datetime.fromisocalendar 的 PTrade Python 环境。
 # - 保留 3.14.15 作为回滚源；Stack/Anchor、水位、成交归属、滴灌与止盈判定不重写。
 # [v3.14.15 更新]
 # - 修复宏观止盈 HWM / Tier 在断代保护期、止盈定投期限未达标、止盈金额未达标期间仍被记录的问题。
@@ -593,9 +594,13 @@ def _week_key(dt):
 def _valid_week(key):
     try:
         year, week = map(int, key.split('_'))
-        datetime.fromisocalendar(year, week, 1)
-        return key == '{}_{}'.format(year, week)
-    except (ValueError, TypeError, AttributeError):
+        if not 1 <= week <= 53:
+            return False
+        jan_4 = datetime(year, 1, 4).date()
+        first_monday = jan_4 - timedelta(days=jan_4.isoweekday() - 1)
+        candidate = first_monday + timedelta(weeks=week - 1)
+        return key == '{}_{}'.format(year, week) and candidate.isocalendar()[:2] == (year, week)
+    except (ValueError, TypeError, AttributeError, OverflowError):
         return False
 
 def _finite_nonnegative(value):
