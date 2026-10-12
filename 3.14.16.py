@@ -1,7 +1,7 @@
 # event_driven_grid_strategy.py
-# 版本号：CHATGPT-3.14.16-VA-ACTIVE-BUDGET-DYNAMIC-GRID
+# 版本号：CHATGPT-3.14.16-VA-LIFECYCLE-PTRADE-CASH
 # [v3.14.16 更新]
-# - VA 独立有效期数/累计预算/周记录持久化；暂停不补投，未确认旧状态迁移阻断 VA。
+# - VA schema=2：正常旧state连续兼容；前瞻暂停审计；显式恢复接续或建立独立VA锚。
 # - 目标、启动修复与新版本报表统一 VA 预算口径；宏观止盈成交确认后重置 VA 周期。
 # - 动态网格容量与账户共享买单资金检查分离；参数需显式确认启用，不改实盘配置。
 # - 保留 3.14.15 作为回滚源；Stack/Anchor、水位、成交归属、滴灌与止盈判定不重写。
@@ -105,8 +105,9 @@ import logging
 import math
 import time
 import heapq  # 引入堆队列算法
-import hashlib
 import copy
+import os
+import tempfile
 from collections import deque
 from datetime import datetime
 from datetime import time as dtime
@@ -120,7 +121,7 @@ import pandas as pd
 # ---------------- 全局句柄 ----------------
 LOG_FH = None
 LOG_DATE = None
-__version__ = 'CHATGPT-3.14.16-VA-ACTIVE-BUDGET-DYNAMIC-GRID'
+__version__ = 'CHATGPT-3.14.16-VA-LIFECYCLE-PTRADE-CASH'
 
 # ---------------- 配置管理类 ----------------
 
@@ -600,137 +601,314 @@ def _valid_week(key):
 def _finite_nonnegative(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0
 
-def _valid_va_budget(budget):
-    if not isinstance(budget, dict) or budget.get('schema') != 1 or budget.get('status') != 'ready':
+def _valid_va_budget(budget, allow_invalid=False):
+    if not isinstance(budget, dict) or budget.get('schema') != 2 or budget.get('status') not in ({'ready', 'invalid'} if allow_invalid else {'ready'}):
         return False
+    if not isinstance(budget.get('cycle_id'), str) or not isinstance(budget.get('last_enabled'), bool):
+        return False
+    if not all(isinstance(budget.get(k), list) for k in ['events', 'pauses', 'cycles', 'counted_weeks', 'drip_events']):
+        return False
+    if budget.get('mode') not in ('legacy', 'independent') or not isinstance(budget.get('serial'), int):
+        return False
+    if not isinstance(budget.get('known'), bool) or not isinstance(budget.get('drip_current_valid'), bool):
+        return False
+    if not all(_valid_week(k) for k in budget['counted_weeks']) or not _finite_nonnegative(budget.get('drip_released_total')):
+        return False
+    if not all(isinstance(p, dict) and isinstance(p.get('skipped_weeks'), dict) for p in budget['pauses']):
+        return False
+    if budget.get('known') and budget['mode'] == 'independent':
+        anchor = budget.get('anchor') or {}
+        if not all(_finite_nonnegative(anchor.get(k)) for k in ['value', 'shares', 'price', 'drip_cursor']) or anchor['price'] <= 0:
+            return False
+    if not budget.get('known'):
+        return budget.get('periods') is None and budget.get('total') is None
     entries = budget.get('weekly_budgets')
     return (isinstance(entries, dict) and all(_valid_week(k) and _finite_nonnegative(v) for k, v in entries.items())
-            and isinstance(budget.get('periods'), int) and not isinstance(budget.get('periods'), bool)
-            and budget.get('periods') == len(entries) and _finite_nonnegative(budget.get('total'))
-            and isinstance(budget.get('excluded_weeks'), list) and all(_valid_week(k) for k in budget['excluded_weeks'])
-            and isinstance(budget.get('cycles'), list) and all(isinstance(c, dict) for c in budget['cycles'])
+            and isinstance(budget.get('periods'), int) and not isinstance(budget['periods'], bool)
+            and budget['periods'] == len(entries) and _finite_nonnegative(budget.get('total'))
             and math.isclose(budget['total'], sum(entries.values()), rel_tol=1e-12, abs_tol=1e-6))
 
-def _new_va_budget():
-    return {'schema': 1, 'status': 'ready', 'periods': 0, 'total': 0.0,
-            'weekly_budgets': {}, 'excluded_weeks': [], 'cycles': [], 'last_observed_week': None}
+def _new_va_budget(symbol='UNKNOWN', serial=1):
+    return {'schema': 2, 'status': 'ready', 'cycle_id': '{}:VA:{}'.format(symbol, serial),
+            'serial': serial, 'mode': 'legacy', 'known': True, 'periods': 0, 'total': 0.0,
+            'weekly_budgets': {}, 'legacy_formula': True, 'events': [], 'pauses': [],
+            'cycles': [], 'counted_weeks': [], 'drip_events': [], 'drip_released_total': 0.0,
+            'last_enabled': True, 'last_observed_week': None, 'unknowns': [], 'drip_current_valid': True}
 
-def _init_va_budget(state, saved, cfg):
-    """旧累计周不能证明 VA 持续开启；迁移须绑定原 state 指纹和人工核验记录。"""
-    existing = copy.deepcopy(saved.get('_va_budget'))
-    if _valid_va_budget(existing):
-        state['_va_budget'] = existing
+def _va_time(dt):
+    return dt.isoformat(timespec='seconds')
+
+def _va_event(ledger, dt, kind, **details):
+    event = dict(id='{}:event:{}'.format(ledger['cycle_id'], len(ledger['events']) + 1),
+                 at=_va_time(dt), kind=kind, cycle_id=ledger['cycle_id'])
+    event.update(details)
+    ledger['events'].append(event)
+
+def _va_target_value(state):
+    budget = state.get('_va_budget')
+    if not _valid_va_budget(budget) or not budget['known']:
+        return None
+    if budget['mode'] == 'independent':
+        anchor = budget.get('anchor') or {}
+        return anchor['value'] + budget['total'] + budget['drip_released_total'] - anchor['drip_cursor']
+    if not _finite_nonnegative(state.get('initial_position_value')):
+        budget['current_error'] = '当前VA初始价值无效'
+        return None
+    return state['initial_position_value'] + budget['total']
+
+def _va_sync_legacy(state):
+    budget = state['_va_budget']
+    if not budget.get('known') or not budget.get('legacy_formula'):
         return
-    weeks = sorted(set(saved.get('trade_week_set') or []))
-    if not saved.get('_va_budget') and not weeks:
-        state['_va_budget'] = _new_va_budget()
+    base, rate = state.get('dingtou_base'), state.get('dingtou_rate')
+    if not _finite_nonnegative(base) or not isinstance(rate, (int, float)) or not math.isfinite(rate) or rate <= -1:
+        raise ValueError('当前定投金额/增长率无效')
+    keys = sorted(budget['weekly_budgets'], key=lambda k: tuple(map(int, k.split('_'))))
+    entries = {k: base * (1 + rate) ** n for n, k in enumerate(keys, 1)}
+    total = sum(entries.values())
+    if not _finite_nonnegative(total):
+        raise ValueError('当前兼容预算非有限非负数')
+    budget.update(weekly_budgets=entries, total=total)
+
+def _va_pause_snapshot(state, dt, confirmed=False):
+    budget = state['_va_budget']
+    if budget['pauses'] and budget['pauses'][-1].get('closed_at') is None:
         return
-    pending = existing if isinstance(existing, dict) and existing.get('status') == 'pending' else {
-        'schema': 1, 'status': 'pending', 'legacy_weeks': weeks,
-        'source_sha256': hashlib.sha256(json.dumps(saved, sort_keys=True, ensure_ascii=True,
-                                                  default=lambda obj: sorted(obj) if isinstance(obj, set) else None).encode()).hexdigest(),
-        'excluded_weeks': [], 'cycles': [], 'reason': '旧 VA 历史或新预算损坏，需核验迁移'}
-    migration = cfg.get('va_migration') or {}
-    try:
-        if not migration.get('evidence') or migration.get('source_sha256') != pending.get('source_sha256'):
-            raise ValueError('缺少证据或原 state 指纹不匹配')
-        legacy = pending['legacy_weeks']
-        if not all(_valid_week(k) for k in legacy):
-            raise ValueError('旧交易周格式异常')
-        mode = migration.get('mode')
-        if mode == 'always_enabled':
-            # 声明必须来自日志/历史配置核验，当前 true 本身不够。
-            if not state['va_enabled'] or saved.get('va_enabled') is False or state['symbol'] in _VA_DEFAULT_OFF:
-                raise ValueError('关闭标的不能用始终开启声明迁移')
-            ordered = sorted(legacy, key=lambda k: tuple(map(int, k.split('_'))))
-            entries = {k: state['dingtou_base'] * (1 + state['dingtou_rate']) ** i
-                       for i, k in enumerate(ordered, 1)}
-        elif mode == 'verified_budget':
-            entries = dict(migration['weekly_budgets'])
-            if not set(entries).issubset(legacy):
-                raise ValueError('有效周不属于绑定的旧周期')
+    target = _va_target_value(state)
+    known = _valid_va_budget(budget) and budget['known']
+    budget['pauses'].append(dict(id='{}:pause:{}'.format(budget['cycle_id'], len(budget['pauses']) + 1),
+        cycle_id=budget['cycle_id'], first_observed_at=_va_time(dt),
+        confirmed_start_at=_va_time(dt) if confirmed else None, historical_start_at=None,
+        history_start_unknown=not confirmed, reliable_budget=known,
+        periods_before_pause=budget['periods'] if known else None, budget_before_pause=budget['total'] if known else None, target_before_pause=target,
+        base_position=state.get('base_position'), drip_amount=state.get('_drip_amount') if budget['drip_current_valid'] else None,
+        drip_remain_weeks=state.get('_drip_remain_weeks') if budget['drip_current_valid'] else None,
+        drip_cursor=len(budget['drip_events']), skipped_weeks={}, closed_at=None))
+    # 只有发生暂停后冻结已记历史；持续开启的兼容路径仍保留旧热加载预算公式。
+    budget['legacy_formula'] = False
+
+def _va_begin_independent(state, dt):
+    old = state['_va_budget']
+    serial = old['serial'] + 1
+    budget = _new_va_budget(state['symbol'], serial)
+    for key in ['events', 'pauses', 'counted_weeks', 'drip_events', 'drip_released_total', 'unknowns', 'drip_current_valid']:
+        budget[key] = copy.deepcopy(old[key])
+    budget['cycles'] = copy.deepcopy(old['cycles']) + [{k: copy.deepcopy(v) for k, v in old.items() if k != 'cycles'}]
+    budget.update(mode='independent', known=False, periods=None, total=None, legacy_formula=False,
+                  anchor_requested_at=_va_time(dt), last_observed_week=old.get('last_observed_week'))
+    state['_va_budget'] = budget
+    _va_event(budget, dt, 'independent_cycle_requested', reason='恢复前有效预算历史未知；仅以VA底仓建立新计算周期')
+
+def _va_ensure_anchor(state, dt, price):
+    budget = state['_va_budget']
+    if budget['mode'] != 'independent' or budget['known']:
+        return
+    shares = state.get('base_position')
+    if not _finite_nonnegative(shares) or not _finite_nonnegative(price) or price <= 0:
+        budget['current_error'] = '独立VA锚等待有效底仓数量和行情'
+        return
+    value = shares * price
+    if not _finite_nonnegative(value):
+        budget['current_error'] = '独立VA锚价值异常'
+        return
+    budget.update(known=True, periods=0, total=0.0, weekly_budgets={}, last_week_position=shares,
+                  anchor=dict(value=value, shares=shares, price=price, observed_at=_va_time(dt),
+                              drip_cursor=budget['drip_released_total']))
+    budget.pop('current_error', None)
+    _va_event(budget, dt, 'independent_anchor_confirmed', anchor=copy.deepcopy(budget['anchor']))
+
+def _va_observe_switch(state, dt, price=None):
+    budget = state['_va_budget']
+    enabled = _as_bool(state.get('va_enabled', True), True)
+    if enabled != budget['last_enabled']:
+        previous = budget['last_enabled']
+        _va_event(budget, dt, 'switch', before=previous, after=enabled)
+        if not enabled:
+            # 冻结最后已确认的有效预算；同一次关闭编辑的新参数不能追改暂停前预算。
+            _va_pause_snapshot(state, dt, confirmed=True)
         else:
-            raise ValueError('迁移模式未确认')
-        budget = _new_va_budget()
-        budget['cycles'] = copy.deepcopy(pending.get('cycles', []))
-        budget.update(periods=len(entries), total=sum(entries.values()), weekly_budgets=entries,
-                      excluded_weeks=sorted(set(legacy) - set(entries) | set(pending.get('excluded_weeks', []))),
-                      migration={'source_sha256': pending['source_sha256'], 'evidence': migration['evidence'], 'mode': mode})
-        observed = set(legacy) | set(pending.get('excluded_weeks', []))
-        budget['last_observed_week'] = max(observed, key=lambda k: tuple(map(int, k.split('_')))) if observed else None
-        if not _valid_va_budget(budget):
-            raise ValueError('迁移预算非法')
+            if budget['pauses'] and budget['pauses'][-1].get('closed_at') is None:
+                budget['pauses'][-1]['closed_at'] = _va_time(dt)
+            if (not budget['known'] and budget['mode'] != 'independent') or not _valid_va_budget(budget):
+                _va_begin_independent(state, dt)
+                budget = state['_va_budget']
+        budget['last_enabled'] = enabled
+    if not enabled:
+        _va_pause_snapshot(state, dt)
+    else:
+        _va_ensure_anchor(state, dt, price)
+
+def _init_va_budget(state, saved, cfg, context=None):
+    """正常旧state按当前旧目标兼容；暂停旧历史未知只记录观察，不阻断其它标的。"""
+    dt = getattr(context, 'current_dt', None) or datetime.now()
+    old = copy.deepcopy(saved.get('_va_budget'))
+    if _valid_va_budget(old, allow_invalid=True):
+        state['_va_budget'] = old
+    else:
+        budget = _new_va_budget(state['symbol'])
+        enabled_before = _as_bool(saved.get('va_enabled', state['va_enabled']), state['va_enabled'])
+        budget['last_enabled'] = enabled_before
+        budget['drip_current_valid'] = (not saved or
+            ('_drip_amount' in saved and '_drip_remain_weeks' in saved
+             and _finite_nonnegative(saved['_drip_amount']) and isinstance(saved['_drip_remain_weeks'], int)
+             and not isinstance(saved['_drip_remain_weeks'], bool) and saved['_drip_remain_weeks'] >= 0))
+        if not budget['drip_current_valid']:
+            budget['unknowns'].append('当前滴灌字段缺失/异常，不能反推；暂停该标的滴灌释放')
+        weeks = list(saved.get('trade_week_set') or [])
+        budget['legacy_reference'] = dict(trade_weeks=len(weeks), effective_history='当前旧目标兼容基线' if enabled_before else '历史未知')
+        # 暂停标的的旧公式只是首次观察参考，不能冒充暂停前有效预算或已成交投入。
+        try:
+            theoretical = sum(state['dingtou_base'] * (1 + state['dingtou_rate']) ** n for n in range(1, len(weeks) + 1))
+            budget['legacy_reference'].update(observed_at=_va_time(dt), theoretical_budget=theoretical,
+                theoretical_target=state['initial_position_value'] + theoretical, not_executed_contribution=True)
+        except (ValueError, TypeError, OverflowError):
+            budget['legacy_reference'].update(theoretical_budget=None, theoretical_target=None)
         state['_va_budget'] = budget
-    except (ValueError, TypeError, KeyError, OverflowError) as exc:
-        pending['reason'] = str(exc)
-        state['_va_budget'] = pending
-        info('[{}] ⛔ VA迁移待确认: {}；保留底仓，仅阻断VA', state['symbol'], exc)
+        try:
+            if isinstance(old, dict) and old.get('schema') == 2:
+                budget.update(status='invalid', known=False, periods=None, total=None)
+                budget['cycles'].append(old)
+                budget['unknowns'].append('新版VA状态损坏：仅本标的VA等待有效恢复事件')
+            elif isinstance(old, dict) and old.get('schema') == 1 and old.get('status') == 'ready' and isinstance(old.get('weekly_budgets'), dict):
+                entries = old['weekly_budgets']
+                if not all(_valid_week(k) and _finite_nonnegative(v) for k, v in entries.items()) or not math.isclose(sum(entries.values()), old['total'], abs_tol=1e-6):
+                    raise ValueError('schema1预算损坏')
+                budget.update(periods=len(entries), total=sum(entries.values()), weekly_budgets=entries,
+                              counted_weeks=list(entries), legacy_formula=False)
+                budget['unknowns'].append('schema1仅有周级开关观察，无准确旧暂停起点')
+            elif enabled_before:
+                if not all(_valid_week(k) for k in weeks):
+                    raise ValueError('旧交易周格式异常')
+                budget['weekly_budgets'] = dict.fromkeys(weeks, 0.0)
+                budget['periods'] = len(weeks)
+                budget['counted_weeks'] = list(weeks)
+                _va_sync_legacy(state)
+                _va_event(budget, dt, 'legacy_compatibility', periods=budget['periods'], budget=budget['total'], target=_va_target_value(state))
+            else:
+                budget.update(known=False, periods=None, total=None, legacy_formula=False)
+                budget['unknowns'] += ['旧暂停起点历史未知', '旧有效VA期数/预算历史未知', '旧滴灌释放历史未知']
+        except (ValueError, TypeError, KeyError, OverflowError) as exc:
+            budget.update(status='invalid', known=False, periods=None, total=None)
+            budget['unknowns'].append(str(exc))
+        if not enabled_before:
+            current = state['va_enabled']
+            state['va_enabled'] = False
+            _va_pause_snapshot(state, dt)
+            state['va_enabled'] = current
+    _va_observe_switch(state, dt)
+    info('[{}] VA状态 schema=2, cycle={}, mode={}, known={}, enabled={}', state['symbol'], state['_va_budget']['cycle_id'],
+         state['_va_budget']['mode'], state['_va_budget']['known'], state['va_enabled'])
 
 def _va_budget_view(state):
     budget = state.get('_va_budget')
-    if not _valid_va_budget(budget):
+    if not _valid_va_budget(budget) or not budget['known']:
         return None, None
     return budget['periods'], budget['total']
 
 def _va_report_view(state, dt):
-    """报表只读：预算不是已成交投入，不从累计交易周重算暂停期。"""
+    budget = state.get('_va_budget') or {}
     periods, total = _va_budget_view(state)
-    if periods is None:
-        return {'periods': '待迁移', 'total': None, 'target': None, 'week_budget': None}
-    return {'periods': periods, 'total': total,
-            'target': state.get('initial_position_value', 0) + total,
-            'week_budget': state['_va_budget']['weekly_budgets'].get(_week_key(dt), 0.0)}
+    pauses = budget.get('pauses', [])
+    pauses = [p for p in pauses if isinstance(p, dict)] if isinstance(pauses, list) else []
+    pause = pauses[-1] if pauses else {}
+    audit_weeks = {}
+    for pause_item in pauses:
+        records = pause_item.get('skipped_weeks') or {}
+        if not isinstance(records, dict): continue
+        for key, record in records.items():
+            value = record.get('hypothetical_budget') if isinstance(record, dict) else None
+            audit_weeks.setdefault(key, []).append(value if _finite_nonnegative(value) else None)
+    values = [max(v) if all(x is not None for x in v) else None for v in audit_weeks.values()]
+    unknown_label = '当前无效' if not _valid_va_budget(budget) else ('等待有效新锚' if budget.get('mode') == 'independent' else '历史未知')
+    return {'periods': unknown_label if periods is None else periods, 'total': total,
+            'target': _va_target_value(state), 'week_budget': (budget.get('weekly_budgets') or {}).get(_week_key(dt), 0.0) if total is not None else None,
+            'cycle_id': budget.get('cycle_id'), 'mode': budget.get('mode'), 'pause_observed_at': pause.get('first_observed_at'),
+            'pause_confirmed_start': pause.get('confirmed_start_at'), 'skipped_weeks': len(audit_weeks),
+            'skipped_budget': sum(values) if all(v is not None for v in values) else None,
+            'drip_amount': state.get('_drip_amount') if budget.get('drip_current_valid') else None,
+            'drip_remain': state.get('_drip_remain_weeks') if budget.get('drip_current_valid') else None,
+            'observed_drip_released': budget.get('drip_released_total', 0), 'unknowns': budget.get('unknowns', []),
+            'current_error': budget.get('current_error')}
 
-def _accrue_va_week(symbol, state, dt):
-    budget = state.get('_va_budget')
+def _va_audit_pause_week(state, dt):
+    budget = state['_va_budget']
+    _va_pause_snapshot(state, dt)
+    pause = budget['pauses'][-1]
     key = _week_key(dt)
-    latest = budget.get('last_observed_week') if isinstance(budget, dict) else None
-    if _valid_week(latest) and tuple(map(int, key.split('_'))) < tuple(map(int, latest.split('_'))):
-        info('[{}] ⛔ 忽略回退交易周的VA预算: {} < {}', symbol, key, latest)
-        return False
-    if isinstance(budget, dict):
-        budget['last_observed_week'] = key
-    if not _valid_va_budget(budget):
-        if isinstance(budget, dict):
-            changed = key not in budget.get('excluded_weeks', [])
-            budget['excluded_weeks'] = sorted(set(budget.get('excluded_weeks', [])) | {key})
-            return changed
-        return False
-    if not _as_bool(state.get('va_enabled', True), True):
-        if key not in budget['weekly_budgets']:
-            changed = key not in budget.get('excluded_weeks', [])
-            budget['excluded_weeks'] = sorted(set(budget.get('excluded_weeks', [])) | {key})
-            return changed
-        return False
-    if key in budget['weekly_budgets']:
-        return False
-    if any(key in cycle.get('weekly_budgets', {}) for cycle in budget.get('cycles', [])):
-        return False  # 同周止盈重锚也不得再次增加VA期数；滴灌仍按原独立周推进。
-    # 恢复当周可计一次；暂停期间缺失的周不扫描、不补投，增长序号接续有效期数。
-    try:
-        amount = state['dingtou_base'] * (1 + state['dingtou_rate']) ** (budget['periods'] + 1)
-        if not _finite_nonnegative(amount):
-            raise ValueError('定投预算非有限非负数')
-    except (ValueError, TypeError, OverflowError) as exc:
-        budget.update(status='pending', reason=str(exc))
-        info('[{}] ⛔ VA预算未增加: {}', symbol, exc)
-        return True
-    budget['weekly_budgets'][key] = amount
-    budget['periods'] += 1
-    budget['total'] = sum(budget['weekly_budgets'].values())  # 与旧sum口径一致，不重算历史单期金额。
-    budget['excluded_weeks'] = sorted(set(budget.get('excluded_weeks', [])) - {key})
-    return True
+    records = pause['skipped_weeks']
+    if key not in records:
+        skipped_count = sum(k not in budget['counted_weeks'] for k in records)
+        index = (pause['periods_before_pause'] + skipped_count + (key not in budget['counted_weeks'])
+                 if pause['reliable_budget'] else len(state.get('trade_week_set', [])))
+        amount = None
+        try:
+            amount = state['dingtou_base'] * (1 + state['dingtou_rate']) ** index
+            if not _finite_nonnegative(amount): amount = None
+        except (TypeError, ValueError, OverflowError):
+            pass
+        if key in budget['counted_weeks']: amount = 0.0
+        records[key] = dict(first_observed_at=_va_time(dt), hypothetical_budget=amount,
+                            hypothetical_index=index, basis='可靠暂停前有效期' if pause['reliable_budget'] else '旧理论周，仅审计，历史未知')
+    records[key].update(drip_released=sum(e['amount'] for e in budget['drip_events'][pause['drip_cursor']:] if e['week'] == key),
+                        drip_amount=state.get('_drip_amount') if budget['drip_current_valid'] else None,
+                        drip_remain_weeks=state.get('_drip_remain_weeks') if budget['drip_current_valid'] else None)
 
-def _reset_va_cycle(state):
-    old = state.get('_va_budget') or {}
-    budget = _new_va_budget()
-    budget['cycles'] = list(old.get('cycles', [])) + [{k: copy.deepcopy(v) for k, v in old.items() if k != 'cycles'}]
+def _accrue_va_week(symbol, state, dt, price=None):
+    budget = state.get('_va_budget')
+    if not isinstance(budget, dict) or budget.get('schema') != 2:
+        _init_va_budget(state, state, {}, None)
+    before = copy.deepcopy(state['_va_budget'])
+    _va_observe_switch(state, dt, price)
+    budget = state['_va_budget']
+    key = _week_key(dt)
+    latest = budget.get('last_observed_week')
+    if _valid_week(latest) and tuple(map(int, key.split('_'))) < tuple(map(int, latest.split('_'))):
+        return budget != before
+    budget['last_observed_week'] = key
+    if not state['va_enabled']:
+        _va_audit_pause_week(state, dt)
+    elif _valid_va_budget(budget) and budget['known']:
+        try:
+            if price is not None and (not _finite_nonnegative(price) or price <= 0):
+                raise ValueError('当前行情无效，不增加VA有效期')
+            if not _finite_nonnegative(state.get('base_position')):
+                raise ValueError('当前VA底仓数量无效，不增加VA有效期')
+            if budget['mode'] == 'legacy' and not _finite_nonnegative(state.get('initial_position_value')):
+                raise ValueError('当前VA初始价值无效，不增加VA有效期')
+            _va_sync_legacy(state)
+            budget.pop('current_error', None)
+            if key not in budget['counted_weeks']:
+                amount = state['dingtou_base'] * (1 + state['dingtou_rate']) ** (budget['periods'] + 1)
+                if not _finite_nonnegative(amount): raise ValueError('新一期VA预算无效')
+                budget['weekly_budgets'][key] = amount
+                budget['periods'] += 1
+                budget['total'] = sum(budget['weekly_budgets'].values())
+                budget['counted_weeks'].append(key)
+                budget['last_week_position'] = state['base_position']
+                _va_event(budget, dt, 'effective_week', week=key, budget=amount, period=budget['periods'])
+        except (ValueError, TypeError, OverflowError) as exc:
+            budget['current_error'] = str(exc)
+            info('[{}] ⛔ 本标的VA预算未更新: {}', symbol, exc)
+    return budget != before
+
+def _reset_va_cycle(state, dt=None):
+    """只有真实宏观完成才跟随原重锚建立已知新周期，旧历史未知不再阻断新周期。"""
+    dt = dt or datetime.now()
+    old = state.get('_va_budget') or _new_va_budget(state['symbol'])
+    budget = _new_va_budget(state['symbol'], old.get('serial', 1) + 1)
+    for key in ['events', 'pauses', 'counted_weeks', 'drip_events', 'drip_released_total', 'unknowns']:
+        budget[key] = copy.deepcopy(old.get(key, budget[key]))
+    # 正式宏观重锚是原策略的真实新周期，按旧规则本周可记新周期第1期；
+    # VA开关/重启不走这里，不能借开关清除周去重记录。
+    budget['counted_weeks'] = []
+    budget['cycles'] = copy.deepcopy(old.get('cycles', [])) + [{k: copy.deepcopy(v) for k, v in old.items() if k != 'cycles'}]
+    budget['last_enabled'] = _as_bool(state.get('va_enabled', True), True)
     budget['last_observed_week'] = old.get('last_observed_week')
-    # 未核验的旧历史不能借止盈隐式变成已确认；新周期不带入旧预算。
-    if not _valid_va_budget(old):
-        budget.update(status='pending', reason='旧迁移未确认；新周期需核验', legacy_weeks=[],
-                      source_sha256=old.get('source_sha256'))
+    if budget['pauses'] and budget['pauses'][-1].get('closed_at') is None:
+        budget['pauses'][-1].update(closed_at=_va_time(dt), closed_reason='macro_completed')
     state['_va_budget'] = budget
+    _va_event(budget, dt, 'macro_cycle_reset', initial_value=state['initial_position_value'])
+    if not budget['last_enabled']: _va_pause_snapshot(state, dt, confirmed=True)
 
 def save_state(symbol, state):
     """
@@ -754,8 +932,19 @@ def save_state(symbol, state):
     
     store['filled_order_ids'] = ids[-StrategyConfig.MAX_SAVED_FILLED_IDS:]
     store['trade_week_set'] = list(state.get('trade_week_set', []))
+    path = research_path('state', f'{symbol}.json')
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=str(path.parent),
+                                         prefix=path.name + '.', suffix='.tmp', delete=False) as handle:
+            temporary = Path(handle.name)
+            handle.write(json.dumps(store, indent=2))
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(path)  # 重启时只看到完整旧文件或完整新文件。
+    finally:
+        if temporary is not None and temporary.exists(): temporary.unlink()
     set_saved_param(f'state_{symbol}', store)
-    research_path('state', f'{symbol}.json').write_text(json.dumps(store, indent=2), encoding='utf-8')
 
 def safe_save_state(symbol, state):
     try:
@@ -832,7 +1021,19 @@ def init_symbol_state(context, sym, cfg):
     终极防御：将防崩装甲武装到数值型字段，彻底消灭 float + None 的数学运算崩溃。
     """
     state_file = research_path('state', f'{sym}.json')
-    saved = json.loads(state_file.read_text(encoding='utf-8')) if state_file.exists() else get_saved_param(f'state_{sym}', {}) or {}
+    try:
+        saved = json.loads(state_file.read_text(encoding='utf-8')) if state_file.exists() else get_saved_param(f'state_{sym}', {}) or {}
+        if not isinstance(saved, dict): raise ValueError('state顶层不是对象')
+        for key in ['base_position', 'base_price', 'grid_unit']:
+            if key in saved and (not _finite_nonnegative(saved[key]) or (key != 'base_position' and saved[key] <= 0)):
+                raise ValueError('当前关键字段无效: ' + key)
+    except (ValueError, TypeError, OSError) as exc:
+        # 不用配置值伪造丢失的成交账本；仅隔离该标的，保留损坏文件供核验。
+        if not hasattr(context, 'quarantined_symbols'): context.quarantined_symbols = {}
+        context.quarantined_symbols[sym] = str(exc)
+        if sym in context.symbol_list: context.symbol_list.remove(sym)
+        info('[{}] ⛔ state读取/当前数据失败，隔离该标的，其余继续: {}', sym, exc)
+        return False
     if isinstance(saved, dict) and saved.get('_macro_tp_pending') and not saved.get('_macro_tp_task'):
         legacy = saved.get('_macro_tp_pending')
         if isinstance(legacy, dict):
@@ -933,7 +1134,7 @@ def init_symbol_state(context, sym, cfg):
     for k in ['scale_factor', 'pending_fill_amount', 'used_atr_rate', 'cached_atr_ema']:
         if k in st: st.pop(k)
         
-    _init_va_budget(st, saved, cfg)
+    _init_va_budget(st, saved, cfg, context)
     context.state[sym] = st
     context.latest_data[sym] = st['base_price']
     context.should_place_order_map[sym] = True
@@ -941,6 +1142,7 @@ def init_symbol_state(context, sym, cfg):
     context.last_valid_price[sym] = st['base_price']
     context.last_valid_ts[sym] = None
     context.pending_frozen[sym] = 0
+    safe_save_state(sym, st)  # 首次可靠观察/开关事件立即持久化，不等待本周VA执行。
     audit_initial_consistency(context, sym)
 
 def audit_initial_consistency(context, symbol):
@@ -985,9 +1187,11 @@ def _repair_state_logic(context):
 
         weeks, acc_invest = _va_budget_view(state)
         if weeks is None or weeks <= 0: continue
-        target_val = state['initial_position_value'] + acc_invest
+        # 新独立周期不参与旧70%启动修复，避免把历史初始价值套到新VA锚。
+        if state['_va_budget']['mode'] == 'independent': continue
+        target_val = _va_target_value(state)
         price = state['base_price']
-        if price <= 0: continue
+        if target_val is None or not _finite_nonnegative(price) or price <= 0 or not _finite_nonnegative(state.get('base_position')): continue
             
         theoretical_pos = int(target_val / price / 100) * 100
         current_pos = state['base_position']
@@ -1094,15 +1298,19 @@ def _fast_cancel_all_orders_global(context):
 # ---------------- 订单与撤单工具 ----------------
 
 def get_order_status(entrust_no):
-    """使用 normalize 兼容字典/对象返回"""
-    try:
-        order_detail = get_order(entrust_no)
-        if order_detail:
-            normalized = OrderUtils.normalize(order_detail)
-            return normalized.get('status', '')
-        return ''
-    except Exception:
-        return ''
+    """官方get_order用id并返回list；旧委托号调用通过查询表映射，失败不猜状态。"""
+    queries = [lambda: get_order(entrust_no)]
+    queries += [globals()[name] for name in ['get_orders', 'get_all_orders'] if callable(globals().get(name))]
+    for query in queries:
+        try:
+            raw = query()
+            if raw is None: continue
+            for item in _grid_order_list(raw):
+                rec = _grid_order_record(item)
+                if str(entrust_no) in (rec['id'], rec['entrust_no']): return rec['status']
+        except Exception:
+            continue
+    return ''
 
 
 def _should_skip_duplicate_submit(context, symbol, amount, price, window_sec=3):
@@ -1171,7 +1379,7 @@ def cancel_all_orders_by_symbol(context, symbol):
             continue
             
         final_status = get_order_status(entrust_no)
-        if final_status in ('8', '4', '5', '6'): continue
+        if final_status in ('8', '5', '6', '9'): continue  # 4部成待撤仍在途，9废单已终态
             
         cache.add(entrust_no)
         total += 1
@@ -2711,7 +2919,7 @@ def _grid_limit_policy():
     if not policy.get('enabled', False):
         return None
     names = ['reference_assets', 'cap_at_reference', 'capital_budget_ratio',
-             'unit_budget_fraction', 'cash_reserve', 'fee_buffer_rate']
+             'unit_budget_fraction', 'cash_reserve', 'fee_buffer_rate', 'minimum_fee']
     if any(not _finite_nonnegative(policy.get(k)) for k in names):
         raise ValueError('动态参数缺失或非有限非负数')
     if policy['reference_assets'] <= 0 or policy['cap_at_reference'] <= 0:
@@ -2722,6 +2930,12 @@ def _grid_limit_policy():
         raise ValueError('费用缓冲异常')
     return policy
 
+def _grid_estimated_fee(notional, policy):
+    return 0.0 if notional <= 0 else max(notional * policy['fee_buffer_rate'], policy['minimum_fee'])
+
+def _grid_order_cost(notional, policy):
+    return notional + _grid_estimated_fee(notional, policy)
+
 def _grid_capacity_cap(context):
     """结构容量用可流通网格资产预算；即时支付能力只在买单发送门检查。"""
     try:
@@ -2729,7 +2943,7 @@ def _grid_capacity_cap(context):
         if policy is None:
             return StrategyConfig.MAX_TRADE_AMOUNT, None
         portfolio = context.portfolio
-        assets, cash = portfolio.total_value, portfolio.available_cash
+        assets, cash = portfolio.portfolio_value, portfolio.cash
         if not _finite_nonnegative(assets) or assets <= 0 or not _finite_nonnegative(cash) or cash > assets:
             raise ValueError('账户总资产/可用现金异常')
         # 只统计策略ETF持仓，不使用证券余额总额或GC001金额；可卖持仓支持卖侧容量。
@@ -2754,64 +2968,132 @@ def _grid_capacity_cap(context):
         # 保留旧单位/卖侧能力，禁止未知资金状态下新增买单。
         return StrategyConfig.MAX_TRADE_AMOUNT, str(exc)
 
+_GRID_OPEN_STATUSES = {'0', '1', '2', '3', '4', '7', '+', '-', 'V'}
+_GRID_TERMINAL_STATUSES = {'5', '6', '8', '9'}
+
+def _grid_order_record(item):
+    def field(name, default=None):
+        return item.get(name, default) if isinstance(item, dict) else getattr(item, name, default)
+    amount = float(field('amount', 0))
+    direction = str(field('entrust_bs', '2' if amount < 0 else '1'))
+    return dict(id=str(field('id', field('order_id', '')) or ''), entrust_no=str(field('entrust_no', '') or ''),
+                symbol=convert_symbol_to_standard(str(field('symbol', field('stock_code', '')) or '')),
+                status=str(field('status', '')), amount=abs(amount), sell=direction == '2',
+                price=field('limit', None) if field('limit', None) is not None else field('price', None),
+                filled=abs(float(field('filled', field('filled_amount', field('business_amount', 0))) or 0)))
+
+def _grid_order_list(raw):
+    if raw is None: raise ValueError('订单快照不可用')
+    if isinstance(raw, dict):
+        return [raw] if 'status' in raw else list(raw.values())
+    return list(raw) if isinstance(raw, (list, tuple)) else [raw]
+
+def _grid_sell_trades():
+    query = globals().get('get_trades')
+    if query is None: return {}  # 回放/旧沙箱无该接口，不凭限价估算卖出回款。
+    raw = query()
+    if not isinstance(raw, dict): raise ValueError('get_trades返回格式异常')
+    proceeds = {}
+    for order_id, fills in raw.items():
+        for fill in fills:
+            if len(fill) < 8: raise ValueError('成交明细字段不足')
+            if str(fill[3]) in ('卖', '卖出', 'SELL', '2'):
+                symbol = convert_symbol_to_standard(str(fill[2]))
+                if symbol.startswith(('204', '131')): continue  # 逆回购卖出是出借，不是即时回款。
+                value = float(fill[6])
+                if not _finite_nonnegative(value): raise ValueError('成交回款异常')
+                key = str(order_id)
+                proceeds.setdefault(key, {})[str(fill[0])] = value
+    return {key: sum(fills.values()) for key, fills in proceeds.items()}
+
 def _grid_cash_available(context, policy):
-    """全账户共享保留账：broker冻结与本地新单按委托号取并集，不能重复占用现金。"""
-    cash = context.portfolio.available_cash
-    if not _finite_nonnegative(cash):
-        raise ValueError('即时可用现金异常')
-    raw = get_open_orders()  # 必须是全账户；不能只读取当前标的。
-    if raw is None:
-        raise ValueError('全账户挂单快照不可用')
-    orders = list(raw.values()) if isinstance(raw, dict) else list(raw)
-    broker = {}
-    for item in orders:
-        o = OrderUtils.normalize(item)
-        if not OrderUtils.is_active(o) or OrderUtils.is_sell(o):
-            continue
-        if not o['entrust_no'] or not is_valid_price(o['price']) or not _finite_nonnegative(o['amount']):
-            raise ValueError('买单冻结信息异常')
-        filled = item.get('filled', 0) if isinstance(item, dict) else getattr(item, 'filled', 0)
-        if not _finite_nonnegative(filled) or filled > o['amount']:
-            raise ValueError('买单已成交数量异常')
-        broker[o['entrust_no']] = (o['amount'] - filled) * o['price'] * (1 + policy['fee_buffer_rate'])
+    """PTrade cash已扣冻结；Order.id映射委托号，待撤仍冻结，废单释放，真实卖款才入池。"""
+    cash = context.portfolio.cash
+    if not _finite_nonnegative(cash): raise ValueError('即时可用现金异常')
+    records = [_grid_order_record(o) for o in _grid_order_list(get_open_orders())]
+    query = globals().get('get_all_orders')
+    if query is not None and '回测' not in getattr(context, 'env', ''):
+        records += [_grid_order_record(o) for o in _grid_order_list(query())]
     ledger = getattr(context, '_grid_cash_ledger', None)
-    gross = cash + sum(broker.values())
+    sales = _grid_sell_trades()
     if ledger is None:
-        ledger = {'local': {}, 'original': {}, 'gross_ceiling': gross, 'spent': 0.0}
+        ledger = {'local': {}, 'original': {}, 'gross_ceiling': None, 'spent': 0.0, 'aliases': {}, 'seen_sales': dict(sales),
+                  'sale_credit': 0.0, 'day': context.current_dt.date().isoformat(), 'local_symbols': {}}
         context._grid_cash_ledger = ledger
+    # 先建立 id<->委托号映射，再合并账户外部记录，禁止同一笔冻结按两种ID重复计算。
+    for rec in records:
+        if rec['id'] and rec['entrust_no']:
+            ledger['aliases'][rec['entrust_no']] = rec['id']
+    indexed = {}
+    for rec in records:
+        key = rec['id'] or ledger['aliases'].get(rec['entrust_no']) or 'entrust:' + rec['entrust_no']
+        if key == 'entrust:': raise ValueError('订单缺少id和委托编号')
+        previous = indexed.get(key)
+        if (previous is None or rec['status'] in _GRID_TERMINAL_STATUSES
+                or (previous['status'] not in _GRID_TERMINAL_STATUSES and rec['filled'] >= previous['filled'] and rec['id'])):
+            indexed[key] = rec
+    # get_order用订单id查询，官方返回list[Order]，不能把委托号直接当id。
+    for eid in ledger['local']:
+        if eid not in indexed:
+            raw_detail = get_order(eid)
+            if raw_detail is None: continue  # 未可见的新订单保留原预算，不猜撤单。
+            detail = _grid_order_list(raw_detail)
+            for item in detail:
+                rec = _grid_order_record(item)
+                if rec['id'] == eid or (not rec['id'] and len(detail) == 1):
+                    indexed[eid] = rec
+                    if rec['entrust_no']: ledger['aliases'][rec['entrust_no']] = eid
+    for key in list(indexed):
+        if key.startswith('entrust:') and key[8:] in ledger['aliases']:
+            canonical = ledger['aliases'][key[8:]]
+            rec = indexed.pop(key)
+            if canonical not in indexed or rec['status'] in _GRID_TERMINAL_STATUSES: indexed[canonical] = rec
+    broker = {}
+    for key, rec in indexed.items():
+        if rec['status'] not in _GRID_OPEN_STATUSES or rec['sell']: continue
+        if not _finite_nonnegative(rec['amount']) or not _finite_nonnegative(rec['filled']) or rec['filled'] > rec['amount']:
+            raise ValueError('订单数量异常')
+        if not _finite_nonnegative(rec['price']) or rec['price'] <= 0: raise ValueError('订单限价不可用')
+        broker[key] = _grid_order_cost((rec['amount'] - rec['filled']) * rec['price'], policy)
+    gross = cash + sum(broker.values())
+    if ledger['gross_ceiling'] is None: ledger['gross_ceiling'] = gross
     for eid in list(ledger['local']):
         remaining = ledger['local'][eid]
         if eid in broker:
-            # 部分成交转为已花费，不再同时记成冻结；即使现金尚未刷新，总预算也不变。
             current = min(remaining, broker[eid])
             ledger['spent'] += remaining - current
             ledger['local'][eid] = current
-            continue
-        if get_order_status(eid) in ('8', '4', '5', '6'):
-            original_cost = ledger['original'][eid]
-            spent_total = original_cost  # 缺明细按整笔成交保守处理。
-            try:
-                detail = get_order(eid)
-                filled = detail.get('filled') if isinstance(detail, dict) else detail.filled
-                original = OrderUtils.normalize(detail)
-                if _finite_nonnegative(filled) and original['amount'] > 0 and filled <= original['amount']:
-                    spent_total = original_cost * filled / original['amount']
-            except Exception:
-                pass
-            ledger['spent'] += max(0.0, spent_total - (original_cost - remaining))
+        elif eid in indexed and indexed[eid]['status'] in _GRID_TERMINAL_STATUSES:
+            rec = indexed[eid]
+            if not _finite_nonnegative(rec['amount']) or not _finite_nonnegative(rec['filled']) or rec['amount'] <= 0 or rec['filled'] > rec['amount']:
+                raise ValueError('终态数量异常')
+            original = ledger['original'][eid]
+            if rec['filled'] and (not _finite_nonnegative(rec['price']) or rec['price'] <= 0):
+                continue  # 缺成交价格上界时保留该笔预算，不猜部分成交费用。
+            spent = _grid_order_cost(rec['filled'] * (rec['price'] or 0), policy)
+            ledger['spent'] += max(0.0, spent - (original - remaining))
             del ledger['local'][eid]
             del ledger['original'][eid]
-    # 现金+冻结只用于重建总池，绝不在可用现金上再减一遍券商冻结。
-    # 在本地单已终态且现金反映支出前保持总池上界；入金也不在这个未知窗口放大预算。
-    if not ledger['local'] and (ledger['spent'] == 0 or gross <= ledger['gross_ceiling'] - ledger['spent']):
-        ledger['gross_ceiling'], ledger['spent'] = gross, 0.0
-    else:
-        ledger['gross_ceiling'] = min(ledger['gross_ceiling'], gross + ledger['spent'])
+            ledger['local_symbols'].pop(eid, None)
+        # 4部成待撤、查不到订单、状态未知都不得释放本地保留账。
+    for order_id, value in sales.items():
+        previous = ledger['seen_sales'].get(order_id, 0)
+        if value > previous:
+            # 最低费用按订单累计估算，不能每条部分成交都扣一次或重复增加回款。
+            net = max(0, value - _grid_estimated_fee(value, policy))
+            prior_net = max(0, previous - _grid_estimated_fee(previous, policy))
+            ledger['sale_credit'] += max(0, net - prior_net)
+            ledger['seen_sales'][order_id] = value
+    if not ledger['local'] and ((ledger['spent'] == 0 and ledger['sale_credit'] == 0)
+                               or ledger['day'] != context.current_dt.date().isoformat()):
+        ledger['gross_ceiling'], ledger['spent'], ledger['sale_credit'] = gross, 0.0, 0.0
+        ledger['day'] = context.current_dt.date().isoformat()
     union = dict(broker)
     for eid, cost in ledger['local'].items():
-        if eid not in union:
-            union[eid] = cost
-    return max(0.0, min(cash, ledger['gross_ceiling'] - ledger['spent'] - sum(union.values())) - policy['cash_reserve'])
+        if eid not in union: union[eid] = cost
+    ledger['pending_buy_symbols'] = {r['symbol'] for r in indexed.values() if not r['sell'] and r['status'] in _GRID_OPEN_STATUSES}
+    ledger['pending_buy_symbols'].update(ledger['local_symbols'].get(eid) for eid in ledger['local'])
+    return max(0.0, min(cash, ledger['gross_ceiling'] + ledger['sale_credit'] - ledger['spent'] - sum(union.values())) - policy['cash_reserve'])
 
 def _submit_grid_order(context, symbol, amount, price):
     """只接普通/竞价网格单；宏观止盈仍走原有成交归属链。"""
@@ -2833,7 +3115,10 @@ def _submit_grid_order(context, symbol, amount, price):
                 if getattr(context, '_grid_submit_uncertain', False):
                     raise ValueError('上次买单返回异常、归属未确认；阻断新增买单，需核对券商挂单后重启')
                 cash = _grid_cash_available(context, policy)
-                qty = min(qty, int(math.floor(cash / (price * (1 + policy['fee_buffer_rate'])) / 100.0)) * 100)
+                if symbol in context._grid_cash_ledger['pending_buy_symbols']:
+                    raise ValueError('同标的买单仍在途/待撤或未可见，不以数量裁剪绕过重复挂单保护')
+                payable = max(0.0, min(cash / (1 + policy['fee_buffer_rate']), cash - policy['minimum_fee']))
+                qty = min(qty, int(math.floor(payable / price / 100.0)) * 100)
             if qty < 100 or qty * price < 1000:
                 raise ValueError('资金/上限不足一个100份整手且不少于1000元的网格；保留网格单位')
             amount = qty if amount > 0 else -qty
@@ -2854,9 +3139,10 @@ def _submit_grid_order(context, symbol, amount, price):
             _mark_order_submit_guard(context, symbol, requested_amount, price)
         context._grid_last_submit = (str(eid), amount)
         if policy is not None and amount > 0:
-            cost = amount * price * (1 + policy['fee_buffer_rate'])
+            cost = _grid_order_cost(amount * price, policy)
             context._grid_cash_ledger['local'][str(eid)] = cost
             context._grid_cash_ledger['original'][str(eid)] = cost
+            context._grid_cash_ledger['local_symbols'][str(eid)] = symbol
         info('[{}] 网格实际委托: {}份 @ {:.3f}, 金额 {:.2f}', symbol, amount, price, abs(amount) * price)
     return eid
 
@@ -2898,6 +3184,10 @@ def _reanchor_base_after_macro_tp(context, symbol, state, remaining_pos, price):
 def _finalize_macro_tp_task(context, symbol, state, final_price):
     task=_get_macro_tp_task(state)
     if not task: return
+    if not all(_finite_nonnegative(task.get(k)) for k in ['filled_qty', 'filled_cash', 'unreleased_cash']):
+        _mark_macro_tp_task_abnormal(context, symbol, state, '当前宏观成交/未释放池字段无效，不能反推滴灌')
+        safe_save_state(symbol, state)
+        return
     actual_sold_qty=float(task.get('filled_qty',0)); actual_cash=float(task.get('filled_cash',0.0))
     remaining_pos=max(0,float(task.get('pre_pos',0))-actual_sold_qty)
     total_drip_pool=actual_cash+float(task.get('unreleased_cash',0.0)); drip_weeks=max(1,int(task.get('drip_weeks',16)))
@@ -2905,7 +3195,7 @@ def _finalize_macro_tp_task(context, symbol, state, final_price):
     _reanchor_base_after_macro_tp(context, symbol, state, remaining_pos, final_price)
     # 止盈完成后立即进入断代保护期，HWM / Tier 从 0 开始，保护期内不得重建。
     state['trade_week_set']=set(); state['_tp_hwm_ratio']=0.0; state['_tp_tier']=0
-    _reset_va_cycle(state)
+    _reset_va_cycle(state, context.current_dt)
     task['status']='finalized'; task['finalized_at']=context.current_dt.strftime('%Y-%m-%d %H:%M:%S'); state['_last_macro_tp_task']=task; state['_macro_tp_task']=None
     safe_save_state(symbol,state)
 
@@ -2935,6 +3225,11 @@ def _check_macro_take_profit(context, symbol, state, price, dt):
                 info('[{}] ⏭ 宏观止盈任务异常(status={})，等待人工处理。', dsym(context, symbol), task.get('status') if task else 'unknown')
             return True
 
+        if ((state.get('_va_budget') or {}).get('drip_current_valid', True) is False
+                or not _finite_nonnegative(state.get('_drip_amount', 0))
+                or not isinstance(state.get('_drip_remain_weeks', 0), int) or state.get('_drip_remain_weeks', 0) < 0):
+            info('[{}] ⛔ 当前滴灌池不可核验，只阻断本标的新宏观任务；不改HWM/成本/成交', symbol)
+            return False
         guard = _get_macro_tp_tracking_guard(context, symbol, state, pos=pos, price=price)
         if not guard['allow_tracking']:
             _clear_macro_tp_tracking_if_blocked(context, symbol, state, reason=guard['reason'])
@@ -3267,31 +3562,53 @@ def end_of_day(context):
 
 def get_target_base_position(context, symbol, state, price, dt):
     try:
+        if not _valid_va_budget(state.get('_va_budget'), allow_invalid=True):
+            _init_va_budget(state, state, {}, SimpleNamespace(current_dt=dt))
+        validated_price = price
+        budget = state['_va_budget']
+        if state['va_enabled'] and not budget['known']:
+            timestamps = getattr(context, 'last_valid_ts', {})
+            observed = timestamps.get(symbol) if isinstance(timestamps, dict) else None
+            if (not isinstance(observed, datetime) or observed > dt
+                    or (dt - observed).total_seconds() > StrategyConfig.MARKET.HALT_SKIP_AFTER_SEC):
+                validated_price = None  # 初始化base_price只是记忆锚，不能冒充恢复行情。
+        before = copy.deepcopy(state['_va_budget'])
+        _va_observe_switch(state, dt, validated_price)  # 锚在本周滴灌释放前建立，后续释放只加一次。
+        if state['_va_budget'] != before:
+            safe_save_state(symbol, state)
         get_trade_weeks(context, symbol, state, dt)  # 宏观期限/滴灌照常推进，与VA预算分离。
-        if _accrue_va_week(symbol, state, dt):
+        if _accrue_va_week(symbol, state, dt, validated_price):
             safe_save_state(symbol, state)
         weeks, accumulated_investment = _va_budget_view(state)
         if not _as_bool(state.get('va_enabled', True), True) or weeks is None:
             state['max_position'] = state['base_position'] + state['grid_unit'] * state.get('max_grid_count', 12)
             return state['base_position']
-        target_val, current_val = state['initial_position_value'] + accumulated_investment, state['base_position'] * price
+        if not _finite_nonnegative(price) or price <= 0 or state['_va_budget'].get('current_error'):
+            return state['base_position']
+        budget = state['_va_budget']
+        independent = budget['mode'] == 'independent'
+        initial_shares = budget['anchor']['shares'] if independent else state['initial_base_position']
+        last_week_position = budget['last_week_position'] if independent else state['last_week_position']
+        target_val, current_val = _va_target_value(state), state['base_position'] * price
         surplus, grid_value = current_val - target_val, state['grid_unit'] * price
         if surplus >= StrategyConfig.VA.THRESHOLD_K * grid_value:
             release_amt = state['grid_unit']
-            if state['base_position'] - release_amt >= state['initial_base_position'] * 0.5:
+            if state['base_position'] - release_amt >= initial_shares * 0.5:
                 state['base_position'] -= release_amt
                 info('[{}] 💰 VA底仓盈余释放: 减少 {} 股', dsym(context, symbol), release_amt)
-        delta_val = target_val - (state['last_week_position'] * price)
+        delta_val = target_val - (last_week_position * price)
         if delta_val > 0:
             delta_pos = math.ceil(delta_val / price / 100) * 100
-            new_pos = state['last_week_position'] + delta_pos
-            min_base = round(state['initial_position_value'] / state['base_price'] / 100) * 100
+            new_pos = last_week_position + delta_pos
+            min_base = (round((target_val - accumulated_investment) / budget['anchor']['price'] / 100) * 100
+                        if independent else round(state['initial_position_value'] / state['base_price'] / 100) * 100)
             final_pos = round(max(min_base, new_pos) / 100) * 100
             if final_pos > state['base_position']:
                 info('[{}] 📈 VA价值平均加仓: 底仓增加至 {}', dsym(context, symbol), final_pos)
                 state['base_position'] = final_pos
                 
         state['max_position'] = state['base_position'] + state['grid_unit'] * state.get('max_grid_count', 12)
+        safe_save_state(symbol, state)
     except Exception as exc:
         info('[{}] ⛔ VA目标未更新: {}', symbol, exc)
     return state['base_position']
@@ -3314,11 +3631,22 @@ def get_trade_weeks(context, symbol, state, dt):
         
         # 🌟 V3.13.10: 独立滴灌引擎 (每周释放一次)
         drip_remain = state.get('_drip_remain_weeks', 0)
-        if drip_remain > 0:
+        valid_drip = (isinstance(drip_remain, int) and not isinstance(drip_remain, bool) and drip_remain >= 0
+                      and _finite_nonnegative(state.get('_drip_amount'))
+                      and _finite_nonnegative(state.get('initial_position_value'))
+                      and (state.get('_va_budget') or {}).get('drip_current_valid', True))
+        if not valid_drip:
+            info('[{}] ⛔ 当前滴灌字段无效，只暂停本标的释放，不反推金额', symbol)
+        elif drip_remain > 0:
             drip_amt = state.get('_drip_amount', 0.0)
             # 滴灌资金直接注入底仓总价值的蓄水池，从0阶导数发力，拒绝拉高斜率
             state['initial_position_value'] += drip_amt
             state['_drip_remain_weeks'] -= 1
+            budget = state.get('_va_budget')
+            if isinstance(budget, dict) and budget.get('schema') == 2:
+                budget['drip_released_total'] += drip_amt
+                budget['drip_events'].append(dict(cycle_id=budget['cycle_id'], week=key, at=_va_time(dt), amount=drip_amt,
+                                                remaining=state['_drip_remain_weeks']))
             if state['_drip_remain_weeks'] <= 0:
                 state['_drip_amount'] = 0.0
                 info('[{}] 💧 滴灌周期彻底结束，VA 引擎完美回归常态定投！', dsym(context, symbol))
@@ -3448,6 +3776,7 @@ def _archive_daily_snapshot(context):
         'buy_stack', 'sell_stack', 'archived_buy_anchor',
         'archived_sell_anchor', 'history_pnl', 'wm_pnl'
     ]
+    required_state_fields.append('_va_budget')
 
     def copy_one(src, relative_path, required=False):
         try:
@@ -3513,8 +3842,14 @@ def _archive_daily_snapshot(context):
             state_ok_count += 1
 
     copy_one(research_path('state', 'pnl_metrics.json'), 'state/pnl_metrics.json')
+    for symbol, reason in getattr(context, 'quarantined_symbols', {}).items():
+        warnings.append('[{}] 当前state隔离: {}'.format(symbol, reason))
+        copy_one(research_path('state', '{}.json'.format(symbol)), 'state/{}.json'.format(symbol), required=True)
 
     report_names = ['{}.csv'.format(symbol) for symbol in symbols]
+    report_names += ['{}.va31416.csv'.format(symbol) for symbol in symbols]
+    report_names += ['{}.va31416.v2.csv'.format(symbol) for symbol in symbols]
+    report_names += ['{}.va31416.audit.json'.format(symbol) for symbol in symbols]
     report_names += [
         'a_trade_details.csv', 'attribution_by_symbol.csv', 'attribution_daily.csv',
         'dashboard_data.json', 'strategy_dashboard.html'
@@ -3592,7 +3927,7 @@ def reload_config_if_changed(context):
         for sym in new_symbols - old_symbols:
             info('[{}] 新增标的 (或重载)，正在初始化状态...', dsym(context, sym))
             cfg = new_config[sym]
-            init_symbol_state(context, sym, cfg)
+            if init_symbol_state(context, sym, cfg) is False: continue
             context.symbol_list.append(sym)
 
         for sym in old_symbols.intersection(new_symbols):
@@ -3631,8 +3966,14 @@ def reload_config_if_changed(context):
         context.symbol_config = new_config
         for sym in context.symbol_list:
             state = context.state[sym]
-            if not _valid_va_budget(state.get('_va_budget')) and new_config[sym].get('va_migration'):
-                _init_va_budget(state, state, new_config[sym])
+            try:
+                if not isinstance(state.get('_va_budget'), dict) or state['_va_budget'].get('schema') != 2:
+                    _init_va_budget(state, state, new_config[sym], context)
+                _va_observe_switch(state, context.current_dt)
+                if state['va_enabled']:
+                    _va_sync_legacy(state)
+            except (ValueError, TypeError, KeyError, OverflowError) as exc:
+                info('[{}] ⛔ 本标的VA热加载数据无效: {}', sym, exc)
             safe_save_state(sym, state)
         _load_symbol_names(context)
         info('✅ 配置文件热重载完成！')
@@ -3655,7 +3996,7 @@ def update_daily_reports(context, data):
     current_date = context.current_dt.strftime("%Y-%m-%d")
     for symbol in context.symbol_list:
         # 新文件/新列名，不改历史CSV；消除旧报表“理论预算=实际投入”的误称。
-        report_file, state, position = reports_dir / f"{symbol}.va31416.csv", context.state[symbol], get_position(symbol)
+        report_file, state, position = reports_dir / f"{symbol}.va31416.v2.csv", context.state[symbol], get_position(symbol)
         amount, close_price = position.amount, context.last_valid_price.get(symbol, state['base_price'])
         if not is_valid_price(close_price): close_price = state['base_price']
         weeks, d_base = len(state.get('trade_week_set', [])), state['dingtou_base']
@@ -3685,11 +4026,19 @@ def update_daily_reports(context, data):
             f"{(state['base_position'] - state.get('last_week_position', 0)) * close_price:.3f}", 
             f"{(close_price - getattr(position, 'cost_basis', state['base_price'])) * amount:.0f}"
         ]
+        row += [va_view['cycle_id'], va_view['mode'], va_view['pause_observed_at'] or '',
+                va_view['pause_confirmed_start'] or '历史未知', str(va_view['skipped_weeks']),
+                budget_text(va_view['skipped_budget']), budget_text(va_view['drip_amount']),
+                '' if va_view['drip_remain'] is None else str(va_view['drip_remain']),
+                budget_text(va_view['observed_drip_released']), ';'.join(va_view['unknowns'])]
         
         is_new = not report_file.exists()
         with open(report_file, 'a', encoding='utf-8', newline='') as f:
-            if is_new: f.write(",".join(["时间","市价","交易周数","VA有效期数","持仓相对上周底仓市值比","市值相对VA预算比","VA目标价值","基础每期预算","当周已记VA预算","累计VA预算非成交投入","定投底仓份额","累计底仓份额","累计底仓价值","每期累计底仓盈利","总累计底仓盈利","底仓","股票余额","单次网格交易数量","可T数量","标准数量","中间数量","极限数量","成本价","对比定投成本","盈亏"]) + "\n")
+            if is_new: f.write(",".join(["时间","市价","交易周数","VA有效期数","持仓相对上周底仓市值比","市值相对VA预算比","VA目标价值","基础每期预算","当周已记VA预算","累计VA预算非成交投入","定投底仓份额","累计底仓份额","累计底仓价值","每期累计底仓盈利","总累计底仓盈利","底仓","股票余额","单次网格交易数量","可T数量","标准数量","中间数量","极限数量","成本价","对比定投成本","盈亏",
+                                      "VA周期ID","VA模式","暂停首次观察","可靠暂停起点","仅审计暂停观察周数","仅审计跳过预算","当前单周滴灌金额","当前滴灌剩余周数","新机制观察到的滴灌释放","历史未知项"]) + "\n")
             f.write(",".join(map(str, row)) + "\n")
+        (reports_dir / f'{symbol}.va31416.audit.json').write_text(json.dumps(
+            {'at': _va_time(context.current_dt), 'view': va_view, 'lifecycle': state.get('_va_budget')}, ensure_ascii=False, indent=2), encoding='utf-8')
         info('✅ [{}] 已更新每日CSV报表', dsym(context, symbol))
 
 # ---------------- 【新增】水位线网格利润重构引擎 ----------------
@@ -3886,6 +4235,7 @@ def generate_html_report(context):
                     <div style="color: #9ece6a; font-size: 12px; margin-left: 15px; margin-bottom: 8px;">🟢 <b>下方网格支撑 (Buy Stack):</b> {b_str}</div>
                     <div style="color: #c0caf5; font-size: 13px; margin-bottom: 6px;"><b>💧 VA 价值平均引擎 (Engine Status):</b></div>
                     <div style="color: #7dcfff; font-size: 12px; margin-left: 15px;">累计VA预算(非成交投入): {acc_text} 元 &nbsp; | &nbsp; 理论应到价值: {target_text} 元</div>
+                    <div style="font-size:12px;">周期:{va_view['cycle_id']} / {va_view['mode']}；暂停观察:{va_view['pause_observed_at']}，可靠起点:{va_view['pause_confirmed_start'] or '历史未知'}；仅审计跳过周数:{va_view['skipped_weeks']} / 金额:{va_view['skipped_budget']}；当前滴灌:{va_view['drip_amount']} × {va_view['drip_remain']}；已观察释放:{va_view['observed_drip_released']}；历史未知:{';'.join(va_view['unknowns'])}</div>
                 </div>
             </td>
             """
@@ -3905,7 +4255,7 @@ def generate_html_report(context):
             
         try:
             if hasattr(context, 'portfolio') and context.portfolio:
-                portfolio_val['other'] += getattr(context.portfolio, 'available_cash', 0)
+                portfolio_val['other'] += getattr(context.portfolio, 'cash', 0)
         except Exception:
             pass
 

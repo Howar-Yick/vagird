@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SYM = 'TEST.SS'
 POLICY = dict(enabled=True, reference_assets=1_000_000, cap_at_reference=5000,
               capital_budget_ratio=0.5, unit_budget_fraction=0.02,
-              cash_reserve=10_000, fee_buffer_rate=0.001)
+              cash_reserve=10_000, fee_buffer_rate=0.001, minimum_fee=5)
 
 
 def load(version):
@@ -52,10 +52,10 @@ def state(**kw):
 def context(st, cash=30_000, assets=1_000_000):
     return NS(state={st['symbol']: st}, symbol_list=[st['symbol']],
               current_dt=datetime(2026, 10, 12, 10), symbol_config={},
-              portfolio=NS(total_value=assets, available_cash=cash),
+              portfolio=NS(portfolio_value=assets, cash=cash),
               latest_data={st['symbol']: 10.0}, last_valid_price={st['symbol']: 10.0},
               pending_frozen={}, should_place_order_map={}, mark_halted={},
-              last_valid_ts={}, pnl_metrics={}, symbol_names={})
+              last_valid_ts={st['symbol']: datetime(2026, 10, 12, 10)}, pnl_metrics={}, symbol_names={})
 
 
 def ready(new, **kw):
@@ -146,42 +146,59 @@ def test_legacy_always_on_migration_and_old_startup_repair_equal(new, old):
 
 @pytest.mark.parametrize('cfg', [{}, {'va_migration': {'mode': 'always_enabled', 'source_sha256': 'bad', 'evidence': 'x'}}])
 def test_unconfirmed_old_paused_state_never_recovers_budget(new, cfg):
-    saved = dict(trade_week_set=['2026_40', '2026_41'], va_enabled=False, base_position=7600)
-    st = state(base_position=7600, last_week_position=7600, trade_week_set=set(saved['trade_week_set']))
-    new._init_va_budget(st, saved, cfg)
+    saved = dict(trade_week_set=['2026_40', '2026_41'], va_enabled=False, base_position=7600,
+                 _drip_amount=0.0, _drip_remain_weeks=0)
+    st = state(base_position=7600, last_week_position=7600, va_enabled=False, trade_week_set=set(saved['trade_week_set']))
     c = context(st)
-    before = st['base_position']
+    new._init_va_budget(st, saved, cfg, c)
     new.get_target_base_position(c, SYM, st, 10, c.current_dt)
-    new._repair_state_logic(c)
-    assert st['base_position'] == before
-    assert new._va_budget_view(st) == (None, None)
+    assert st['base_position'] == 7600 and new._va_budget_view(st) == (None, None)
+    observed = st['_va_budget']['pauses'][0]
+    assert observed['historical_start_at'] is None and observed['confirmed_start_at'] is None
+    st['va_enabled'] = True
+    new.get_target_base_position(c, SYM, st, 10, c.current_dt)
+    assert st['_va_budget']['mode'] == 'independent'
+    assert st['_va_budget']['periods'] == 1
+    assert st['_va_budget']['total'] == 1010
+    assert st['base_position'] <= 7800  # only next budget, never old cumulative weeks
+    assert st['initial_position_value'] == 10_000
 
 
 def test_verified_paused_migration_preserves_budget_and_growth_index(new):
-    saved = dict(trade_week_set=['2026_38', '2026_39', '2026_40', '2026_41'], va_enabled=False)
-    st = state(va_enabled=False, trade_week_set=set(saved['trade_week_set']))
-    cfg = {'va_migration': {'mode': 'verified_budget', 'source_sha256': fingerprint(saved),
-                            'evidence': 'old states and switch logs',
-                            'weekly_budgets': {'2026_38': 1010.0, '2026_39': 1020.1}}}
-    new._init_va_budget(st, saved, cfg)
-    assert st['_va_budget']['excluded_weeks'] == ['2026_40', '2026_41']
+    st = ready(new)
+    c = context(st)
+    new.get_target_base_position(c, SYM, st, 10, c.current_dt)
+    new.get_target_base_position(c, SYM, st, 10, c.current_dt + timedelta(weeks=1))
+    budget = st['_va_budget']['total']; cycle = st['_va_budget']['cycle_id']
+    st['va_enabled'] = False
+    for n in [2, 3]: new.get_target_base_position(c, SYM, st, 10, c.current_dt + timedelta(weeks=n))
     st['va_enabled'] = True
-    new.get_target_base_position(context(st), SYM, st, 10, datetime(2026, 10, 12))
+    new.get_target_base_position(c, SYM, st, 10, c.current_dt + timedelta(weeks=4))
+    assert st['_va_budget']['cycle_id'] == cycle
     assert st['_va_budget']['periods'] == 3
-    assert st['_va_budget']['total'] == pytest.approx(1010 + 1020.1 + 1000 * 1.01 ** 3)
+    assert st['_va_budget']['total'] == pytest.approx(budget + 1000 * 1.01 ** 3)
+    assert len(st['_va_budget']['pauses'][0]['skipped_weeks']) == 2
 
 
 def test_pending_restart_keeps_original_fingerprint_and_can_confirm(new):
-    saved = dict(trade_week_set=['2026_40'], va_enabled=False)
+    saved = dict(trade_week_set=['2026_40'], va_enabled=False, _drip_amount=0.0, _drip_remain_weeks=0)
     st = state(va_enabled=False, trade_week_set={'2026_40'})
-    new._init_va_budget(st, saved, {})
-    new.get_target_base_position(context(st), SYM, st, 10, datetime(2026, 10, 9))
+    c = context(st)
+    new._init_va_budget(st, saved, {}, c)
+    new.get_target_base_position(c, SYM, st, 10, c.current_dt)
+    before = copy.deepcopy(st['_va_budget'])
     restarted = json.loads(json.dumps(st, default=list))
-    cfg = {'va_migration': {'mode': 'verified_budget', 'source_sha256': fingerprint(saved),
-                            'evidence': 'verified', 'weekly_budgets': {'2026_40': 1010}}}
-    new._init_va_budget(st, restarted, cfg)
-    assert st['_va_budget']['status'] == 'ready'
-    assert '2026_41' in st['_va_budget']['excluded_weeks']
+    new._init_va_budget(st, restarted, {}, c)
+    assert st['_va_budget'] == before
+    st['va_enabled'] = True
+    new.get_target_base_position(c, SYM, st, 10, c.current_dt)
+    before = copy.deepcopy(st['_va_budget'])
+    restarted = json.loads(json.dumps(st, default=list))
+    new._init_va_budget(st, restarted, {}, c)
+    new.get_target_base_position(c, SYM, st, 10, c.current_dt)
+    assert st['_va_budget']['cycle_id'] == before['cycle_id']
+    assert st['_va_budget']['total'] == before['total']
+    assert st['_va_budget']['unknowns']  # retained history does not make new cycle pending
 
 
 def test_invalid_budget_blocks_and_does_not_erase_original(new):
@@ -213,11 +230,16 @@ def test_macro_finalize_reset_cooldown_drip_and_no_same_week_duplicate(new, old)
     initial = a['initial_position_value']
     for _ in range(3):
         new.get_target_base_position(ca, SYM, a, 11, ca.current_dt)
-    assert a['_va_budget']['periods'] == 0
-    assert a['initial_position_value'] == initial + 1450
-    new.get_target_base_position(ca, SYM, a, 11, ca.current_dt + timedelta(weeks=1))
+        old.get_target_base_position(cb, SYM, b, 11, cb.current_dt)
+        assert (a['base_position'], a['initial_position_value'], a['_drip_remain_weeks']) == (b['base_position'], b['initial_position_value'], b['_drip_remain_weeks'])
     assert a['_va_budget']['periods'] == 1
     assert a['_va_budget']['total'] == 1010
+    assert a['initial_position_value'] == initial + 1450
+    new.get_target_base_position(ca, SYM, a, 11, ca.current_dt + timedelta(weeks=1))
+    old.get_target_base_position(cb, SYM, b, 11, cb.current_dt + timedelta(weeks=1))
+    assert a['base_position'] == b['base_position']
+    assert a['_va_budget']['periods'] == 2
+    assert a['_va_budget']['total'] == sum(1000 * 1.01 ** n for n in range(1, 3))
     assert a['initial_position_value'] == initial + 2900
     assert new._get_macro_tp_tracking_guard(ca, SYM, a, pos=NS(amount=2500, cost_basis=10), price=11)['allow_tracking'] is False
 
@@ -282,14 +304,14 @@ def test_report_pending_and_paused_never_labels_theory_as_actual(new, tmp_path):
     historical = tmp_path / 'reports' / (SYM + '.csv')
     historical.write_text('old data')
     new.update_daily_reports(c, {})
-    text = (tmp_path / 'reports' / (SYM + '.va31416.csv')).read_text()
+    text = (tmp_path / 'reports' / (SYM + '.va31416.v2.csv')).read_text()
     assert '累计VA预算非成交投入' in text
     assert '实际累计投入' not in text
     assert historical.read_text() == 'old data'
     assert new._va_report_view(st, c.current_dt)['total'] == 0
     st['_va_budget']['status'] = 'pending'
     new.update_daily_reports(c, {})
-    assert '待迁移' in (tmp_path / 'reports' / (SYM + '.va31416.csv')).read_text()
+    assert '当前无效' in (tmp_path / 'reports' / (SYM + '.va31416.v2.csv')).read_text()
 
 
 def setup_cash(new, cash=30_000, assets=1_000_000, positions=50_000):
@@ -363,7 +385,7 @@ def test_api_cash_lag_visible_orders_do_not_create_extra_budget(new):
     _, c, calls = setup_cash(new, cash=17_000)
     new._submit_grid_order(c, SYM, 500, 10)
     # Order became visible before broker cash decreased.
-    new.get_open_orders = lambda *a: [dict(entrust_no='1', amount=500, price=10, status=2)]
+    new.get_open_orders = lambda *a: [dict(id='1', entrust_no='700001', amount=500, price=10, status=2)]
     new._submit_grid_order(c, 'OTHER.SS', 500, 10)
     assert calls[1][1] == 100
     assert sum(q * p * 1.001 for _, q, p in calls) <= 7000
@@ -372,13 +394,13 @@ def test_api_cash_lag_visible_orders_do_not_create_extra_budget(new):
 def test_reflected_freeze_and_terminal_release(new):
     _, c, calls = setup_cash(new, cash=17_000)
     new._submit_grid_order(c, SYM, 500, 10)
-    c.portfolio.available_cash = 11_995
-    new.get_open_orders = lambda *a: [dict(entrust_no='1', amount=500, price=10, status=2)]
+    c.portfolio.cash = 11_995
+    new.get_open_orders = lambda *a: [dict(id='1', entrust_no='700001', amount=500, price=10, status=2)]
     assert new._grid_cash_available(c, POLICY) == pytest.approx(1995)
     new.get_open_orders = lambda *a: []
     new.get_order_status = lambda eid: '6'  # cancelled
-    new.get_order = lambda eid: dict(entrust_no=eid, status=6, amount=500, price=10, filled=0)
-    c.portfolio.available_cash = 17_000
+    new.get_order = lambda eid: [dict(id=eid, entrust_no='700001', status=6, amount=500, price=10, filled=0)]
+    c.portfolio.cash = 17_000
     c.current_dt += timedelta(seconds=5)
     assert new._submit_grid_order(c, SYM, 500, 10) == '2'
     assert len(calls) == 2
@@ -388,6 +410,7 @@ def test_terminal_fill_cash_lag_cannot_reuse_spent_money(new):
     _, c, calls = setup_cash(new, cash=17_000)
     new._submit_grid_order(c, SYM, 500, 10)
     new.get_order_status = lambda eid: '8'
+    new.get_order = lambda eid: [dict(id=eid, entrust_no='700001', amount=500, limit=10, status=8, filled=500)]
     # Broker says fully filled while available_cash still shows its old value.
     assert new._submit_grid_order(c, 'OTHER.SS', 500, 10) == '2'
     assert calls[1][1] == 100
@@ -397,23 +420,23 @@ def test_terminal_fill_cash_lag_cannot_reuse_spent_money(new):
 def test_partial_fill_then_cancel_does_not_double_count_frozen_or_spent(new):
     _, c, _ = setup_cash(new, cash=17_000)
     new._submit_grid_order(c, SYM, 500, 10)
-    new.get_open_orders = lambda *a: [dict(entrust_no='1', amount=500, price=10, status=7, filled=200)]
-    c.portfolio.available_cash = 11_995
+    new.get_open_orders = lambda *a: [dict(id='1', entrust_no='700001', amount=500, price=10, status=7, filled=200)]
+    c.portfolio.cash = 11_995
     assert new._grid_cash_available(c, POLICY) == pytest.approx(1995)
-    assert c._grid_cash_ledger['spent'] == pytest.approx(2002)
+    assert c._grid_cash_ledger['spent'] == pytest.approx(2000)
     new.get_open_orders = lambda *a: []
     new.get_order_status = lambda eid: '5'
-    new.get_order = lambda eid: dict(entrust_no=eid, amount=500, price=10, status=5, filled=200)
-    c.portfolio.available_cash = 14_998
-    assert new._grid_cash_available(c, POLICY) == pytest.approx(4998)
+    new.get_order = lambda eid: [dict(id=eid, entrust_no='700001', amount=500, price=10, status=5, filled=200)]
+    c.portfolio.cash = 14_995
+    assert new._grid_cash_available(c, POLICY) == pytest.approx(4995)
 
 
 def test_restart_reconstructs_broker_frozen_without_reusing_it(new):
     _, c, _ = setup_cash(new, cash=17_000)
     new._submit_grid_order(c, SYM, 500, 10)
-    c.portfolio.available_cash = 11_995
+    c.portfolio.cash = 11_995
     del c._grid_cash_ledger
-    new.get_open_orders = lambda *a: [dict(entrust_no='1', amount=500, price=10, status=2, filled=0)]
+    new.get_open_orders = lambda *a: [dict(id='1', entrust_no='700001', amount=500, price=10, status=2, filled=0)]
     assert new._grid_cash_available(c, POLICY) == pytest.approx(1995)
 
 
@@ -457,11 +480,11 @@ def test_out_of_order_dates_do_not_reintroduce_paused_week(new):
 
 def test_macro_reset_cannot_confirm_corrupt_or_pending_migration(new):
     st = ready(new)
-    st['_va_budget']['total'] = 1234  # invalid: no matching weekly ledger
+    st['_va_budget']['total'] = 1234
     new._reset_va_cycle(st)
-    assert st['_va_budget']['status'] == 'pending'
+    assert st['_va_budget']['status'] == 'ready' and st['_va_budget']['known']
     assert st['_va_budget']['total'] == 0
-    assert st['_va_budget']['cycles'][0]['total'] == 1234
+    assert st['_va_budget']['cycles'][0]['total'] == 1234  # audit, never carried into new macro cycle
 
 
 def test_strategy_config_invalid_policy_not_silently_reused(new, tmp_path):
@@ -495,9 +518,9 @@ def test_bad_data_or_policy_blocks_buy_with_reason(new, bad):
     _, c, calls = setup_cash(new)
     messages = []
     new.info = lambda *a: messages.append(a)
-    if bad == 'assets': c.portfolio.total_value = float('nan')
+    if bad == 'assets': c.portfolio.portfolio_value = float('nan')
     if bad == 'price': c.latest_data[SYM] = float('inf')
-    if bad == 'cash': c.portfolio.available_cash = -1
+    if bad == 'cash': c.portfolio.cash = -1
     if bad == 'policy': new.StrategyConfig.GRID_LIMITS['capital_budget_ratio'] = 2
     if bad == 'orders': new.get_open_orders = lambda *a: None
     assert new._submit_grid_order(c, SYM, 500, 10) is None
@@ -538,7 +561,8 @@ def test_untouched_functions_ast_equal_including_trade_clock():
     changed = {'save_state', 'init_symbol_state', '_repair_state_logic', 'place_auction_orders',
                'place_limit_orders', '_calc_grid_unit_for_base', '_reanchor_base_after_macro_tp',
                '_finalize_macro_tp_task', 'handle_data', 'get_target_base_position',
-               'adjust_grid_unit', 'reload_config_if_changed', 'update_daily_reports', 'generate_html_report'}
+               'adjust_grid_unit', 'reload_config_if_changed', 'update_daily_reports', 'generate_html_report',
+               'get_trade_weeks', '_archive_daily_snapshot', 'get_order_status', 'cancel_all_orders_by_symbol', '_check_macro_take_profit'}
     actual = {name for name in prior if prior[name] != current[name]}
     assert actual == changed
     for name in prior.keys() - changed:

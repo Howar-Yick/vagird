@@ -1,0 +1,227 @@
+{
+  "snapshot_date": "2026-10-12",
+  "actual_version": "CHATGPT-3.14.15-MACRO-TP-COOLDOWN-HWM-GUARD",
+  "manifest_files": 37,
+  "logs": [
+    [
+      "2026-10-12_strategy.log",
+      2828
+    ]
+  ],
+  "symbols": [
+    {
+      "symbol": "159509.SZ",
+      "va_enabled": true,
+      "old_trade_weeks": 1,
+      "effective_periods": 1,
+      "baseline_theoretical_budget": 854.93,
+      "baseline_target": 38400.29,
+      "new_effective_budget": 854.9300000000001,
+      "new_target": 38400.29117846171,
+      "base_position": 12300,
+      "drip_amount": 2759.6611784617103,
+      "drip_remain": 23,
+      "source_sha256": "3450a772d2d774b47317dc1bb4f230a4bea5d73be229bf4a4695c1de5b5237e8",
+      "same_week_and_next_week_match": true
+    },
+    {
+      "symbol": "518850.SS",
+      "va_enabled": true,
+      "old_trade_weeks": 32,
+      "effective_periods": 32,
+      "baseline_theoretical_budget": 27653.47,
+      "baseline_target": 42491.47,
+      "new_effective_budget": 27653.472584680625,
+      "new_target": 42491.472584680625,
+      "base_position": 4900,
+      "drip_amount": 0.0,
+      "drip_remain": 0,
+      "source_sha256": "4fe20faeec21ad99162c865add84c20bda8401e185b1533087ef72f2cf88c2b4",
+      "same_week_and_next_week_match": true
+    },
+    {
+      "symbol": "159934.SZ",
+      "va_enabled": false,
+      "old_trade_weeks": 74,
+      "effective_periods": "历史未知",
+      "baseline_theoretical_budget": 65317.19,
+      "baseline_target": 68873.69,
+      "new_effective_budget": null,
+      "new_target": null,
+      "base_position": 7600,
+      "drip_amount": 0.0,
+      "drip_remain": 0,
+      "source_sha256": "32909cf0d6cb4934a9621a619ce0c17cba03153f9d689f8ec2bb23b6034b997d",
+      "same_week_and_next_week_match": true
+    },
+    {
+      "symbol": "159612.SZ",
+      "va_enabled": true,
+      "old_trade_weeks": 3,
+      "effective_periods": 3,
+      "baseline_theoretical_budget": 2564.31,
+      "baseline_target": 51814.14,
+      "new_effective_budget": 2564.3066746591994,
+      "new_target": 51814.1449559092,
+      "base_position": 24800,
+      "drip_amount": 2712.1460937499996,
+      "drip_remain": 13,
+      "source_sha256": "cef85232689011c2cadd84fc2dbb4ef47cda4674c7fd1c41bd436cfc3d338d53",
+      "same_week_and_next_week_match": true
+    },
+    {
+      "symbol": "159655.SZ",
+      "va_enabled": true,
+      "old_trade_weeks": 37,
+      "effective_periods": 37,
+      "baseline_theoretical_budget": 39036.19,
+      "baseline_target": 39036.19,
+      "new_effective_budget": 39036.18996031768,
+      "new_target": 39036.18996031768,
+      "base_position": 19200,
+      "drip_amount": 0.0,
+      "drip_remain": 0,
+      "source_sha256": "ff52a75f486acb1d98528432a462dcb239a14fe25b671af6c1875dd82da554ef",
+      "same_week_and_next_week_match": true
+    },
+    {
+      "symbol": "159545.SZ",
+      "va_enabled": false,
+      "old_trade_weeks": 49,
+      "effective_periods": "历史未知",
+      "baseline_theoretical_budget": 48953.76,
+      "baseline_target": 49977.86,
+      "new_effective_budget": null,
+      "new_target": null,
+      "base_position": 37700,
+      "drip_amount": 0.0,
+      "drip_remain": 0,
+      "source_sha256": "eb3d1d43bd74599aadb1596c7a792ec19c6f3a7276fe3d4937ba4033498fceaf",
+      "same_week_and_next_week_match": true
+    },
+    {
+      "symbol": "159501.SZ",
+      "va_enabled": true,
+      "old_trade_weeks": 3,
+      "effective_periods": 3,
+      "baseline_theoretical_budget": 3034.93,
+      "baseline_target": 37938.75,
+      "new_effective_budget": 3034.9347551120004,
+      "new_target": 37938.747255112,
+      "base_position": 17200,
+      "drip_amount": 1276.6375,
+      "drip_remain": 13,
+      "source_sha256": "1d8e9f8d5693ee8e29b1e9c5650cffa18036cf6c3d972d5fa0a0fdd473a0f23b",
+      "same_week_and_next_week_match": true
+    },
+    {
+      "symbol": "159696.SZ",
+      "va_enabled": true,
+      "old_trade_weeks": 3,
+      "effective_periods": 3,
+      "baseline_theoretical_budget": 3034.93,
+      "baseline_target": 35855.98,
+      "new_effective_budget": 3034.9347551120004,
+      "new_target": 35855.984755112,
+      "base_position": 16800,
+      "drip_amount": 1192.55,
+      "drip_remain": 13,
+      "source_sha256": "09e9b11154f7a67a754d2ba5ac75848a7f6b1604501671b74622a5439e519678",
+      "same_week_and_next_week_match": true
+    },
+    {
+      "symbol": "159605.SZ",
+      "va_enabled": false,
+      "old_trade_weeks": 37,
+      "effective_periods": "历史未知",
+      "baseline_theoretical_budget": 39951.83,
+      "baseline_target": 39951.83,
+      "new_effective_budget": null,
+      "new_target": null,
+      "base_position": 32400,
+      "drip_amount": 0.0,
+      "drip_remain": 0,
+      "source_sha256": "061188b9c2270d846cd37bf5d711a5b1d8cf323621708fa72b2ea2435981ca45",
+      "same_week_and_next_week_match": true
+    },
+    {
+      "symbol": "513010.SS",
+      "va_enabled": false,
+      "old_trade_weeks": 40,
+      "effective_periods": "历史未知",
+      "baseline_theoretical_budget": 45630.1,
+      "baseline_target": 46670.1,
+      "new_effective_budget": null,
+      "new_target": null,
+      "base_position": 50800,
+      "drip_amount": 0.0,
+      "drip_remain": 0,
+      "source_sha256": "44b46accf75d96f4978113f4bfdf4d69d91494f4a3e1b85a139951f3c701a800",
+      "same_week_and_next_week_match": true
+    },
+    {
+      "symbol": "520810.SS",
+      "va_enabled": true,
+      "old_trade_weeks": 39,
+      "effective_periods": 39,
+      "baseline_theoretical_budget": 39789.97,
+      "baseline_target": 40794.97,
+      "new_effective_budget": 39789.972051865014,
+      "new_target": 40794.972051865014,
+      "base_position": 40400,
+      "drip_amount": 0.0,
+      "drip_remain": 0,
+      "source_sha256": "e8483638efaebbe258b820c197f4788ff8b9b4c8c2f8a37fcc269ddc5f0f0f66",
+      "same_week_and_next_week_match": true
+    },
+    {
+      "symbol": "513850.SS",
+      "va_enabled": true,
+      "old_trade_weeks": 4,
+      "effective_periods": 4,
+      "baseline_theoretical_budget": 4040.16,
+      "baseline_target": 4040.16,
+      "new_effective_budget": 4040.160320256,
+      "new_target": 4040.160320256,
+      "base_position": 2100,
+      "drip_amount": 0.0,
+      "drip_remain": 0,
+      "source_sha256": "9ead0d004372b842d154e84c92d0782e4b2d0261db166875c1cb106a361f8a39",
+      "same_week_and_next_week_match": true
+    }
+  ],
+  "unknown_resume": [
+    {
+      "symbol": "159934.SZ",
+      "instant_anchor": 68164.4,
+      "first_period_budget": 850.8499999999999,
+      "old_fields_preserved": true,
+      "restart_no_duplicate": true
+    },
+    {
+      "symbol": "159545.SZ",
+      "instant_anchor": 49010.0,
+      "first_period_budget": 951.9,
+      "old_fields_preserved": true,
+      "restart_no_duplicate": true
+    },
+    {
+      "symbol": "159605.SZ",
+      "instant_anchor": 24073.2,
+      "first_period_budget": 1004.0,
+      "old_fields_preserved": true,
+      "restart_no_duplicate": true
+    },
+    {
+      "symbol": "513010.SS",
+      "instant_anchor": 27381.2,
+      "first_period_budget": 1054.2,
+      "old_fields_preserved": true,
+      "restart_no_duplicate": true
+    }
+  ],
+  "validation": "offline full-redacted-state differential regression",
+  "limitations": [
+    "未部署候选；无原始Portfolio/Order查询返回包；官方对象模型用于订单模拟，不是券商实测"
+  ]
+}
