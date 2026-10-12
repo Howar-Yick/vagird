@@ -1,0 +1,199 @@
+{
+  "159509.SZ": {
+    "grid_unit": 500,
+    "initial_base_position": 0,
+    "base_price": 1.559,
+    "dingtou_base": 850,
+    "dingtou_rate": 0.0058,
+    "credit_limit": 0,
+    "name": "纳指科技ETF",
+    "tp_cool_weeks": 4,
+    "tp_min_weeks": 4,
+    "tp_min_value": 30000,
+    "max_grid_count": 10,
+    "va_enabled": true,
+    "va_migration": {
+      "mode": "always_enabled",
+      "source_sha256": "0b36dea29ca21a13f3043f7c632cd73f25520857bd607c8f540eb0124c71edb7",
+      "evidence": "用户2026-10-12确认：本标的当前止盈周期内一直开启，无暂停"
+    }
+  },
+  "518850.SS": {
+    "grid_unit": 100,
+    "initial_base_position": 500,
+    "base_price": 7.419,
+    "dingtou_base": 850,
+    "dingtou_rate": 0.001,
+    "name": "黄金ETF华夏",
+    "tp_cool_weeks": 4,
+    "tp_min_weeks": 4,
+    "tp_min_value": 30000,
+    "max_grid_count": 10,
+    "va_enabled": true,
+    "va_migration": {
+      "mode": "always_enabled",
+      "source_sha256": "df71b1f2530af9955e21f32110f8b31311b0104bcdd8192bfae40fd0dc43f89e",
+      "evidence": "用户2026-10-12确认：本标的当前止盈周期内一直开启，无暂停"
+    }
+  },
+  "159934.SZ": {
+    "grid_unit": 100,
+    "initial_base_position": 1000,
+    "base_price": 7.113,
+    "dingtou_base": 850,
+    "dingtou_rate": 0.001,
+    "name": "黄金ETF",
+    "tp_cool_weeks": 4,
+    "tp_min_weeks": 4,
+    "tp_min_value": 30000,
+    "va_enabled": false,
+    "max_grid_count": 10
+  },
+  "159612.SZ": {
+    "grid_unit": 400,
+    "initial_base_position": 3000,
+    "base_price": 1.819,
+    "dingtou_base": 850,
+    "dingtou_rate": 0.0028,
+    "name": "标普500ETF国泰",
+    "tp_cool_weeks": 4,
+    "tp_min_weeks": 4,
+    "tp_min_value": 30000,
+    "max_grid_count": 10,
+    "va_enabled": true,
+    "va_migration": {
+      "mode": "always_enabled",
+      "source_sha256": "fbea216bcbe885debf2dcc96cdaed8c13d8c5730a0391dd31253f40b0ae7a1de",
+      "evidence": "用户2026-10-12确认：本标的当前止盈周期内一直开启，无暂停"
+    }
+  },
+  "159655.SZ": {
+    "grid_unit": 600,
+    "initial_base_position": 0,
+    "base_price": 1.8,
+    "dingtou_base": 1000,
+    "dingtou_rate": 0.0028,
+    "name": "标普500ETF华夏",
+    "tp_cool_weeks": 4,
+    "tp_min_weeks": 4,
+    "tp_min_value": 30000,
+    "max_grid_count": 10,
+    "va_enabled": true,
+    "va_migration": {
+      "mode": "always_enabled",
+      "source_sha256": "dfcdd00411e844b6729af481a3f401884937c52f18a26fa4709711b6028b8980",
+      "evidence": "用户2026-10-12确认：本标的当前止盈周期内一直开启，无暂停"
+    }
+  },
+  "159545.SZ": {
+    "grid_unit": 700,
+    "initial_base_position": 700,
+    "base_price": 1.463,
+    "dingtou_base": 950,
+    "dingtou_rate": 0.002,
+    "name": "恒生红利低波ETF易方达",
+    "tp_cool_weeks": 4,
+    "tp_min_weeks": 4,
+    "tp_min_value": 30000,
+    "va_enabled": false,
+    "max_grid_count": 10
+  },
+  "159501.SZ": {
+    "grid_unit": 600,
+    "initial_base_position": 600,
+    "base_price": 1.801,
+    "dingtou_base": 1000,
+    "dingtou_rate": 0.0058,
+    "name": "嘉实纳指100",
+    "tp_cool_weeks": 4,
+    "tp_min_weeks": 4,
+    "tp_min_value": 30000,
+    "max_grid_count": 10,
+    "va_enabled": true,
+    "va_migration": {
+      "mode": "always_enabled",
+      "source_sha256": "96e0994ec4df5cdfc4298680b74c3f0c72cc91a1fa36f5143ed9b0e04296f90e",
+      "evidence": "用户2026-10-12确认：本标的当前止盈周期内一直开启，无暂停"
+    }
+  },
+  "159696.SZ": {
+    "grid_unit": 600,
+    "initial_base_position": 600,
+    "base_price": 1.755,
+    "dingtou_base": 1000,
+    "dingtou_rate": 0.0058,
+    "name": "易方达纳指",
+    "tp_cool_weeks": 4,
+    "tp_min_weeks": 4,
+    "tp_min_value": 30000,
+    "max_grid_count": 10,
+    "va_enabled": true,
+    "va_migration": {
+      "mode": "always_enabled",
+      "source_sha256": "3696fd8890998552b22154e1e8a0493296625af64f34658f7d90e0dcf229c354",
+      "evidence": "用户2026-10-12确认：本标的当前止盈周期内一直开启，无暂停"
+    }
+  },
+  "159605.SZ": {
+    "grid_unit": 900,
+    "initial_base_position": 0,
+    "base_price": 1.099,
+    "name": "中概互联ETF广发",
+    "tp_cool_weeks": 4,
+    "tp_min_weeks": 4,
+    "tp_min_value": 30000,
+    "max_grid_count": 10,
+    "va_enabled": false,
+    "dingtou_base": 0,
+    "dingtou_rate": 0
+  },
+  "513010.SS": {
+    "grid_unit": 1300,
+    "initial_base_position": 1300,
+    "base_price": 0.8,
+    "name": "恒生科技ETF易方达",
+    "tp_cool_weeks": 4,
+    "tp_min_weeks": 4,
+    "tp_min_value": 30000,
+    "max_grid_count": 10,
+    "va_enabled": false,
+    "dingtou_base": 0,
+    "dingtou_rate": 0
+  },
+  "520810.SS": {
+    "grid_unit": 1000,
+    "initial_base_position": 1000,
+    "base_price": 1.005,
+    "dingtou_base": 1000,
+    "dingtou_rate": 0.001,
+    "name": "港股通红利ETF易方达",
+    "tp_cool_weeks": 4,
+    "tp_min_weeks": 4,
+    "tp_min_value": 30000,
+    "max_grid_count": 10,
+    "va_enabled": true,
+    "va_migration": {
+      "mode": "always_enabled",
+      "source_sha256": "97c5c494da710698a65697b49a5a2e3fb44a2d75604f583be782b17c25afb62b",
+      "evidence": "用户2026-10-12确认：本标的当前止盈周期内一直开启，无暂停"
+    }
+  },
+  "513850.SS": {
+    "grid_unit": 600,
+    "initial_base_position": 0,
+    "base_price": 1.912,
+    "dingtou_base": 1000,
+    "dingtou_rate": 0.004,
+    "name": "美国50ETF易方达",
+    "tp_cool_weeks": 4,
+    "tp_min_weeks": 4,
+    "tp_min_value": 30000,
+    "max_grid_count": 10,
+    "va_enabled": true,
+    "va_migration": {
+      "mode": "always_enabled",
+      "source_sha256": "c27956b6ddab7183112085de08cae29ee0f047bd1df50baf2ebf0b9b284f5075",
+      "evidence": "用户2026-10-12确认：本标的当前止盈周期内一直开启，无暂停"
+    }
+  }
+}

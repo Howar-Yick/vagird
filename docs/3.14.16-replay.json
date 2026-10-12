@@ -1,0 +1,399 @@
+{
+  "snapshot_version": "CHATGPT-3.14.15-MACRO-TP-COOLDOWN-HWM-GUARD",
+  "files_size_verified": 37,
+  "log_lines": 2075,
+  "symbols": [
+    {
+      "symbol": "159509.SZ",
+      "enabled": true,
+      "source_weeks": 8,
+      "base_position": 18900,
+      "migration": "ready",
+      "source_sha256": "0b36dea29ca21a13f3043f7c632cd73f25520857bd607c8f540eb0124c71edb7",
+      "baseline_theoretical_budget": 6979.9,
+      "confirmed_budget": 6979.9,
+      "logged_price_samples": 8,
+      "differential_base_matches": true
+    },
+    {
+      "symbol": "518850.SS",
+      "enabled": true,
+      "source_weeks": 31,
+      "base_position": 4900,
+      "migration": "ready",
+      "source_sha256": "df71b1f2530af9955e21f32110f8b31311b0104bcdd8192bfae40fd0dc43f89e",
+      "baseline_theoretical_budget": 26775.85,
+      "confirmed_budget": 26775.85,
+      "logged_price_samples": 8,
+      "differential_base_matches": true
+    },
+    {
+      "symbol": "159934.SZ",
+      "enabled": false,
+      "source_weeks": 73,
+      "base_position": 7600,
+      "migration": "pending",
+      "source_sha256": "84cd7ab83f064d6a254d0878d491616939af0b14e8844ee3380a363fccf92312",
+      "baseline_theoretical_budget": 64401.94,
+      "confirmed_budget": null,
+      "logged_price_samples": 8,
+      "differential_base_matches": true
+    },
+    {
+      "symbol": "159612.SZ",
+      "enabled": true,
+      "source_weeks": 2,
+      "base_position": 23300,
+      "migration": "ready",
+      "source_sha256": "fbea216bcbe885debf2dcc96cdaed8c13d8c5730a0391dd31253f40b0ae7a1de",
+      "baseline_theoretical_budget": 1707.15,
+      "confirmed_budget": 1707.15,
+      "logged_price_samples": 8,
+      "differential_base_matches": true
+    },
+    {
+      "symbol": "159655.SZ",
+      "enabled": true,
+      "source_weeks": 36,
+      "base_position": 18800,
+      "migration": "ready",
+      "source_sha256": "dfcdd00411e844b6729af481a3f401884937c52f18a26fa4709711b6028b8980",
+      "baseline_theoretical_budget": 37927.19,
+      "confirmed_budget": 37927.19,
+      "logged_price_samples": 8,
+      "differential_base_matches": true
+    },
+    {
+      "symbol": "159545.SZ",
+      "enabled": false,
+      "source_weeks": 48,
+      "base_position": 37700,
+      "migration": "pending",
+      "source_sha256": "1a90de5d2bc2b083cf73e2b3c874f84434f6f85521ba07a3ef98681da39c2f36",
+      "baseline_theoretical_budget": 47906.05,
+      "confirmed_budget": null,
+      "logged_price_samples": 8,
+      "differential_base_matches": true
+    },
+    {
+      "symbol": "159501.SZ",
+      "enabled": true,
+      "source_weeks": 2,
+      "base_position": 16300,
+      "migration": "ready",
+      "source_sha256": "96e0994ec4df5cdfc4298680b74c3f0c72cc91a1fa36f5143ed9b0e04296f90e",
+      "baseline_theoretical_budget": 2017.43,
+      "confirmed_budget": 2017.43,
+      "logged_price_samples": 8,
+      "differential_base_matches": true
+    },
+    {
+      "symbol": "159696.SZ",
+      "enabled": true,
+      "source_weeks": 2,
+      "base_position": 16000,
+      "migration": "ready",
+      "source_sha256": "3696fd8890998552b22154e1e8a0493296625af64f34658f7d90e0dcf229c354",
+      "baseline_theoretical_budget": 2017.43,
+      "confirmed_budget": 2017.43,
+      "logged_price_samples": 8,
+      "differential_base_matches": true
+    },
+    {
+      "symbol": "159605.SZ",
+      "enabled": false,
+      "source_weeks": 36,
+      "base_position": 32400,
+      "migration": "pending",
+      "source_sha256": "fde61efa92b2ed1ca237b4822a662d565b9293b215774d1714569add4610896d",
+      "baseline_theoretical_budget": 38792.66,
+      "confirmed_budget": null,
+      "logged_price_samples": 8,
+      "differential_base_matches": true
+    },
+    {
+      "symbol": "513010.SS",
+      "enabled": false,
+      "source_weeks": 39,
+      "base_position": 50800,
+      "migration": "pending",
+      "source_sha256": "88d18c39821aae99b7f4eb858d3b534bbe8e51b857c435559960485d37deef83",
+      "baseline_theoretical_budget": 44398.31,
+      "confirmed_budget": null,
+      "logged_price_samples": 8,
+      "differential_base_matches": true
+    },
+    {
+      "symbol": "520810.SS",
+      "enabled": true,
+      "source_weeks": 38,
+      "base_position": 40000,
+      "migration": "ready",
+      "source_sha256": "97c5c494da710698a65697b49a5a2e3fb44a2d75604f583be782b17c25afb62b",
+      "baseline_theoretical_budget": 38750.22,
+      "confirmed_budget": 38750.22,
+      "logged_price_samples": 8,
+      "differential_base_matches": true
+    },
+    {
+      "symbol": "513850.SS",
+      "enabled": true,
+      "source_weeks": 3,
+      "base_position": 1600,
+      "migration": "ready",
+      "source_sha256": "c27956b6ddab7183112085de08cae29ee0f047bd1df50baf2ebf0b9b284f5075",
+      "baseline_theoretical_budget": 3024.06,
+      "confirmed_budget": 3024.06,
+      "logged_price_samples": 8,
+      "differential_base_matches": true
+    }
+  ],
+  "limitations": [
+    "仅10/9当日日志，关闭标的首次暂停历史未确认",
+    "dashboard_data.json是2025-09-26旧数据，不参与计算",
+    "EOD种子+日志价格为同输入差分模拟，非完整历史回测、非实盘验证",
+    "账户总资产/即时现金不在快照内；动态上限场景为假设敏感性分析"
+  ],
+  "dynamic_scenarios": [
+    {
+      "hypothetical_assets": 500000,
+      "hypothetical_available_cash": 0,
+      "capacity_cap": 2500.0,
+      "allocated_buy_cost": 0,
+      "orders": [
+        {
+          "symbol": "159509.SZ",
+          "unit": 700,
+          "buy_sent": false,
+          "sell_sent": true
+        },
+        {
+          "symbol": "518850.SS",
+          "unit": 200,
+          "buy_sent": false,
+          "sell_sent": true
+        },
+        {
+          "symbol": "159934.SZ",
+          "unit": 200,
+          "buy_sent": false,
+          "sell_sent": true
+        },
+        {
+          "symbol": "159612.SZ",
+          "unit": 1100,
+          "buy_sent": false,
+          "sell_sent": true
+        },
+        {
+          "symbol": "159655.SZ",
+          "unit": 1000,
+          "buy_sent": false,
+          "sell_sent": true
+        },
+        {
+          "symbol": "159545.SZ",
+          "unit": 1900,
+          "buy_sent": false,
+          "sell_sent": true
+        },
+        {
+          "symbol": "159501.SZ",
+          "unit": 900,
+          "buy_sent": false,
+          "sell_sent": true
+        },
+        {
+          "symbol": "159696.SZ",
+          "unit": 800,
+          "buy_sent": false,
+          "sell_sent": true
+        },
+        {
+          "symbol": "159605.SZ",
+          "unit": 1700,
+          "buy_sent": false,
+          "sell_sent": true
+        },
+        {
+          "symbol": "513010.SS",
+          "unit": 2600,
+          "buy_sent": false,
+          "sell_sent": true
+        },
+        {
+          "symbol": "520810.SS",
+          "unit": 2000,
+          "buy_sent": false,
+          "sell_sent": true
+        },
+        {
+          "symbol": "513850.SS",
+          "unit": 600,
+          "buy_sent": false,
+          "sell_sent": true
+        }
+      ]
+    },
+    {
+      "hypothetical_assets": 1000000,
+      "hypothetical_available_cash": 25000,
+      "capacity_cap": 5000.0,
+      "allocated_buy_cost": 14110.2,
+      "orders": [
+        {
+          "symbol": "159509.SZ",
+          "unit": 1000,
+          "buy_sent": true,
+          "sell_sent": true
+        },
+        {
+          "symbol": "518850.SS",
+          "unit": 300,
+          "buy_sent": true,
+          "sell_sent": true
+        },
+        {
+          "symbol": "159934.SZ",
+          "unit": 400,
+          "buy_sent": true,
+          "sell_sent": true
+        },
+        {
+          "symbol": "159612.SZ",
+          "unit": 1200,
+          "buy_sent": true,
+          "sell_sent": true
+        },
+        {
+          "symbol": "159655.SZ",
+          "unit": 1000,
+          "buy_sent": true,
+          "sell_sent": true
+        },
+        {
+          "symbol": "159545.SZ",
+          "unit": 1900,
+          "buy_sent": false,
+          "sell_sent": true
+        },
+        {
+          "symbol": "159501.SZ",
+          "unit": 900,
+          "buy_sent": false,
+          "sell_sent": true
+        },
+        {
+          "symbol": "159696.SZ",
+          "unit": 800,
+          "buy_sent": false,
+          "sell_sent": true
+        },
+        {
+          "symbol": "159605.SZ",
+          "unit": 1700,
+          "buy_sent": false,
+          "sell_sent": true
+        },
+        {
+          "symbol": "513010.SS",
+          "unit": 2600,
+          "buy_sent": false,
+          "sell_sent": true
+        },
+        {
+          "symbol": "520810.SS",
+          "unit": 2000,
+          "buy_sent": false,
+          "sell_sent": true
+        },
+        {
+          "symbol": "513850.SS",
+          "unit": 600,
+          "buy_sent": false,
+          "sell_sent": true
+        }
+      ]
+    },
+    {
+      "hypothetical_assets": 2000000,
+      "hypothetical_available_cash": 100000,
+      "capacity_cap": 10000.0,
+      "allocated_buy_cost": 26172.55,
+      "orders": [
+        {
+          "symbol": "159509.SZ",
+          "unit": 1000,
+          "buy_sent": true,
+          "sell_sent": true
+        },
+        {
+          "symbol": "518850.SS",
+          "unit": 300,
+          "buy_sent": true,
+          "sell_sent": true
+        },
+        {
+          "symbol": "159934.SZ",
+          "unit": 400,
+          "buy_sent": true,
+          "sell_sent": true
+        },
+        {
+          "symbol": "159612.SZ",
+          "unit": 1200,
+          "buy_sent": true,
+          "sell_sent": true
+        },
+        {
+          "symbol": "159655.SZ",
+          "unit": 1000,
+          "buy_sent": true,
+          "sell_sent": true
+        },
+        {
+          "symbol": "159545.SZ",
+          "unit": 1900,
+          "buy_sent": true,
+          "sell_sent": true
+        },
+        {
+          "symbol": "159501.SZ",
+          "unit": 900,
+          "buy_sent": true,
+          "sell_sent": true
+        },
+        {
+          "symbol": "159696.SZ",
+          "unit": 800,
+          "buy_sent": true,
+          "sell_sent": true
+        },
+        {
+          "symbol": "159605.SZ",
+          "unit": 1700,
+          "buy_sent": true,
+          "sell_sent": true
+        },
+        {
+          "symbol": "513010.SS",
+          "unit": 2600,
+          "buy_sent": true,
+          "sell_sent": true
+        },
+        {
+          "symbol": "520810.SS",
+          "unit": 2000,
+          "buy_sent": true,
+          "sell_sent": true
+        },
+        {
+          "symbol": "513850.SS",
+          "unit": 600,
+          "buy_sent": true,
+          "sell_sent": true
+        }
+      ]
+    }
+  ]
+}
