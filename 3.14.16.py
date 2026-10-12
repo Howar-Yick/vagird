@@ -5,6 +5,7 @@
 # - 目标、启动修复与新版本报表统一 VA 预算口径；宏观止盈成交确认后重置 VA 周期。
 # - 动态网格容量与账户共享买单资金检查分离；参数需显式确认启用，不改实盘配置。
 # - 周编号校验兼容不提供 datetime.fromisocalendar 的 PTrade Python 环境。
+# - PTrade 实盘禁用 os；状态保存沿用 3.14.15 已验证的研究目录写入路径。
 # - 保留 3.14.15 作为回滚源；Stack/Anchor、水位、成交归属、滴灌与止盈判定不重写。
 # [v3.14.15 更新]
 # - 修复宏观止盈 HWM / Tier 在断代保护期、止盈定投期限未达标、止盈金额未达标期间仍被记录的问题。
@@ -107,8 +108,6 @@ import math
 import time
 import heapq  # 引入堆队列算法
 import copy
-import os
-import tempfile
 from collections import deque
 from datetime import datetime
 from datetime import time as dtime
@@ -937,19 +936,8 @@ def save_state(symbol, state):
     
     store['filled_order_ids'] = ids[-StrategyConfig.MAX_SAVED_FILLED_IDS:]
     store['trade_week_set'] = list(state.get('trade_week_set', []))
-    path = research_path('state', f'{symbol}.json')
-    temporary = None
-    try:
-        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=str(path.parent),
-                                         prefix=path.name + '.', suffix='.tmp', delete=False) as handle:
-            temporary = Path(handle.name)
-            handle.write(json.dumps(store, indent=2))
-            handle.flush()
-            os.fsync(handle.fileno())
-        temporary.replace(path)  # 重启时只看到完整旧文件或完整新文件。
-    finally:
-        if temporary is not None and temporary.exists(): temporary.unlink()
     set_saved_param(f'state_{symbol}', store)
+    research_path('state', f'{symbol}.json').write_text(json.dumps(store, indent=2), encoding='utf-8')
 
 def safe_save_state(symbol, state):
     try:
