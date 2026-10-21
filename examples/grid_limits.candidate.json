@@ -1,0 +1,12 @@
+{
+  "grid_limits": {
+    "enabled": true,
+    "reference_assets": 840000,
+    "cap_at_reference": 5000,
+    "capital_budget_ratio": 0.5,
+    "unit_budget_fraction": 0.02,
+    "cash_reserve": 10000,
+    "fee_buffer_rate": 0.001,
+    "minimum_fee": 5
+  }
+}
